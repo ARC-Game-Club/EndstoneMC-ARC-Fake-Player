@@ -544,6 +544,10 @@ class ArcFakePlayerPlugin(Plugin):
             # 反射层撑着，看起来依然是个活人。0/0 = 用固定 decision_interval。
             "decision_interval_min_seconds": 0,
             "decision_interval_max_seconds": 0,
+            # 自发发言冷却（分钟）：没被点名/没被打的主动说话至少隔
+            # uniform(min, max) 分钟；应答式说话不受限。0/0 = 不限制。
+            "spontaneous_say_min_minutes": 0,
+            "spontaneous_say_max_minutes": 0,
             "steps_per_tick": 6,
             "default_goal": "活下来并发展：找食物、收集木头和石头、天黑前有个能躲的地方。",
             # 手动 /ai spawn 的假人没有角色卡，用这个当长期使命（可空）。
@@ -2048,7 +2052,7 @@ class ArcFakePlayerPlugin(Plugin):
         agent = self._agents.get(bot)
         if agent is not None and agent.alive():
             agent.note_events([{"kind": "combat", "text": text}])
-            agent.state.last_decision = 0.0
+            agent.wake()
         self._record("combat", text, who=bot)
 
     def _social_on_attacked(self, bot: str, attacker_name: str,
@@ -2317,7 +2321,7 @@ class ArcFakePlayerPlugin(Plugin):
                     agent.note_events([{
                         "kind": "combat",
                         "text": f"你{who}，已在出生点重生。这笔账记下了。"}])
-                    agent.state.last_decision = 0.0
+                    agent.wake()
                 return
             if xuid:
                 # 真玩家死了。若正被我们的假人寻仇 → 得手，恩怨两清。
@@ -2398,7 +2402,7 @@ class ArcFakePlayerPlugin(Plugin):
                 # 立刻唤醒决策。
                 event.cancel()
                 agent.hear(f"{speaker}(管理员)", msg)
-                agent.state.last_decision = 0.0
+                agent.wake()
                 if name not in self._stealth:
                     try:
                         self.server.broadcast_message(
@@ -2414,7 +2418,7 @@ class ArcFakePlayerPlugin(Plugin):
                 # 普通玩家：**对话**而非控制。不取消事件——这句话留在
                 # 公屏上是自然的聊天；大脑以"朋友聊天"的定位听到它。
                 agent.hear(f"{speaker}(玩家)", msg)
-                agent.state.last_decision = 0.0
+                agent.wake()
                 # 友好对话攒好感（5 分钟冷却，防刷屏刷好感）
                 try:
                     bonus = float(self._social_cfg().get("chat_bonus", 1.0))
@@ -2439,7 +2443,7 @@ class ArcFakePlayerPlugin(Plugin):
             if chance <= 0 or _random.random() >= chance:
                 continue
             agent.hear(f"{speaker}(玩家闲聊)", msg)
-            agent.state.last_decision = 0.0      # 听到了就立刻想想接不接话
+            agent.wake()      # 听到了就立刻想想接不接话
             self._record("chat", f"听到 {speaker} 闲聊，考虑搭话", who=name)
 
     # ------------------------------------------------------------------
@@ -2773,6 +2777,10 @@ class ArcFakePlayerPlugin(Plugin):
                     self._cfg.get("decision_interval_min_seconds", 0) or 0),
                 decision_interval_max=float(
                     self._cfg.get("decision_interval_max_seconds", 0) or 0),
+                spontaneous_say_min=float(
+                    self._cfg.get("spontaneous_say_min_minutes", 0) or 0),
+                spontaneous_say_max=float(
+                    self._cfg.get("spontaneous_say_max_minutes", 0) or 0),
                 context_max_chars=int(self._cfg["context_max_chars"]),
                 # 夹到 >= 1：0 会让压缩变成"清空全部历史"（见 agent.py
                 # 里 `_compact_history` 的注释）。这里先夹住，用户填 0
@@ -5120,7 +5128,7 @@ class ArcFakePlayerPlugin(Plugin):
         goal = " ".join(args[1:])
         agent.config.goal = goal
         agent.state.done_reason = ""
-        agent.state.last_decision = 0.0
+        agent.wake()
         self._record("goal", f"被{sender.name}改为: {goal[:100]}", who=args[0])
         sender.send_message(f"{C.GREEN}已更新目标{C.RESET}")
 
@@ -5134,7 +5142,7 @@ class ArcFakePlayerPlugin(Plugin):
             return
         text = " ".join(args[1:])
         agent.hear(sender.name, text)
-        agent.state.last_decision = 0.0
+        agent.wake()
         self._record("chat", f"收到 {sender.name} 的话: {text[:100]}", who=args[0])
         sender.send_message(f"{C.GREEN}已转达{C.RESET}")
 

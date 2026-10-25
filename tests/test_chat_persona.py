@@ -56,7 +56,7 @@ class ChatPersonaPluginTests(unittest.TestCase):
         plugin = self.plugin_with(chance=0.0)
         agent = SimpleNamespace(
             hear=Mock(), alive=lambda: True,
-            state=SimpleNamespace(last_decision=5.0))
+            state=SimpleNamespace(last_decision=5.0), wake=lambda: None)
         plugin._agents = {"Al": agent}
         event = self.chat_event("这游戏真好玩")       # 没点名
         plugin.on_player_chat(event)
@@ -66,7 +66,7 @@ class ChatPersonaPluginTests(unittest.TestCase):
         plugin = self.plugin_with(chance=1.0)
         agent = SimpleNamespace(
             hear=Mock(), alive=lambda: True,
-            state=SimpleNamespace(last_decision=5.0))
+            state=SimpleNamespace(last_decision=5.0), wake=Mock())
         plugin._agents = {"Al": agent}
         event = self.chat_event("这游戏真好玩")
         plugin.on_player_chat(event)
@@ -74,14 +74,14 @@ class ChatPersonaPluginTests(unittest.TestCase):
         args = agent.hear.call_args[0]
         self.assertIn("Steve(玩家闲聊)", args[0])
         self.assertEqual(args[1], "这游戏真好玩")
-        self.assertEqual(agent.state.last_decision, 0.0)   # 立刻想
+        agent.wake.assert_called_once()   # 立刻想（唤醒由 wake() 承担）
 
     def test_mention_still_forced_regardless_of_chance(self):
         # @点名必回：概率 0 也要回
         plugin = self.plugin_with(chance=0.0)
         agent = SimpleNamespace(
             hear=Mock(), alive=lambda: True,
-            state=SimpleNamespace(last_decision=5.0))
+            state=SimpleNamespace(last_decision=5.0), wake=lambda: None)
         plugin._agents = {"Al": agent}
         plugin.server = SimpleNamespace(broadcast_message=Mock())
         event = self.chat_event("@Al 挖石头", is_op=True)
@@ -93,7 +93,7 @@ class ChatPersonaPluginTests(unittest.TestCase):
         plugin = self.plugin_with(chance=1.0)
         agent = SimpleNamespace(
             hear=Mock(), alive=lambda: True,
-            state=SimpleNamespace(last_decision=5.0))
+            state=SimpleNamespace(last_decision=5.0), wake=lambda: None)
         plugin._agents = {"Al": agent, "Bo": agent}
         event = self.chat_event("哈哈", name="Bo")     # Bo 是我们的假人
         plugin.on_player_chat(event)

@@ -227,6 +227,39 @@ def main() -> int:
     agent.state.last_decision = now - 5.0
     check("固定间隔模式下间隔内不思考", not agent.should_think(time.monotonic()))
 
+    # ---- 自发发言冷却 ----
+    # 开启 30~30 分钟冷却：自发轮的 say 被吞；唤醒轮（wake）不受限
+    agent.config.spontaneous_say_min = 30.0
+    agent.config.spontaneous_say_max = 30.0
+    said_before = len(said)
+    agent.state.woken = False
+    agent.state.next_spontaneous_say = time.monotonic() + 1000.0
+    agent.state.last_decision = 0.0
+    agent.think()
+    wait(lambda: not agent.state.thinking and not executor.busy)
+    for _ in range(50):
+        if not executor.busy:
+            break
+        done = executor.tick()
+        agent.reap_finished(done)
+        time.sleep(0.01)
+    check("冷却内的自发发言被吞", len(said) == said_before, str(said[said_before:]))
+    check("冷却时刻已重掷", agent.state.next_spontaneous_say > time.monotonic())
+    # 唤醒轮：应答式说话放行
+    agent.state.last_decision = 0.0
+    agent.wake()
+    agent.think()
+    wait(lambda: not agent.state.thinking and not executor.busy)
+    for _ in range(50):
+        if not executor.busy:
+            break
+        done = executor.tick()
+        agent.reap_finished(done)
+        time.sleep(0.01)
+    check("唤醒轮应答式说话放行", len(said) > said_before, str(said[said_before:]))
+    agent.config.spontaneous_say_min = 0.0
+    agent.config.spontaneous_say_max = 0.0
+
     # ---- 长期使命注入 ----
     from endstone_arc_fake_player.agent import build_system
     probe = agent.state

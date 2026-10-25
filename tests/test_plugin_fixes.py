@@ -60,7 +60,10 @@ class PluginFixTests(unittest.TestCase):
 
     def test_chat_requires_name_boundary(self):
         plugin = ArcFakePlayerPlugin()
-        agent = SimpleNamespace(hear=Mock(), state=SimpleNamespace(last_decision=5))
+        # 搭话概率钉死为 0：这个用例只测名字边界，别让闲聊随机监听
+        # 把 hear 意外触发（否则它是 15% 概率的隐性炸弹）。
+        plugin.chat_reply_chance = lambda name: 0.0
+        agent = SimpleNamespace(hear=Mock(), wake=Mock(), state=SimpleNamespace(last_decision=5))
         plugin._agents = {"Al": agent}
         plugin._stealth = set()
         plugin.server = SimpleNamespace(broadcast_message=Mock())
@@ -74,7 +77,7 @@ class PluginFixTests(unittest.TestCase):
         agent.hear.assert_called_once_with("Steve(玩家)", "@Al 挖石头")
         event.cancel.assert_not_called()
         # 管理员：指令式控制——取消事件并立即唤醒决策。
-        op_agent = SimpleNamespace(hear=Mock(), state=SimpleNamespace(last_decision=5))
+        op_agent = SimpleNamespace(hear=Mock(), wake=Mock(), state=SimpleNamespace(last_decision=5))
         plugin._agents = {"Al": op_agent}
         event2 = SimpleNamespace(message="@Al 挖石头",
                                  player=SimpleNamespace(name="Steve", is_op=True),

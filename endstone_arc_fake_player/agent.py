@@ -194,6 +194,11 @@ class AgentConfig:
     #: 拉长间隔的代价只是"自发行动"变从容，别的感觉不到。
     decision_interval_min: float = 0.0
     decision_interval_max: float = 0.0
+    #: 自发发言冷却（分钟）。max > 0 时启用：**没被点名/没被打**的
+    #: 主动说话，两次之间至少隔 uniform(min, max) 分钟——应答式说话
+    #: （点名必回、被打喊话、交易）不受限。0/0 = 不限制。
+    spontaneous_say_min: float = 0.0
+    spontaneous_say_max: float = 0.0
     #: 计划执行期间即使到期也不打断，避免"想一半去做别的"
     wait_for_plan: bool = True
     temperature: float = 0.3
@@ -254,6 +259,11 @@ class AgentState:
     last_decision: float = 0.0
     #: 下一次决策要等多久（随机间隔模式下由 think() 掷出）。0 = 未启用。
     decision_gap: float = 0.0
+    #: 这一轮思考是被外部事件唤醒的吗（点名/被攻击/指令）。是的话，
+    #: 这一轮的说话算**应答**，不受自发发言冷却限制。
+    woken: bool = False
+    #: 下一次允许**自发**发言的时刻（monotonic）。0 = 没在冷却中。
+    next_spontaneous_say: float = 0.0
     thinking: bool = False
     turns: int = 0
     errors: int = 0
@@ -463,6 +473,8 @@ class Agent:
     ) -> None:
         self.config = config
         self.state = AgentState(config=config)
+        #: 本轮思考是否被外部唤醒（think 时从 state.woken 取走）
+        self._turn_woken = False
         self._llm = llm
         self._world = world
         self._compiler = compiler
@@ -514,6 +526,12 @@ class Agent:
     def hear(self, player: str, text: str) -> None:
         self.state.chat_inbox.append(f"{player}: {text}")
 
+    def wake(self) -> None:
+        """外部事件唤醒（被点名/被攻击/收到指令）：立即思考，且这一轮
+        的说话算**应答**——不受自发发言冷却限制。"""
+        self.state.woken = True
+        self.state.last_decision = 0.0
+
     def note_events(self, events: list[dict]) -> None:
         self.state.recent_events.extend(events)
 
@@ -541,6 +559,10 @@ class Agent:
             return
         s.thinking = True
         s.last_decision = time.monotonic()
+        # 本轮是否被外部唤醒（决定说话算应答还是自发）——先取走再复位，
+        # 下一轮默认回到"自发"档。
+        self._turn_woken = s.woken
+        s.woken = False
         s.turns += 1
         # 随机决策间隔：这一轮开始时掷下一轮要等多久（1~5 分钟量级，
         # 具体看配置）。被聊天/事件立即唤醒的场景同样适用——唤醒是
@@ -947,9 +969,23 @@ class Agent:
             for line in ctx.get("notes", []):
                 s.notes.append(line)
                 self._log(f"📝 {line}")
+            # 自发发言冷却：没被唤醒的这一轮想说的话，要等冷却到点才让说
+            # （应答式——点名/被打/指令触发的——不走这道闸）。
+            say_cooldown_on = self.config.spontaneous_say_max > 0
+            now = time.monotonic()
             for msg in ctx.get("say", []):
+                if (say_cooldown_on and not self._turn_woken
+                        and now < s.next_spontaneous_say):
+                    self._log("🤐 没到自发发言间隔，这句话忍住了")
+                    continue
                 if self._on_say:
                     self._on_say(self.name, msg)
+                if say_cooldown_on and not self._turn_woken:
+                    import random as _r
+                    lo = max(0.1, self.config.spontaneous_say_min)
+                    hi = max(lo, self.config.spontaneous_say_max)
+                    s.next_spontaneous_say = (
+                        now + _r.uniform(lo, hi) * 60.0)
             if ctx.get("done"):
                 s.done_reason = ctx["done"]
                 self._log(f"✅ {ctx['done']}")
