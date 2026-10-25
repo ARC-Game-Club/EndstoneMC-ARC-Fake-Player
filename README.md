@@ -25,7 +25,7 @@
 
    ```bash
    # 在 bedrock_server 目录下（用服务器同款 Python）
-   pip install --target ./afp_tmp dist 对应的 endstone_arc_fake_player-*.whl
+   pip install --target ./afp_tmp endstone_arc_fake_player-<版本>-py3-none-any.whl
    python - <<'EOF'
    import sys
    sys.path.insert(0, "./afp_tmp")
