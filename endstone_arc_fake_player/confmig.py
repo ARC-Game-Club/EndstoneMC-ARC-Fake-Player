@@ -46,7 +46,8 @@ from typing import Any, Callable
 #:   5 → 锚点闲逛：roam（开关/挖矿概率），常驻地 homes.json + /ai home 表单
 #:   6 → 聊天个性：chat_reply_chance（公屏搭话概率，bot_settings.json 可按 AI 覆盖）
 #:   7 → 话痨治理：rules 新增第 8 条"说话要克制"（prompt_rules 旧默认值升级）
-CONFIG_VERSION = 7
+#:   8 → 枪战自动补位：shooter_fill（真人进大厅自动派 AI，quiet 加入）
+CONFIG_VERSION = 8
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:

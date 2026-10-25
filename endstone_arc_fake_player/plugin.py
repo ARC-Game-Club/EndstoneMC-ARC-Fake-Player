@@ -203,6 +203,7 @@ class ArcFakePlayerPlugin(Plugin):
                 "/arc_fake_player home",
                 "/arc_fake_player home <args: message>",
                 "/arc_fake_player style <args: message>",
+                "/arc_fake_player fillshooter <args: message>",
                 "/arc_fake_player chatrate <args: message>",
                 "/arc_fake_player session <name: str> <minutes: float>",
                 "/arc_fake_player auto [on|off|status]",
@@ -656,6 +657,13 @@ class ArcFakePlayerPlugin(Plugin):
                 "· 聊天和交易会慢慢涨好感，被攻击和被击杀会大跌。"
                 "管理员测试性的攻击不算仇。"
             ),
+            # ---- 枪战自动补位 ----
+            # 真人玩家进入等待中的枪战大厅时，自动派 AI 假人去凑人数
+            # （quiet 加入，不抢房主的开局权）。count = 最多派几个。
+            "shooter_fill": {
+                "enabled": True,
+                "count": 1,
+            },
             # ---- 聊天个性 ----
             # 公屏闲聊（没点名）时 AI 搭话的概率（0~1）。每个 AI 可在
             # 管理表单/角色卡里单独覆盖；@点名永远必回。
@@ -2442,6 +2450,7 @@ class ArcFakePlayerPlugin(Plugin):
             "cmd": self._cmd_cmd,
             "home": self._cmd_home,
             "style": self._cmd_style,
+            "fillshooter": self._cmd_fillshooter,
             "chatrate": self._cmd_chatrate,
         }.get(args[0].lower())
         if fn is None:
@@ -2969,6 +2978,8 @@ class ArcFakePlayerPlugin(Plugin):
 
     #: arena 状态：名字 → 下次敌我名单刷新时刻
     _arena_next: dict[str, float] = {}
+    #: arena：名字 → 连续看到它在等待室的刷新次数（滞留检测）
+    _arena_waiting: dict[str, int] = {}
 
     def _shooter_plugin(self) -> Any:
         try:
@@ -2995,6 +3006,7 @@ class ArcFakePlayerPlugin(Plugin):
                          f"{', '.join(enemies) or '暂无'}）")
 
     def _arena_disable(self, name: str) -> None:
+        self._arena_waiting.pop(name, None)
         if self._arena_next.pop(name, None) is not None:
             self._bridge.arena_off(name)
             self.logger.info(f"[{name}] arena 战斗 AI 已停止")
@@ -3061,9 +3073,25 @@ class ArcFakePlayerPlugin(Plugin):
                 # 对局结束/被移出房间——战斗 AI 交给 JS 侧的
                 # "敌人 30 秒不在线自动退场"兜底，Python 这里只清记账。
                 self._arena_next.pop(name, None)
+                self._arena_waiting.pop(name, None)
                 self._bridge.arena_off(name)
                 self.logger.info(f"[{name}] 已不在枪战房间，arena 战斗 AI 停止")
                 continue
+            # 等待室滞留检测：对局结束后回到 LOBBY 干等（真人早走了）。
+            # 连续 4 个刷新周期（约 60 秒）还在等待室 → 自动离开，别把
+            # 空房间占着、也别让假人在大厅里罚站。
+            if str(info.get("state", "")) == "lobby":
+                waits = self._arena_waiting.get(name, 0) + 1
+                self._arena_waiting[name] = waits
+                if waits >= 4:
+                    self._arena_waiting.pop(name, None)
+                    self._arena_disable(name)
+                    self._run_bot_command(name, self._live_actor(name) or name,
+                                          "gs leave")
+                    self.logger.info(f"[{name}] 在枪战等待室滞留超时，已自动离开")
+                    continue
+            else:
+                self._arena_waiting.pop(name, None)
             enemies = [str(e) for e in (info.get("enemies") or [])]
             minutes = max(2.0, (info.get("match_seconds") or 300) / 60.0 + 2.0)
             self._bridge.arena(name, enemies, minutes)
@@ -3478,6 +3506,27 @@ class ArcFakePlayerPlugin(Plugin):
         self._apply_chat_personality(name)
         sender.send_message(
             f"{C.GREEN}{name} 的说话风格已更新（{len(examples)} 条示例）{C.RESET}")
+
+    def _cmd_fillshooter(self, sender: CommandSender, args: list[str]) -> None:
+        """手动触发枪战补人（测试/管理用）：/ai fillshooter [数量]。"""
+        if args and len(args) == 1 and " " in str(args[0]):
+            args = str(args[0]).split()
+        try:
+            n = max(1, min(8, int(args[0])) if args else 1)
+        except ValueError:
+            n = 1
+        result = self.api_fill_shooter(n)
+        if result.get("ok"):
+            filled = result.get("filled") or []
+            if filled:
+                sender.send_message(
+                    f"{C.GREEN}已派 {len(filled)} 名 AI 进枪战："
+                    f"{', '.join(filled)}{C.RESET}")
+            else:
+                sender.send_message(
+                    f"{C.YELLOW}没有可派的 AI（都在忙/不在线/未启用 shooter_fill）{C.RESET}")
+        else:
+            sender.send_message(f"{C.RED}{result.get('text')}{C.RESET}")
 
     def _cmd_chatrate(self, sender: CommandSender, args: list[str]) -> None:
         """控制台版概率设置：/ai chatrate <名字> <0~1>。"""
@@ -3961,6 +4010,48 @@ class ArcFakePlayerPlugin(Plugin):
             return ""
         except Exception:
             return ""
+
+    def api_fill_shooter(self, max_slots: int = 1) -> dict:
+        """枪战插件回调：有真人进了等待中的大厅，派几个 AI 去凑人数。
+
+        派谁：优先**闲着**的角色卡假人（不在打架/对局/有计划）。
+        派去的走 quiet 加入（不抢房主的开局权），进房即开 arena 战斗 AI。
+        配置 shooter_fill：{"enabled": true, "count": 1}——关掉就一个都不派。
+        """
+        try:
+            cfg = self._cfg.get("shooter_fill")
+            cfg = cfg if isinstance(cfg, dict) else {}
+            if not cfg.get("enabled", True):
+                return {"ok": False, "text": "未启用"}
+            want = max(1, int(cfg.get("count", 1)))
+            want = min(want, max(1, int(max_slots)))
+            picked: list[str] = []
+            for name, agent in list(self._agents.items()):
+                if len(picked) >= want:
+                    break
+                alive_fn = getattr(agent, "alive", None)
+                if callable(alive_fn) and not alive_fn():
+                    continue
+                if self._roam_busy(name):
+                    continue          # 在打架/对局/忙的不要
+                actor = self._live_actor(name)
+                if actor is None:
+                    continue
+                shooter = self._shooter_plugin()
+                if shooter is None:
+                    break
+                result = shooter.api_quick_join(actor, quiet=True)
+                if not result.get("ok"):
+                    continue
+                self._arena_enable(name)
+                picked.append(name)
+            if picked:
+                self.logger.info(f"枪战补人：派出 {', '.join(picked)}")
+                self._record("game", f"真人建房，自动补位 {len(picked)} 名 AI",
+                             who=",".join(picked))
+            return {"ok": True, "filled": picked}
+        except Exception as exc:
+            return {"ok": False, "text": f"api_fill_shooter: {exc}"}
 
     def api_identities(self) -> dict:
         """全部已登记身份（名字 → {xuid, uuid}）。"""
