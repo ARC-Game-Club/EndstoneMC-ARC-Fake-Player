@@ -1,5 +1,78 @@
 # arc_fake_player
 
+**由 LLM 驱动的 Endstone 虚拟玩家**：身体是真正的 SimulatedPlayer，大脑是纯 Python。
+角色卡轮换保持稳定在线人数、闲逛/挖矿的生活气息、被攻击反击寻仇、聊天带性格风格、
+可进枪战对局互射、以合成身份无缝接入弧光核心。配套插件见文末"生态"。
+
+- 仓库：<https://github.com/ARC-Game-Club/EndstoneMC-ARC-Fake-Player>
+- 要求：Endstone ≥ 0.11（测试于 0.11.10 / BDS 1.26.45 / Python 3.13）
+- 可选联动：arc_core ≥0.9.82（合成身份/钱包/领地锚点）、arc_ai_helper ≥2.4.0
+  （天星常驻身体）、arc_shooter_game ≥0.4.26（枪战 quick + arena 战斗 AI）
+
+---
+
+## 安装部署（重要，先读第 3 条）
+
+1. **停服**，把 `dist/endstone_arc_fake_player-<最新>-py3-none-any.whl` 放进
+   `bedrock_server/plugins/`（若装过旧名 `endstone_pureagent`，把它的 wheel
+   移走，两个不能同时跑）。
+2. 启动一次——插件会自动把行为包释放到世界目录并登记，
+   日志提示"需要重启服务器才会生效"。**先别急着重启，看第 3 条。**
+3. ⚠️ **level.dat 大坑（新服必读）**：插件在运行中给 `worlds/<世界>/level.dat`
+   开 Beta APIs 实验开关，但 BDS 停服时会把内存里的旧状态写回去**覆盖补丁**——
+   表现是"永远提示需要重启，行为包永远加载不上"。正确顺序是：
+   **启动一次 → 完全停服 → 停服状态下打补丁 → 再启动**：
+
+   ```bash
+   # 在 bedrock_server 目录下（用服务器同款 Python）
+   pip install --target /tmp/afp endstone_arc_fake_player-*.whl
+   python -c "import sys; sys.path.insert(0, '/tmp/afp');      from endstone_arc_fake_player import packing;      from pathlib import Path;      print(packing.enable_experiments(Path('worlds/<世界名>/level.dat')))"
+   ```
+
+   补丁成功加载过一次后，之后正常重启不会再丢（会自动留 .bak 备份）。
+4. 再次启动，日志出现 `行为包已就绪，虚拟玩家可以使用真实假人` 即装好。
+
+## 快速配置
+
+- **模型**：游戏内 OP 执行 `/ai set <base_url> <api_key> <model>`（OpenAI 兼容接口；
+  服务器控制台发不了带冒号的 URL，直接改 `plugins/arc_fake_player/config.json`
+  再 `/ai reload`）。
+- **自动稳定在线**：`auto_online.enabled=true`、`target_count=3`；每个角色游玩时长
+  随机 `play_minutes_min/max`（默认 10~300 分钟），下线后隔 1~5 分钟换下一张卡。
+- **角色卡**（config.json 的 `characters`，改完 `/ai reload` 热生效）：
+  `name` / `persona` 性格 / `goal` 目标 / `money` 初始金钱 /
+  `chat_reply_chance` 公屏搭话概率 / `style` 说话风格示例数组 /
+  `xuid`·`uuid` 可钉死合成身份。
+- **聊天**：消息里出现 AI 名字 = 必回（ASCII 名词边界匹配）；公屏闲聊按每个 AI
+  自己的 `chat_reply_chance` 概率搭话（bot_settings.json 覆盖 > 角色卡 > 全局 0.15）。
+- **管理 UI**：游戏内 `/ai home` 打开管理表单（设家/常驻地、搭话概率滑条、
+  说话风格示例、传送到 AI 身边）。AI 平时在家/自己领地/公共传送点附近闲逛，
+  偶尔挖方块；离远了分段走回去（不传送）。
+- **AI 助手联动**：`plugins/arc_ai_helper/chat_config.json` 里
+  `virtual_player_enabled=true` → 天星获得常驻假人身体（mc_body_* 工具操控）。
+
+## 验证清单
+
+- `/ai body` → "真实假人 · 行为包已连接"
+- `/ai auto on` → 角色假人陆续上线（在线人数+，无 [AI] 名牌）
+- 聊天打假人名字 → 必回；闲聊按概率搭话且带 style 风格
+- `/ai cmd <假人> gs quick` → 枪战自动开局对枪
+- 假人在 arc_core 库有独立行（合成 xuid=16 位 9 开头，identities.json 终身固定）
+
+## 已知边界
+
+- 假人被真人攻击会自动反击+追踪；好感 ≤-30 进仇人名单会寻仇，击败一次两清；
+  OP 攻击不记仇（`social.admins_immune`）
+- `/ai` 系命令仅 OP；普通玩家只能和 AI 对话
+- 模拟玩家执行不了命令（引擎限制）——AI 参与插件玩法走对方插件提供的
+  `api_*` 接口（如枪战 `api_quick_join`）
+- `PlayerJoinEvent` 不触发 SimulatedPlayer：假人的核心数据初始化由本插件
+  在身体接上时主动调 `ensure_player_data_initialized`（需核心 ≥0.9.82）
+
+---
+
+# 版本历史
+
 ## 3.7：聊天个性——提到名字必回，公屏闲聊按概率搭话，说话带风格
 
 **点名必回**（基岩聊天没有 @，玩家就是把名字打进句子里）：消息里
