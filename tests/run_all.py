@@ -54,6 +54,7 @@ ALL_TESTS = [
     "test_crowd.py",
     "test_social.py",
     "test_roam.py",
+    "test_chat_persona.py",
 ]
 
 #: 各文件用自己的 main() 打印的结论行，两种写法都在这了。

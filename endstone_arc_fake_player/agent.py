@@ -215,6 +215,9 @@ class AgentConfig:
     body: str = DEFAULT_BODY
     #: "性格"
     persona: str = DEFAULT_PERSONA
+    #: 说话风格段（含小标题的完整段落；空串 = 无此段）。
+    #: 由插件从 bot_settings/角色卡拼好——agent 只负责摆进提示词。
+    style: str = ""
     #: 行为规范
     rules: str = DEFAULT_RULES
     #: 物品代码名对照表。观测和工具参数用的是代码名，写中文显示名会找不到物品。
@@ -294,6 +297,8 @@ $goal
 
 $persona
 
+$style
+
 # 你记得的事
 $notes
 $landmarks
@@ -334,6 +339,7 @@ def build_system(state: AgentState) -> str:
         body=c.body,
         goal=c.goal,
         persona=c.persona,
+        style=c.style,
         notes=notes,
         landmarks=marks,
         rules=c.rules,

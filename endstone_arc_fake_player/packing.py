@@ -37,7 +37,7 @@ from .nbt import (
 
 #: 行为包标识。必须和 behavior_pack/manifest.json 里的 header.uuid 一致。
 PACK_UUID = "7d4c1a90-2f63-4b8e-a5d1-9c0e7b3f6a24"
-PACK_VERSION = [3, 6, 6]
+PACK_VERSION = [3, 7, 0]
 #: 释放到磁盘上的目录名
 PACK_DIR_NAME = "arc_fake_player_bridge"
 LEGACY_PACK_DIR_NAME = "pureagent_bridge"

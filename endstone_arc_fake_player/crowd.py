@@ -44,6 +44,10 @@ class CharacterCard:
     #: 填了就钉死——同一张卡跨服务器/重装都是同一个"人"。
     xuid: str | None = None
     uuid: str | None = None
+    #: 公屏闲聊（没点名）时的搭话概率 0~1。None = 用全局默认。
+    chat_reply_chance: float | None = None
+    #: 说话风格示例（大模型模仿这几句的语气/口头禅/情绪）。
+    style: list[str] | None = None
 
     @staticmethod
     def from_dict(raw: Any) -> "CharacterCard | None":
@@ -58,6 +62,16 @@ class CharacterCard:
                 money = float(money)
             except (TypeError, ValueError):
                 money = None
+        chance = raw.get("chat_reply_chance")
+        if chance is not None:
+            try:
+                chance = max(0.0, min(1.0, float(chance)))
+            except (TypeError, ValueError):
+                chance = None
+        style_raw = raw.get("style")
+        style = None
+        if isinstance(style_raw, list):
+            style = [str(x).strip() for x in style_raw if str(x).strip()]
         return CharacterCard(
             name=name,
             persona=str(raw.get("persona", "") or ""),
@@ -65,6 +79,8 @@ class CharacterCard:
             money=money,
             xuid=(str(raw["xuid"]).strip() or None) if raw.get("xuid") else None,
             uuid=(str(raw["uuid"]).strip() or None) if raw.get("uuid") else None,
+            chat_reply_chance=chance,
+            style=style,
         )
 
 

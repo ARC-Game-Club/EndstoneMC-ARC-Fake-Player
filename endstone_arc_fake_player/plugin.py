@@ -127,6 +127,33 @@ def _clean_name(raw: str) -> str:
     return cleaned or "bot"
 
 
+def _mentions(low_message: str, name: str) -> bool:
+    """消息（已小写）里是否"点名"提到这个 AI。
+
+    ASCII 名字要求词边界：前后不能贴着字母/数字/下划线——
+    否则叫 Al 的假人会被每一句 "alice"/"hello" 误命中。
+    中文名字（含非 ASCII）直接包含即命中。
+    """
+    target = name.lower().strip()
+    if not target:
+        return False
+    low_message = str(low_message or "").lower()
+    if any(ord(ch) > 127 for ch in target):
+        return target in low_message
+    start = 0
+    while True:
+        idx = low_message.find(target, start)
+        if idx < 0:
+            return False
+        before = low_message[idx - 1] if idx > 0 else ""
+        after = (low_message[idx + len(target)]
+                 if idx + len(target) < len(low_message) else "")
+        if not (before.isalnum() or before == "_") and \
+                not (after.isalnum() or after == "_"):
+            return True
+        start = idx + 1
+
+
 def _kind_of(text: str) -> str:
     """从 Agent 的日志正文猜出事件类别。
 
@@ -175,6 +202,8 @@ class ArcFakePlayerPlugin(Plugin):
                 "/arc_fake_player cmd <name: str> <command: message>",
                 "/arc_fake_player home",
                 "/arc_fake_player home <args: message>",
+                "/arc_fake_player style <args: message>",
+                "/arc_fake_player chatrate <args: message>",
                 "/arc_fake_player session <name: str> <minutes: float>",
                 "/arc_fake_player auto [on|off|status]",
                 "/arc_fake_player reload",
@@ -292,6 +321,10 @@ class ArcFakePlayerPlugin(Plugin):
         # 常驻地（家）表：homes.json，OP 用 /ai home 设置。
         self._homes_path = Path(self.data_folder) / "homes.json"
         self._homes: dict[str, Any] = self._load_homes()
+        # 每个 AI 的个性设置：公屏搭话概率 / 说话风格示例。
+        # bot_settings.json 持久；角色卡在首次上线时播种默认值。
+        self._bot_settings_path = Path(self.data_folder) / "bot_settings.json"
+        self._bot_settings: dict[str, Any] = self._load_bot_settings()
         # 锚点闲逛驱动：家 > 自己领地 > 公共传送点；忙时（打架/对局/
         # 有计划）让路。与 arena AI 同级的"条件反射"层。
         self._roam = RoamDriver(
@@ -593,6 +626,10 @@ class ArcFakePlayerPlugin(Plugin):
                 "· 聊天和交易会慢慢涨好感，被攻击和被击杀会大跌。"
                 "管理员测试性的攻击不算仇。"
             ),
+            # ---- 聊天个性 ----
+            # 公屏闲聊（没点名）时 AI 搭话的概率（0~1）。每个 AI 可在
+            # 管理表单/角色卡里单独覆盖；@点名永远必回。
+            "chat_reply_chance": 0.15,
             # ---- 锚点闲逛（日常生活）----
             # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
             # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
@@ -1400,6 +1437,8 @@ class ArcFakePlayerPlugin(Plugin):
     _stealth: set[str] = set()
     #: 合成身份注册表（on_enable 里创建；类级默认让早期 API 调用安全失败）。
     _identities: Any = None
+    #: 聊天个性设置（on_enable 里创建；同上）。
+    _bot_settings: dict[str, Any] = {}
     #: (假人, 玩家) → 上次"玩家靠近"提醒时刻（monotonic）。
     _proximity_seen: dict[tuple[str, str], float] = {}
     #: owner → 动作编译器（切换身体模式时要同步 use_real_dig）
@@ -2129,47 +2168,78 @@ class ArcFakePlayerPlugin(Plugin):
 
     @event_handler(priority=EventPriority.NORMAL, ignore_cancelled=True)
     def on_player_chat(self, event: PlayerChatEvent) -> None:
+        """聊天分诊：提到名字必回；没提名的公屏闲聊按各自概率搭话。
+
+        基岩聊天没有 @ 提及——玩家就是直接把名字打进句子里
+        （"BossZhong 你在哪"）。所以"点名"的判定是**消息里出现名字**：
+
+          · ASCII 名字用词边界匹配（"al" 不会误命中 "alice"），
+            前后隔着字母/数字/下划线不算
+          · 中文名字直接包含即命中（中文没有词边界一说）
+
+        命中 → 必回（OP 的话按"指令"处理并撤回消息，普通玩家按
+        "对话"处理）；没命中 → 走公屏闲聊的概率门控。
+        """
         msg = (event.message or "").strip()
+        if not msg:
+            return
         low = msg.lower()
+        speaker = str(getattr(event.player, "name", "") or "")
         is_op = bool(getattr(event.player, "is_op", False))
+
+        named_any = False
         for name, agent in self._agents.items():
-            for prefix in (f"@{name}", name.lower()):
-                if low.startswith(prefix.lower()):
-                    suffix = msg[len(prefix):]
-                    if suffix and not (suffix[0].isspace() or suffix[0] in ":：,，"):
-                        continue
-                    rest = suffix.strip(" \t\r\n:：,，")
-                    if not rest:
-                        return
-                    if is_op:
-                        # 管理员：指令式控制。取消事件（不留在公屏），
-                        # 立刻唤醒决策——和原来一样。
-                        event.cancel()
-                        agent.hear(f"{event.player.name}(管理员)", rest)
-                        agent.state.last_decision = 0.0     # 管理员指令 → 立即响应
-                        if name not in self._stealth:
-                            self.server.broadcast_message(
-                                f"{C.GOLD}[{name}]{C.RESET} 收到玩家指令，正在思考…")
-                        else:
-                            # 隐身假人被管理员指挥时不广播（穿帮），
-                            # 只给管理员本人一个回执。
-                            event.player.send_message(
-                                f"{C.GOLD}[{name}]{C.RESET} 收到指令，正在思考…")
-                    else:
-                        # 普通玩家：**对话**而非控制。
-                        # 不取消事件——这句话留在公屏上是自然的聊天；
-                        # 大脑以"朋友聊天"的定位听到它，按提示词里的
-                        # 指令权限规则回应（闲聊/交易可以，指挥干活不行）。
-                        agent.hear(f"{event.player.name}(玩家)", rest)
-                        # 友好对话攒好感（5 分钟冷却，防刷屏刷好感）
-                        try:
-                            bonus = float(self._social_cfg().get("chat_bonus", 1.0))
-                            if bonus:
-                                self._favor.chat_bonus(name, event.player.name,
-                                                       bonus)
-                        except Exception:
-                            pass
-                    return
+            if not _mentions(low, name):
+                continue
+            named_any = True
+            if is_op:
+                # 管理员：指令式控制。取消事件（不留在公屏），
+                # 立刻唤醒决策。
+                event.cancel()
+                agent.hear(f"{speaker}(管理员)", msg)
+                agent.state.last_decision = 0.0
+                if name not in self._stealth:
+                    try:
+                        self.server.broadcast_message(
+                            f"{C.GOLD}[{name}]{C.RESET} 收到玩家指令，正在思考…")
+                    except Exception:
+                        pass
+                else:
+                    # 隐身假人被管理员指挥时不广播（穿帮），
+                    # 只给管理员本人一个回执。
+                    event.player.send_message(
+                        f"{C.GOLD}[{name}]{C.RESET} 收到指令，正在思考…")
+            else:
+                # 普通玩家：**对话**而非控制。不取消事件——这句话留在
+                # 公屏上是自然的聊天；大脑以"朋友聊天"的定位听到它。
+                agent.hear(f"{speaker}(玩家)", msg)
+                agent.state.last_decision = 0.0
+                # 友好对话攒好感（5 分钟冷却，防刷屏刷好感）
+                try:
+                    bonus = float(self._social_cfg().get("chat_bonus", 1.0))
+                    if bonus:
+                        self._favor.chat_bonus(name, speaker, bonus)
+                except Exception:
+                    pass
+
+        if named_any:
+            return
+        if not speaker or speaker in self._agents:
+            return      # 我们自己的假人说话不触发（防自嗨循环）
+
+        # ---- 没被任何 AI 点名：公屏闲聊，按**每个 AI 自己的概率**
+        # 决定要不要搭话（0 = 永不插嘴；1 = 每句都听）。
+        import random as _random
+        for name, agent in list(self._agents.items()):
+            alive_fn = getattr(agent, "alive", None)
+            if callable(alive_fn) and not alive_fn():
+                continue
+            chance = self.chat_reply_chance(name)
+            if chance <= 0 or _random.random() >= chance:
+                continue
+            agent.hear(f"{speaker}(玩家闲聊)", msg)
+            agent.state.last_decision = 0.0      # 听到了就立刻想想接不接话
+            self._record("chat", f"听到 {speaker} 闲聊，考虑搭话", who=name)
 
     # ------------------------------------------------------------------
     # 命令
@@ -2194,6 +2264,8 @@ class ArcFakePlayerPlugin(Plugin):
             "reload": self._cmd_reload,
             "cmd": self._cmd_cmd,
             "home": self._cmd_home,
+            "style": self._cmd_style,
+            "chatrate": self._cmd_chatrate,
         }.get(args[0].lower())
         if fn is None:
             sender.send_message(f"{C.RED}未知子命令: {args[0]}{C.RESET}")
@@ -2506,6 +2578,7 @@ class ArcFakePlayerPlugin(Plugin):
                 identity=str(self._cfg["prompt_identity"]),
                 body=str(self._cfg["prompt_body"]),
                 persona=persona or str(self._cfg["prompt_persona"]),
+                style=self._style_block(name),
                 rules=(str(self._cfg["prompt_rules"]) + "\n\n"
                        + str(self._cfg.get("prompt_command_policy", ""))
                        + "\n\n" + str(self._cfg.get("prompt_social", ""))),
@@ -2817,6 +2890,96 @@ class ArcFakePlayerPlugin(Plugin):
     # 常驻地与锚点闲逛（家 > 自己领地 > 公共传送点）+ OP 管理表单
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 聊天个性：公屏搭话概率 + 说话风格示例
+    # ------------------------------------------------------------------
+
+    def _load_bot_settings(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self._bot_settings_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.logger.warning(f"bot_settings.json 读取失败: {exc}")
+            return {}
+
+    def _save_bot_settings(self) -> None:
+        try:
+            tmp = self._bot_settings_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._bot_settings, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            tmp.replace(self._bot_settings_path)
+        except Exception as exc:
+            self.logger.warning(f"bot_settings.json 保存失败: {exc}")
+
+    def _seed_bot_settings(self, name: str, *, chance: float | None,
+                           style: list[str] | None) -> None:
+        """角色卡首次上线时播种个性设置；已有设置不动（改过的优先）。"""
+        entry = self._bot_settings.setdefault(name, {})
+        changed = False
+        if "chat_reply_chance" not in entry and chance is not None:
+            entry["chat_reply_chance"] = float(chance)
+            changed = True
+        if not entry.get("style") and style:
+            entry["style"] = list(style)
+            changed = True
+        if changed:
+            self._save_bot_settings()
+
+    def chat_reply_chance(self, name: str) -> float:
+        """这个 AI 听到公屏闲聊时搭话的概率（0~1）。"""
+        entry = self._bot_settings.get(name) or {}
+        try:
+            return max(0.0, min(1.0, float(entry.get("chat_reply_chance"))))
+        except (TypeError, ValueError):
+            pass
+        try:
+            cfg = getattr(self, "_cfg", None) or {}
+            raw = cfg.get("chat_reply_chance", 0.15)
+            if raw is None:
+                raw = 0.15
+            return max(0.0, min(1.0, float(raw)))
+        except (TypeError, ValueError, AttributeError):
+            return 0.15
+
+    def set_chat_reply_chance(self, name: str, chance: float) -> None:
+        entry = self._bot_settings.setdefault(name, {})
+        entry["chat_reply_chance"] = max(0.0, min(1.0, float(chance)))
+        self._save_bot_settings()
+
+    def _style_of(self, name: str) -> list[str]:
+        entry = self._bot_settings.get(name) or {}
+        style = entry.get("style")
+        if isinstance(style, list):
+            return [str(x) for x in style if str(x).strip()]
+        return []
+
+    def _style_block(self, name: str) -> str:
+        """拼进系统提示词的"说话风格"段。没有示例返回空串。"""
+        examples = self._style_of(name)
+        if not examples:
+            return ""
+        lines = ["## 说话风格",
+                 "你说话要**模仿下面示例的语气、口头禅和情绪**（可以自由发挥，"
+                 "但不要逐字照抄示例）："]
+        lines += [f"- {e}" for e in examples[:8]]
+        return "\n".join(lines)
+
+    def set_style(self, name: str, examples: list[str]) -> None:
+        cleaned = [str(e).strip() for e in examples if str(e).strip()]
+        entry = self._bot_settings.setdefault(name, {})
+        entry["style"] = cleaned
+        self._save_bot_settings()
+
+    def _apply_chat_personality(self, name: str) -> None:
+        """把最新的风格段推给在线的智能体（下轮决策生效）。"""
+        agent = self._agents.get(name)
+        if agent is not None:
+            agent.config.style = self._style_block(name)
+
+
     def _load_homes(self) -> dict[str, Any]:
         try:
             raw = json.loads(self._homes_path.read_text(encoding="utf-8"))
@@ -3009,6 +3172,12 @@ class ArcFakePlayerPlugin(Plugin):
             "清除家",
             on_click=lambda s: self._home_clear(s, name))
         form.add_button(
+            f"主动回复概率（当前 {self.chat_reply_chance(name):.0%}）",
+            on_click=lambda s: self._chance_form(s, name))
+        form.add_button(
+            "说话风格示例",
+            on_click=lambda s: self._style_form(s, name))
+        form.add_button(
             "传送到他身边",
             on_click=lambda s: self._cmd_tp(s, [name]))
         form.add_button(
@@ -3060,6 +3229,90 @@ class ArcFakePlayerPlugin(Plugin):
         else:
             sender.send_message(f"{C.YELLOW}{name} 本来就没有家{C.RESET}")
         self._show_bot_form(sender, name)
+
+    def _chance_form(self, sender: Any, name: str) -> None:
+        """主动回复概率滑条（公屏没点名时搭话的概率）。"""
+        from endstone.form import ModalForm, Slider
+        current = self.chat_reply_chance(name)
+        form = ModalForm(title=f"{name} 的主动回复概率",
+                         submit_button="保存")
+        form.add_control(Slider(
+            label="公屏没点名时，搭话的概率（0% 从不插嘴，100% 每句都回）",
+            min=0, max=100, step=5, default_value=int(current * 100)))
+
+        def _submit(player: Any, data: Any) -> None:
+            try:
+                pct = float(list(data or [0])[0])
+            except (TypeError, ValueError, IndexError):
+                pct = 0.0
+            self.set_chat_reply_chance(name, pct / 100.0)
+            self._record("admin", f"{player.name} 设搭话概率 {pct:.0f}%", who=name)
+            player.send_message(
+                f"{C.GREEN}{name} 的主动回复概率已设为 {pct:.0f}%{C.RESET}")
+            self._show_bot_form(player, name)
+
+        form.on_submit = _submit
+        sender.send_form(form)
+
+    def _style_form(self, sender: Any, name: str) -> None:
+        """说话风格示例编辑（多句用 | 分隔）。"""
+        from endstone.form import ModalForm, TextInput
+        current = " | ".join(self._style_of(name))
+        form = ModalForm(title=f"{name} 的说话风格示例",
+                         submit_button="保存")
+        form.add_control(TextInput(
+            label="示例句子（多句用 | 分隔）。大模型会模仿这些句子的"
+                  "语气、口头禅和情绪来回复，不会逐字照抄。",
+            placeholder="我是XX，我操我太喜欢这个游戏了 | 这个服务器太勾八好玩了hhh",
+            default_value=current))
+
+        def _submit(player: Any, data: Any) -> None:
+            raw = str((list(data or [""])[0]) or "")
+            examples = [x.strip() for x in raw.split("|") if x.strip()]
+            self.set_style(name, examples)
+            self._apply_chat_personality(name)
+            self._record("admin",
+                         f"{player.name} 设说话风格（{len(examples)} 条示例）",
+                         who=name)
+            player.send_message(
+                f"{C.GREEN}{name} 的说话风格已更新（{len(examples)} 条示例，"
+                f"下轮对话生效）{C.RESET}")
+            self._show_bot_form(player, name)
+
+        form.on_submit = _submit
+        sender.send_form(form)
+
+    def _cmd_style(self, sender: CommandSender, args: list[str]) -> None:
+        """控制台版风格设置：/ai style <名字> 示例1|示例2。"""
+        if args and len(args) == 1 and " " in str(args[0]):
+            args = str(args[0]).split(" ", 1)
+        if len(args) < 2:
+            sender.send_message(f"{C.RED}用法: /ai style <名字> 示例1|示例2{C.RESET}")
+            return
+        name = _clean_name(args[0])
+        examples = [x.strip() for x in " ".join(args[1:]).split("|") if x.strip()]
+        self.set_style(name, examples)
+        self._apply_chat_personality(name)
+        sender.send_message(
+            f"{C.GREEN}{name} 的说话风格已更新（{len(examples)} 条示例）{C.RESET}")
+
+    def _cmd_chatrate(self, sender: CommandSender, args: list[str]) -> None:
+        """控制台版概率设置：/ai chatrate <名字> <0~1>。"""
+        if args and len(args) == 1 and " " in str(args[0]):
+            args = str(args[0]).split()
+        if len(args) < 2:
+            sender.send_message(f"{C.RED}用法: /ai chatrate <名字> <0~1>{C.RESET}")
+            return
+        name = _clean_name(args[0])
+        try:
+            chance = max(0.0, min(1.0, float(args[1])))
+        except ValueError:
+            sender.send_message(f"{C.RED}概率要是 0~1 的小数{C.RESET}")
+            return
+        self.set_chat_reply_chance(name, chance)
+        sender.send_message(
+            f"{C.GREEN}{name} 的主动回复概率已设为 {chance:.0%}{C.RESET}")
+
 
     def _cmd_home(self, sender: CommandSender, args: list[str]) -> None:
         """常驻地管理：游戏内无参开表单；控制台用文本命令。"""
@@ -3200,6 +3453,11 @@ class ArcFakePlayerPlugin(Plugin):
             name,
             xuid=str(card_xuid).strip() if card_xuid else None,
             uuid=str(card_uuid).strip() if card_uuid else None)
+        # 播种聊天个性（搭话概率/风格示例）；改过的设置不会被覆盖
+        self._seed_bot_settings(
+            name,
+            chance=getattr(card, "chat_reply_chance", None),
+            style=getattr(card, "style", None))
         goal = str(card.goal) if card.goal else str(self._cfg["default_goal"])
         persona = str(card.persona or "")
         money = float(card.money) if card.money is not None else None

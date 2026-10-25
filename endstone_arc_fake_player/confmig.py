@@ -44,7 +44,8 @@ from typing import Any, Callable
 #:       prompt_command_policy（管理员指令权限说明）
 #:   4 → 好感度与恩怨：social（反击/寻仇/好感度数值）、prompt_social
 #:   5 → 锚点闲逛：roam（开关/挖矿概率），常驻地 homes.json + /ai home 表单
-CONFIG_VERSION = 5
+#:   6 → 聊天个性：chat_reply_chance（公屏搭话概率，bot_settings.json 可按 AI 覆盖）
+CONFIG_VERSION = 6
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:

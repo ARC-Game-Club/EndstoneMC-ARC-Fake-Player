@@ -71,7 +71,7 @@ class PluginFixTests(unittest.TestCase):
         # 大脑以"朋友聊天"的定位听到。
         event.message = "@Al 挖石头"
         plugin.on_player_chat(event)
-        agent.hear.assert_called_once_with("Steve(玩家)", "挖石头")
+        agent.hear.assert_called_once_with("Steve(玩家)", "@Al 挖石头")
         event.cancel.assert_not_called()
         # 管理员：指令式控制——取消事件并立即唤醒决策。
         op_agent = SimpleNamespace(hear=Mock(), state=SimpleNamespace(last_decision=5))
@@ -80,7 +80,7 @@ class PluginFixTests(unittest.TestCase):
                                  player=SimpleNamespace(name="Steve", is_op=True),
                                  cancel=Mock())
         plugin.on_player_chat(event2)
-        op_agent.hear.assert_called_once_with("Steve(管理员)", "挖石头")
+        op_agent.hear.assert_called_once_with("Steve(管理员)", "@Al 挖石头")
         event2.cancel.assert_called_once()
 
     def test_terminal_interaction_failure_reaches_executor(self):
