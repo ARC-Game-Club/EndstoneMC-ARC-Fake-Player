@@ -25,9 +25,17 @@
 
    ```bash
    # 在 bedrock_server 目录下（用服务器同款 Python）
-   pip install --target /tmp/afp endstone_arc_fake_player-*.whl
-   python -c "import sys; sys.path.insert(0, '/tmp/afp');      from endstone_arc_fake_player import packing;      from pathlib import Path;      print(packing.enable_experiments(Path('worlds/<世界名>/level.dat')))"
+   pip install --target ./afp_tmp dist 对应的 endstone_arc_fake_player-*.whl
+   python - <<'EOF'
+   import sys
+   sys.path.insert(0, "./afp_tmp")
+   from pathlib import Path
+   from endstone_arc_fake_player import packing
+   print(packing.enable_experiments(Path("worlds/你的世界名/level.dat")))
+   EOF
    ```
+
+   Windows 服务器把 `<<'EOF'` 那段存成 `patch.py` 跑 `python patch.py` 即可。
 
    补丁成功加载过一次后，之后正常重启不会再丢（会自动留 .bak 备份）。
 4. 再次启动，日志出现 `行为包已就绪，虚拟玩家可以使用真实假人` 即装好。
