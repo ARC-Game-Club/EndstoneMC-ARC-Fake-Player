@@ -419,6 +419,83 @@ class QQSyncTests(unittest.TestCase):
         cls._qq_sync(fake, "chat", "BotA", "x")   # 不抛即为通过
 
 
+class PlaytimeSyncTests(unittest.TestCase):
+    """游玩时长记账（_core_playtime：合成 xuid 垫片直调核心）。"""
+
+    XUID = "9123456789012345"
+
+    def _make_fake(self, cfg=None, core=None, xuid=XUID):
+        import endstone_arc_fake_player.plugin as plugin_mod
+        from types import MethodType
+
+        class Manager:
+            def get_plugin(self, name):
+                if core is None:
+                    raise RuntimeError("no core")
+                return core
+
+        class Server:
+            def __init__(self):
+                self.plugin_manager = Manager()
+
+        fake = SimpleNamespace(
+            _cfg=dict(cfg if cfg is not None else {"playtime_sync": True}),
+            server=Server(),
+            logger=SimpleNamespace(debug=lambda *_: None),
+            _identities=SimpleNamespace(xuid_of=lambda n: xuid))
+        fake._core_playtime = MethodType(
+            plugin_mod.ArcFakePlayerPlugin._core_playtime, fake)
+        return fake, plugin_mod.ArcFakePlayerPlugin
+
+    @staticmethod
+    def _core():
+        calls = []
+
+        class Core:
+            def _record_player_join_playtime(self, player):
+                calls.append(("join", player.name, player.xuid))
+
+            def _record_player_quit_playtime(self, player=None, *,
+                                             xuid="", name=""):
+                calls.append(("quit", name, xuid, player))
+
+        return Core(), calls
+
+    def test_join_passes_synthetic_xuid_shim(self):
+        core, calls = self._core()
+        fake, cls = self._make_fake(core=core)
+        cls._core_playtime(fake, "BotA", joining=True)
+        self.assertEqual(calls, [("join", "BotA", self.XUID)])
+
+    def test_quit_passes_keywords(self):
+        core, calls = self._core()
+        fake, cls = self._make_fake(core=core)
+        cls._core_playtime(fake, "BotA", joining=False)
+        self.assertEqual(
+            calls, [("quit", "BotA", self.XUID, None)])
+
+    def test_disabled_by_config(self):
+        core, calls = self._core()
+        fake, cls = self._make_fake({"playtime_sync": False}, core=core)
+        cls._core_playtime(fake, "BotA", joining=True)
+        cls._core_playtime(fake, "BotA", joining=False)
+        self.assertEqual(calls, [])
+
+    def test_core_missing_is_silent(self):
+        fake, cls = self._make_fake(core=None)
+        cls._core_playtime(fake, "BotA", joining=True)   # 不抛即为通过
+
+    def test_core_without_methods_is_silent(self):
+        fake, cls = self._make_fake(core=object())
+        cls._core_playtime(fake, "BotA", joining=True)
+
+    def test_no_synthetic_xuid_skips(self):
+        core, calls = self._core()
+        fake, cls = self._make_fake(core=core, xuid="")
+        cls._core_playtime(fake, "BotA", joining=True)
+        self.assertEqual(calls, [])
+
+
 class EconomyBridgeTests(unittest.TestCase):
     def make_bridge(self, *, fail=None):
         """core.economy 的最小假实现。fail 是要让它失败的方法名集合。

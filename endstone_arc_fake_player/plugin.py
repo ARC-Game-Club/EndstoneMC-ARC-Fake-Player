@@ -453,6 +453,13 @@ class ArcFakePlayerPlugin(Plugin):
             pass
 
     def on_disable(self) -> None:
+        # 停服/卸载前把在线假人的游玩时长结算掉（否则最后一次会话的
+        # 秒数全丢——进服次数已 +1，时长却没累上，统计就对不上账）。
+        for name in list(self._agents):
+            try:
+                self._core_playtime(name, joining=False)
+            except Exception:
+                pass
         for agent in list(self._agents.values()):
             try:
                 agent.stop("插件卸载")
@@ -661,6 +668,12 @@ class ArcFakePlayerPlugin(Plugin):
             # 格式。同步插件不在就静默跳过。
             "qq_sync_chat": True,
             "qq_sync_join_leave": True,
+            # ---- 游玩时长记账 ----
+            # 真人的"第N次游戏/总游戏时长"由弧光核心在进/退服事件里记账；
+            # SimulatedPlayer 不触发这两个事件，假人的统计永远是 0
+            # （QQ 群消息、核心面板一眼穿帮）。开着他就在进/退服时用
+            # 合成 xuid 走核心同一套记账函数。
+            "playtime_sync": True,
             # ---- 锚点闲逛（日常生活）----
             # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
             # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
@@ -2877,6 +2890,7 @@ class ArcFakePlayerPlugin(Plugin):
             self._stealth.add(name)
             self._apply_pending_gm(name, player)
             self._ensure_core_identity(player, name)
+            self._core_playtime(name, joining=True)
             self._init_wallet_once(name, money)
             self._announce_join(name)
             self._record("spawn", f"角色卡真身已加入，目标: {goal[:60]}",
@@ -3623,6 +3637,7 @@ class ArcFakePlayerPlugin(Plugin):
             self._stealth.add(name)
             self._apply_pending_gm(name, player)
             self._ensure_core_identity(player, name)
+            self._core_playtime(name, joining=True)
             self._init_wallet_once(name, money)
             self._announce_join(name)
         else:
@@ -3636,6 +3651,9 @@ class ArcFakePlayerPlugin(Plugin):
     def crowd_retire(self, name: str, why: str) -> None:
         """让一个角色下线：停大脑 → 收动作 → 撤身体。"""
         was_stealth = name in self._stealth
+        # 先结算游玩时长（身体还在，计时数据完整），再做清理动作。
+        if was_stealth:
+            self._core_playtime(name, joining=False)
         self._stealth.discard(name)
         self._pending_gm.pop(name, None)
         self._pending_crowd.pop(name, None)
@@ -3725,6 +3743,51 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception as exc:
             try:
                 self.logger.debug(f"QQ 同步 {event_type}({name}) 失败: {exc}")
+            except Exception:
+                pass
+
+    def _core_playtime(self, name: str, *, joining: bool) -> None:
+        """把假人的进/退服报给弧光核心记游玩时长（次数 + 总时长）。
+
+        真人由核心的 PlayerJoin/QuitEvent 记账；SimulatedPlayer 不触发
+        这两个事件，假人的"第N次游戏/总时长"永远是 0——QQ 群消息和
+        核心统计面板一眼穿帮。这里用假人的**合成 xuid** 包一个最小
+        垫片对象，调核心同一套记账函数：主服本地写库，从服走中心
+        上报，和真人完全同一条链路。
+
+        ⚠️ 调的是核心的下划线内部方法（没有对外的 api_*）。这几条
+        函数是真人计时的主干，改名的概率极低；万一改了，这里的
+        hasattr/try 兜底也只是"计时回到 0"，不会出别的错。
+        """
+        if not bool(self._cfg.get("playtime_sync", True)):
+            return
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return
+        if core is None:
+            return
+        try:
+            xuid = str(self._identities.xuid_of(name) or "")
+        except Exception:
+            return
+        if not xuid:
+            return
+        try:
+            if joining:
+                fn = getattr(core, "_record_player_join_playtime", None)
+                if not callable(fn):
+                    return
+                from types import SimpleNamespace
+                fn(SimpleNamespace(name=name, xuid=xuid))
+            else:
+                fn = getattr(core, "_record_player_quit_playtime", None)
+                if not callable(fn):
+                    return
+                fn(player=None, xuid=xuid, name=name)
+        except Exception as exc:
+            try:
+                self.logger.debug(f"游玩时长记账失败（{name}）: {exc}")
             except Exception:
                 pass
 
