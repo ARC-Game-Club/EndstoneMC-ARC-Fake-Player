@@ -91,6 +91,7 @@ from .identity import IdentityRegistry, looks_synthetic
 from .llm import LLMClient
 from .pathfinder import make_probe
 from .realbody import RealBodyActions
+from .roam import RoamDriver
 from .social import CombatReflex, FavorStore
 from .world import WorldAdapter, short_id
 
@@ -172,6 +173,8 @@ class ArcFakePlayerPlugin(Plugin):
                 "/arc_fake_player persona <name: str> <text: message>",
                 "/arc_fake_player money <name: str> [amount: float]",
                 "/arc_fake_player cmd <name: str> <command: message>",
+                "/arc_fake_player home",
+                "/arc_fake_player home <args: message>",
                 "/arc_fake_player session <name: str> <minutes: float>",
                 "/arc_fake_player auto [on|off|status]",
                 "/arc_fake_player reload",
@@ -285,6 +288,23 @@ class ArcFakePlayerPlugin(Plugin):
         self._stealth: set[str] = set()
         # (假人, 玩家) → 上次"玩家靠近"提醒时刻。控频用。
         self._proximity_seen: dict[tuple[str, str], float] = {}
+
+        # 常驻地（家）表：homes.json，OP 用 /ai home 设置。
+        self._homes_path = Path(self.data_folder) / "homes.json"
+        self._homes: dict[str, Any] = self._load_homes()
+        # 锚点闲逛驱动：家 > 自己领地 > 公共传送点；忙时（打架/对局/
+        # 有计划）让路。与 arena AI 同级的"条件反射"层。
+        self._roam = RoamDriver(
+            names=lambda: [n for n, a in self._agents.items() if a.alive()],
+            busy=self._roam_busy,
+            anchor=self._roam_anchor,
+            bot_pos=self._bot_pos,
+            surface=self._roam_surface,
+            walk=lambda n, x, y, z: self._bridge.walk(
+                n, x, y, z, timeout=200) >= 0,
+            dig=lambda n, x, y, z: self._bridge.dig(n, x, y, z) >= 0,
+            log=lambda m: self.logger.debug(m))
+        self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
 
         # 编译前先决定用哪种模式（真身体 / 直连）
         self._use_real_body = False
@@ -575,6 +595,15 @@ class ArcFakePlayerPlugin(Plugin):
                 "· 聊天和交易会慢慢涨好感，被攻击和被击杀会大跌。"
                 "管理员测试性的攻击不算仇。"
             ),
+            # ---- 锚点闲逛（日常生活）----
+            # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
+            # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
+            # （不传送——禁传送的服务器同样成立）。
+            "roam": {
+                "enabled": True,
+                # 到点后顺手挖一块方块的概率（0 = 永不挖）
+                "dig_chance": 0.25,
+            },
             # ---- 好感度 / 反击 / 寻仇 ----
             "social": {
                 "enabled": True,
@@ -1707,6 +1736,15 @@ class ArcFakePlayerPlugin(Plugin):
             self._arena_refresh()
         except Exception as exc:
             self.logger.debug(f"arena 刷新失败: {exc}")
+        # 锚点闲逛驱动（家/领地/传送点附近逛 + 偶尔挖方块）。
+        # 只在开着且大脑空闲时干活；忙时让路（见 _roam_busy）。
+        try:
+            roam_cfg = self._cfg.get("roam")
+            if isinstance(roam_cfg, dict) and roam_cfg.get("enabled", True):
+                self._roam.dig_chance = float(roam_cfg.get("dig_chance", 0.25))
+                self._roam.tick()
+        except Exception as exc:
+            self.logger.debug(f"闲逛驱动失败: {exc}")
         # 好感度落盘节流（脏了才写）
         try:
             self._favor.save()
@@ -2157,6 +2195,7 @@ class ArcFakePlayerPlugin(Plugin):
             "session": self._cmd_session, "auto": self._cmd_auto,
             "reload": self._cmd_reload,
             "cmd": self._cmd_cmd,
+            "home": self._cmd_home,
         }.get(args[0].lower())
         if fn is None:
             sender.send_message(f"{C.RED}未知子命令: {args[0]}{C.RESET}")
@@ -2196,6 +2235,7 @@ class ArcFakePlayerPlugin(Plugin):
             f"{C.YELLOW}/ai session <名字> <分钟>{C.RESET}     调整在线角色的剩余游玩时间",
             f"{C.YELLOW}/ai auto [on|off|status]{C.RESET}     自动稳定在线开关/状态",
             f"{C.YELLOW}/ai reload{C.RESET}                    重读 config.json（角色卡等）",
+            f"{C.YELLOW}/ai home{C.RESET}                      AI 管理表单（设家/常驻地）",
             f"{C.YELLOW}/ai install{C.RESET}                  重新安装行为包",
             f"{C.YELLOW}/ai remove <名字>{C.RESET}            移除",
             f"{C.DARK_AQUA}管理员可用 @名字 下指令；普通玩家 @名字 为对话{C.RESET}",
@@ -2774,6 +2814,289 @@ class ArcFakePlayerPlugin(Plugin):
             minutes = max(2.0, (info.get("match_seconds") or 300) / 60.0 + 2.0)
             self._bridge.arena(name, enemies, minutes)
             self._arena_next[name] = now + 15.0
+
+    # ------------------------------------------------------------------
+    # 常驻地与锚点闲逛（家 > 自己领地 > 公共传送点）+ OP 管理表单
+    # ------------------------------------------------------------------
+
+    def _load_homes(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self._homes_path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.logger.warning(f"homes.json 读取失败: {exc}")
+            return {}
+
+    def _save_homes(self) -> None:
+        try:
+            tmp = self._homes_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._homes, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            tmp.replace(self._homes_path)
+        except Exception as exc:
+            self.logger.warning(f"homes.json 保存失败: {exc}")
+
+    def set_home(self, name: str, x: float, y: float, z: float,
+                 dimension: str = "overworld") -> None:
+        """设置常驻地。OP 管理表单与控制台命令共用这一个入口。"""
+        self._homes[name] = {"x": float(x), "y": float(y), "z": float(z),
+                             "dim": str(dimension)}
+        self._save_homes()
+
+    def _roam_busy(self, name: str) -> bool:
+        """闲逛让路条件：打架 / 枪战对局 / 有执行计划 / 等真身。"""
+        agent = self._agents.get(name)
+        return (self._reflex.is_engaged(name)
+                or name in self._arena_next
+                or name in self._pending_crowd
+                or bool(getattr(agent, "_inflight", None)))
+
+    def _roam_anchor(self, name: str) -> tuple[float, float, float, str] | None:
+        """闲逛锚点：家 > 自己领地传送点 > 随机公共传送点。"""
+        home = self._homes.get(name)
+        if isinstance(home, dict):
+            try:
+                return (float(home["x"]), float(home["y"]), float(home["z"]),
+                        "家")
+            except (KeyError, TypeError, ValueError):
+                pass
+        # 自己的领地（按合成 xuid 查——身份系统让假人名下的地也查得到）
+        try:
+            pm = getattr(self.server, "plugin_manager", None)
+            core = pm.get_plugin("arc_core") if pm else None
+            lands = getattr(core, "land_system", None)
+            if lands is not None and self._identities is not None:
+                xuid = self._identities.xuid_of(name)
+                mine = lands.get_player_lands(xuid)
+                if mine:
+                    land = next(iter(mine.values()))
+                    tp = (float(land.get("tp_x", 0) or 0),
+                          float(land.get("tp_y", 64) or 64),
+                          float(land.get("tp_z", 0) or 0))
+                    if any(tp):
+                        return (tp[0], tp[1], tp[2], "领地")
+        except Exception:
+            pass
+        warp = self._random_warp()
+        if warp is not None:
+            return (warp[0], warp[1], warp[2], "传送点")
+        return None
+
+    def _random_warp(self) -> tuple[float, float, float] | None:
+        """随机一个公共传送点（只读 arc_core 的库，60 秒缓存）。"""
+        now = time.monotonic()
+        cached_at, cached = self._warps_cache
+        if now - cached_at > 60.0:
+            fresh: list[tuple] = []
+            try:
+                import sqlite3
+                db_path = (Path(self.data_folder).parent.parent
+                           / "ARCCore" / "ARCCore.db")
+                if db_path.exists():
+                    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                    try:
+                        rows = con.execute(
+                            "SELECT x, y, z FROM public_warps").fetchall()
+                        fresh = [(float(r[0]), float(r[1]), float(r[2]))
+                                 for r in rows]
+                    finally:
+                        con.close()
+            except Exception as exc:
+                self.logger.debug(f"读取公共传送点失败: {exc}")
+            self._warps_cache = (now, fresh)
+            cached = fresh
+        if not cached:
+            return None
+        import random as _random
+        return _random.choice(cached)
+
+    def _roam_surface(self, x: float, z: float, near_y: float) -> float | None:
+        """(x,z) 这一列在 near_y 附近可站立的 y。从上往下找第一块实心。"""
+        try:
+            dim = self.server.level.get_dimension("overworld")
+        except Exception:
+            return None
+        y0 = int(near_y) + 6
+        try:
+            for y in range(y0, max(-64, int(near_y) - 12), -1):
+                name = self._world.get_block_name(dim, int(x), y, int(z))
+                if name and name.strip() not in ("", "minecraft:air", "air"):
+                    return float(y + 1)
+        except Exception:
+            return None
+        return None
+
+    # ---- OP 管理表单（游戏内 UI；控制台仍可用文本命令） ----
+
+    def _show_manage_form(self, sender: Any) -> None:
+        """AI 玩家管理主表单：列出每个 AI，点进去单独管理。"""
+        try:
+            from endstone.form import ActionForm
+        except Exception:
+            sender.send_message(f"{C.RED}本客户端不支持表单{C.RESET}")
+            return
+        names = sorted(set(self._agents) | set(self._homes))
+        if not names and self._identities is not None:
+            names = sorted(self._identities.all().keys())
+        form = ActionForm(
+            title="AI 玩家管理",
+            content="点选一个 AI 玩家进行管理。\n"
+                    "常驻地优先级：家 > 自己的领地 > 公共传送点。\n"
+                    "AI 平时在常驻地附近闲逛，偶尔挖方块；离远了会自己走回去。")
+        for name in names:
+            online = self._live_actor(name) is not None
+            anchor = self._roam_anchor(name)
+            where = anchor[3] if anchor else "无锚点"
+            state = "在线" if online else "离线"
+            form.add_button(
+                f"{name}\n{state} · 锚点: {where}",
+                on_click=lambda s, n=name: self._show_bot_form(s, n))
+        form.add_button("关闭", on_click=lambda s: None)
+        sender.send_form(form)
+
+    def _show_bot_form(self, sender: Any, name: str) -> None:
+        """单个 AI 的管理表单。"""
+        from endstone.form import ActionForm
+        home = self._homes.get(name)
+        anchor = self._roam_anchor(name)
+        lines = [f"名字: {name}",
+                 f"状态: {'在线' if self._live_actor(name) is not None else '离线'}"]
+        if home:
+            lines.append(f"家: ({home.get('x', 0):.0f}, {home.get('y', 0):.0f},"
+                         f" {home.get('z', 0):.0f})")
+        else:
+            lines.append("家: 未设置")
+        if anchor:
+            lines.append(f"当前锚点: {anchor[3]}"
+                         f" ({anchor[0]:.0f},{anchor[1]:.0f},{anchor[2]:.0f})")
+        else:
+            lines.append("当前锚点: 无（会在原地附近小范围晃）")
+        form = ActionForm(title=f"管理 {name}", content="\n".join(lines))
+        form.add_button(
+            "设家到我脚下",
+            on_click=lambda s: self._home_set_here(s, name))
+        form.add_button(
+            "设家到指定坐标",
+            on_click=lambda s: self._home_set_coords_form(s, name))
+        form.add_button(
+            "清除家",
+            on_click=lambda s: self._home_clear(s, name))
+        form.add_button(
+            "传送到他身边",
+            on_click=lambda s: self._cmd_tp(s, [name]))
+        form.add_button(
+            "命令帮助",
+            on_click=lambda s: self._help(s))
+        form.add_button("返回", on_click=lambda s: self._show_manage_form(s))
+        sender.send_form(form)
+
+    def _home_set_here(self, sender: Any, name: str) -> None:
+        loc = getattr(sender, "location", None)
+        if loc is None:
+            sender.send_message(f"{C.RED}拿不到你的位置{C.RESET}")
+            return
+        self.set_home(name, loc.x, loc.y, loc.z)
+        self._record("admin", f"{sender.name} 经表单设置常驻地", who=name)
+        sender.send_message(
+            f"{C.GREEN}{name} 的家已设到你脚下"
+            f"（{loc.x:.0f},{loc.y:.0f},{loc.z:.0f}）{C.RESET}")
+        self._show_bot_form(sender, name)
+
+    def _home_set_coords_form(self, sender: Any, name: str) -> None:
+        from endstone.form import ModalForm, TextInput
+        form = ModalForm(title=f"设置 {name} 的家（输入 x y z）")
+        form.add_control(TextInput(label="X", placeholder="0"))
+        form.add_control(TextInput(label="Y", placeholder="64"))
+        form.add_control(TextInput(label="Z", placeholder="0"))
+
+        def _submit(player: Any, data: Any) -> None:
+            try:
+                values = list(data or [])
+                x, y, z = float(values[0]), float(values[1]), float(values[2])
+            except (TypeError, ValueError, IndexError):
+                player.send_message(f"{C.RED}坐标无效{C.RESET}")
+                return
+            self.set_home(name, x, y, z)
+            self._record("admin", f"{player.name} 经表单设置常驻地"
+                         f" ({x:.0f},{y:.0f},{z:.0f})", who=name)
+            player.send_message(
+                f"{C.GREEN}{name} 的家已设为 ({x:.0f},{y:.0f},{z:.0f}){C.RESET}")
+            self._show_bot_form(player, name)
+
+        form.on_submit = _submit
+        sender.send_form(form)
+
+    def _home_clear(self, sender: Any, name: str) -> None:
+        if self._homes.pop(name, None) is not None:
+            self._save_homes()
+            sender.send_message(f"{C.GREEN}{name} 的家已清除{C.RESET}")
+        else:
+            sender.send_message(f"{C.YELLOW}{name} 本来就没有家{C.RESET}")
+        self._show_bot_form(sender, name)
+
+    def _cmd_home(self, sender: CommandSender, args: list[str]) -> None:
+        """常驻地管理：游戏内无参开表单；控制台用文本命令。"""
+        # message 型 usage 会把整行塞进一个参数，先摊平
+        if args and len(args) == 1 and " " in str(args[0]):
+            args = str(args[0]).split()
+        # 玩家：无参/单个名字 → 管理表单；控制台：继续走文本解析
+        if getattr(sender, "location", None) is not None and (
+                not args or (len(args) == 1 and args[0] not in ("set", "clear"))):
+            self._show_manage_form(sender)
+            return
+        if not args:
+            sender.send_message(
+                f"{C.RED}控制台用法: /ai home <名字> set x y z | clear | 查看{C.RESET}")
+            return
+        name = _clean_name(args[0])
+        sub = args[1].lower() if len(args) > 1 else ""
+        if not sub:
+            home = self._homes.get(name)
+            if home:
+                sender.send_message(
+                    f"{C.AQUA}{name}{C.RESET} 的家: "
+                    f"({home.get('x'):.0f}, {home.get('y'):.0f}, "
+                    f"{home.get('z'):.0f})")
+            else:
+                anchor = self._roam_anchor(name)
+                if anchor:
+                    sender.send_message(
+                        f"{C.YELLOW}{name} 没有家，锚点: {anchor[3]} "
+                        f"({anchor[0]:.0f},{anchor[1]:.0f},{anchor[2]:.0f}){C.RESET}")
+                else:
+                    sender.send_message(f"{C.YELLOW}{name} 没有可用锚点{C.RESET}")
+            return
+        if sub == "set":
+            if len(args) >= 5:
+                try:
+                    x, y, z = float(args[2]), float(args[3]), float(args[4])
+                except ValueError:
+                    sender.send_message(f"{C.RED}坐标要是数字{C.RESET}")
+                    return
+            else:
+                loc = getattr(sender, "location", None)
+                if loc is None:
+                    sender.send_message(
+                        f"{C.RED}控制台请用 /ai home <名字> set x y z{C.RESET}")
+                    return
+                x, y, z = loc.x, loc.y, loc.z
+            self.set_home(name, x, y, z)
+            self._record("admin", f"{sender.name} 设置常驻地"
+                         f" ({x:.0f},{y:.0f},{z:.0f})", who=name)
+            sender.send_message(
+                f"{C.GREEN}{name} 的家已设为 ({x:.0f},{y:.0f},{z:.0f}){C.RESET}")
+            return
+        if sub == "clear":
+            if self._homes.pop(name, None) is not None:
+                self._save_homes()
+                sender.send_message(f"{C.GREEN}{name} 的家已清除{C.RESET}")
+            else:
+                sender.send_message(f"{C.YELLOW}{name} 本来就没有家{C.RESET}")
+            return
+        sender.send_message(f"{C.RED}未知子命令: {sub}{C.RESET}")
 
     def _crowd_tick(self) -> None:
         self._crowd.tick()

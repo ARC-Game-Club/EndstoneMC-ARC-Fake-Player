@@ -773,7 +773,7 @@ def test_prompt_sections() -> None:
 def test_confmig() -> None:
     section("第六部分：confmig —— 老配置升级不丢用户改动")
 
-    check("CONFIG_VERSION 是 4", CONFIG_VERSION == 4, str(CONFIG_VERSION))
+    check("CONFIG_VERSION 是 5", CONFIG_VERSION == 5, str(CONFIG_VERSION))
     check("登记了 v1 的 persona 默认值",
           "prompt_persona" in confmig.LEGACY_DEFAULTS)
     check("登记的 v1 persona 与当前默认值一致（一字未改）",

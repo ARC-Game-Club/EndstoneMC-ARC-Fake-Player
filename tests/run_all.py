@@ -53,6 +53,7 @@ ALL_TESTS = [
     "test_pack_upgrade.py",
     "test_crowd.py",
     "test_social.py",
+    "test_roam.py",
 ]
 
 #: 各文件用自己的 main() 打印的结论行，两种写法都在这了。

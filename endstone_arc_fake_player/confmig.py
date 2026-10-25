@@ -43,7 +43,8 @@ from typing import Any, Callable
 #:   3 → 社交与轮换：auto_online（自动稳定在线调度）、characters（角色卡）、
 #:       prompt_command_policy（管理员指令权限说明）
 #:   4 → 好感度与恩怨：social（反击/寻仇/好感度数值）、prompt_social
-CONFIG_VERSION = 4
+#:   5 → 锚点闲逛：roam（开关/挖矿概率），常驻地 homes.json + /ai home 表单
+CONFIG_VERSION = 5
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:
