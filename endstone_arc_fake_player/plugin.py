@@ -1882,13 +1882,23 @@ class ArcFakePlayerPlugin(Plugin):
     _PROXIMITY_RANGE = 8.0
     #: 同一个"玩家 × 假人"对的提醒冷却（秒）。没有冷却的话一个玩家
     #: 在假人边上站着，每半秒的感知都会塞一条"玩家在你旁边"，
-    #: 上下文很快就被这种废话填满。
+    #: 上下文很快就被这种废话填满。默认从 social.proximity_cooldown_seconds
+    #: 读（240 秒）——90 秒一提醒会让假人变成话痨。
     _PROXIMITY_COOLDOWN = 90.0
+
+    def _proximity_cooldown(self) -> float:
+        try:
+            v = float(self._social_cfg().get(
+                "proximity_cooldown_seconds", 240.0))
+        except (TypeError, ValueError):
+            v = 240.0
+        return max(30.0, v)
 
     def _note_nearby_players(self, name: str, agent: Any, actor: Any) -> None:
         try:
             loc = actor.location
             now = time.monotonic()
+            cooldown = self._proximity_cooldown()
             events: list[dict[str, str]] = []
             for p in self.server.online_players:
                 # 我们自己的假人不算"真人靠近"（xuid 为空）。
@@ -1906,13 +1916,14 @@ class ArcFakePlayerPlugin(Plugin):
                 if d > self._PROXIMITY_RANGE:
                     continue
                 key = (name, pname.lower())
-                if now - self._proximity_seen.get(key, 0.0) < self._PROXIMITY_COOLDOWN:
+                if now - self._proximity_seen.get(key, 0.0) < cooldown:
                     continue
                 self._proximity_seen[key] = now
                 events.append({
                     "kind": "social",
-                    "text": f"玩家 {pname} 就在你旁边（约{d:.0f}格）——"
-                            f"可以打招呼、聊天或搭伙玩"})
+                    "text": f"玩家 {pname} 在你旁边（约{d:.0f}格）。"
+                            f"想搭话可以打个招呼，但别话痨——"
+                            f"没必要时继续做自己的事"})
             if events:
                 agent.note_events(events)
         except Exception as exc:

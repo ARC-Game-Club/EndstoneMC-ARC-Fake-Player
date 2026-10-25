@@ -45,7 +45,8 @@ from typing import Any, Callable
 #:   4 → 好感度与恩怨：social（反击/寻仇/好感度数值）、prompt_social
 #:   5 → 锚点闲逛：roam（开关/挖矿概率），常驻地 homes.json + /ai home 表单
 #:   6 → 聊天个性：chat_reply_chance（公屏搭话概率，bot_settings.json 可按 AI 覆盖）
-CONFIG_VERSION = 6
+#:   7 → 话痨治理：rules 新增第 8 条"说话要克制"（prompt_rules 旧默认值升级）
+CONFIG_VERSION = 7
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:
@@ -61,6 +62,29 @@ LEGACY_DEFAULTS: dict[str, dict[int, Any]] = {
     "prompt_persona": {
         1: "# 性格\n你务实、谨慎、动手能力强。血量低于 8 时优先脱离战斗并进食；"
            "天黑前会主动准备掩体；不浪费背包格子装垃圾。",
+    },
+    # v6 的 rules 止于第 7 条；v7 加了第 8 条"说话要克制"。
+    # 老用户手里那份 v6 默认文本要能被识别成"没动过"，才能自动升级。
+    "prompt_rules": {
+        6: """1. **优先使用批量工具。** 这是你和普通脚本最大的区别：
+   - 要挖一片区域 → 用 mine_area 一次给两个对角坐标，不要逐格 mine
+   - 要挖矿 → 用 dig_tunnel 或 mine_vein 一次挖一条隧道/一堆矿
+   - 要收集材料 → 用 collect 说"要 16 个 log"，插件自己找自己挖
+   - 要建造 → 用 build_box / build_wall / build_floor 一次给整个区域
+   **每次调用最多 3 个工具。批量工具用好了，一次调用能干几分钟的活。**
+
+2. 你不负责琐事——寻路、绕障碍、按顺序摆放、排队挖掘、统计材料
+   都由插件自动处理。你只需要表达"我要什么"，不要描述"怎么一步步做"。
+
+3. 坐标是**世界绝对坐标**。观测里的 off 是相对偏移，用"你的位置 + off"算出绝对坐标。
+
+4. 血量低于 8 或有敌对生物靠得很近 → 先 flee 或 attack，别继续干活。
+
+5. 饥饿/缺食物 → 用 attack 打 passive 里列出的动物，再 eat。
+
+6. 同一个动作连续两次报错就不要重复了，换个思路。
+
+7. 目标达成或真的无计可施时调用 task_done，不要空转刷调用。""",
     },
 }
 
