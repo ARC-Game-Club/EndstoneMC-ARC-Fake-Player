@@ -226,3 +226,44 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class MobEngagementTests(unittest.TestCase):
+    """怪物反击不计好感（≤3.8.8 把僵尸 runtime id 记成仇人的回归）。"""
+
+    def _reflex(self):
+        return CombatReflex(
+            attack=lambda b, t: True,
+            walk=lambda b, x, y, z: True,
+            bot_pos=lambda b: (0.0, 0.0, 0.0),
+            target_pos=lambda t: (3.0, 0.0, 0.0),
+            bot_health=lambda b: 20.0,
+            on_event=lambda b, t: None)
+
+    def test_mob_engagement_not_marked_player(self):
+        r = self._reflex()
+        r.engage("Bot", "12345", label="Zombie", is_player=False)
+        e = r.engagement_of("Bot")
+        self.assertIsNotNone(e)
+        self.assertFalse(e.is_player)
+        self.assertEqual(e.target, "12345")
+        self.assertEqual(e.label, "Zombie")
+
+    def test_player_engagement_default(self):
+        r = self._reflex()
+        r.engage("Bot", "Steve")
+        self.assertTrue(r.engagement_of("Bot").is_player)
+
+    def test_prune_mob_entries(self):
+        import tempfile, os
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "f.json"
+            store = FavorStore(path)
+            store.adjust("Bot", "682", -40.0)     # 怪物 runtime id
+            store.adjust("Bot", "Steve", -5.0)    # 真人
+            store.save()
+            removed = store.prune_mob_entries()
+            self.assertEqual(removed, 1)
+            self.assertNotIn("682", store._data["Bot"])
+            self.assertIn("Steve", store._data["Bot"])

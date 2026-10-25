@@ -297,6 +297,14 @@ class ArcFakePlayerPlugin(Plugin):
         # 反射是秒级反应，不等 LLM；大脑通过事件播报知情并接手后续。
         self._favor = FavorStore(Path(self.data_folder) / "favorability.json",
                                  self.logger)
+        # 历史脏数据自愈：≤3.8.8 被怪打死也会记 -40 到怪的 runtime id 上。
+        try:
+            pruned = self._favor.prune_mob_entries()
+            if pruned:
+                self.logger.info(
+                    f"好感度表：清掉 {pruned} 条误记到怪物身上的条目")
+        except Exception:
+            pass
         self._reflex = CombatReflex(
             attack=lambda b, t: self._bridge.attack(b, t) >= 0,
             walk=lambda b, x, y, z: self._bridge.walk(
@@ -2100,7 +2108,8 @@ class ArcFakePlayerPlugin(Plugin):
         self._mob_targets[key] = (attacker, time.monotonic() + 120.0)
         duration = float(cfg.get("reflex_duration_seconds", 90.0))
         self._reflex.engage(bot, key, reason="怪物来袭",
-                            duration=duration, label=mob_name)
+                            duration=duration, label=mob_name,
+                            is_player=False)
         try:
             self._executor.cancel_all(bot)
         except Exception:
@@ -2288,18 +2297,23 @@ class ArcFakePlayerPlugin(Plugin):
             xuid = str(getattr(p, "xuid", "") or "").strip()
             cfg = self._social_cfg()
             if not xuid and name in self._agents:
-                # 我们的假人死了（会在出生点重生）
-                target = self._reflex.target_of(name)
+                # 我们的假人死了（会在出生点重生）。
+                # 只有**真人击杀**才扣好感/记仇——反击对象是怪物时
+                # target 是 runtime id（≤3.8.8 曾把僵尸记成仇人，绷不住）。
+                e = self._reflex.engagement_of(name)
+                target = e.target if (e is not None and e.is_player) else None
+                shown = (e.label or e.target) if e is not None else ""
+                if e is not None:
+                    self._reflex.disengage(name, "阵亡")
                 if target:
                     penalty = float(cfg.get("kill_penalty", 40.0))
                     score = self._favor.adjust(name, target, -penalty,
                                                reason="被击杀")
-                    self._reflex.disengage(name, "阵亡")
                     self.logger.info(
                         f"[{name}] 被 {target} 击杀，好感度 → {score:+.1f}")
                 agent = self._agents.get(name)
                 if agent is not None and agent.alive():
-                    who = f"被 {target} 击杀" if target else "死了"
+                    who = f"被 {shown or target} 击杀" if (shown or target) else "死了"
                     agent.note_events([{
                         "kind": "combat",
                         "text": f"你{who}，已在出生点重生。这笔账记下了。"}])

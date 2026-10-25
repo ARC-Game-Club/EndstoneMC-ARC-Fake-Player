@@ -152,6 +152,23 @@ class FavorStore:
         self.dirty = True
         return -10.0
 
+    def prune_mob_entries(self) -> int:
+        """清掉误记到**怪物**头上的好感度条目（键是纯数字的 runtime id）。
+
+        ≤3.8.8 的 bug：假人被怪打死时死亡结算不看反击对象是人还是怪，
+        一律 -40——僵尸的 runtime id 就这么成了"仇人"。加载后清一遍，
+        返回清掉的条数。
+        """
+        removed = 0
+        for bot in list(self._data):
+            tbl = self._data.get(bot) or {}
+            for key in [k for k in tbl if str(k).isdigit()]:
+                tbl.pop(key, None)
+                removed += 1
+        if removed:
+            self.dirty = True
+        return removed
+
     def forget(self, bot: str, player: str) -> None:
         self._data.get(bot, {}).pop(player, None)
         self.dirty = True
@@ -180,6 +197,9 @@ class Engagement:
     reason: str = ""
     #: 播报用的人话名字（怪物目标的 target 是 runtime id）。
     label: str = ""
+    #: 目标是不是真人玩家。怪物的 runtime id 不能进好感度/仇人表
+    #: （≤3.8.8 的 bug：被怪打死也记 -40，一串数字成了"仇人"）。
+    is_player: bool = True
     engaged_at: float = 0.0
     give_up_at: float = 0.0
     # 初始为"-无穷"：接管的**第一拍**必须立刻出手/追击，
@@ -232,6 +252,9 @@ class CombatReflex:
         e = self._engaged.get(bot)
         return e.target if e else None
 
+    def engagement_of(self, bot: str) -> Engagement | None:
+        return self._engaged.get(bot)
+
     def engaged_bots_of(self, target: str) -> list[str]:
         """正在围殴某个目标的所有假人（寻仇得手判定用）。"""
         return [b for b, e in self._engaged.items() if e.target == target]
@@ -239,7 +262,8 @@ class CombatReflex:
     # -- 接管 / 放手 ------------------------------------------------------
 
     def engage(self, bot: str, target: str, *, reason: str = "",
-               duration: float = 90.0, label: str = "") -> None:
+               duration: float = 90.0, label: str = "",
+               is_player: bool = True) -> None:
         now = self._clock()
         old = self._engaged.get(bot)
         if old is not None and old.target == target:
@@ -248,7 +272,7 @@ class CombatReflex:
             return
         self._engaged[bot] = Engagement(
             target=target, reason=reason, engaged_at=now,
-            give_up_at=now + duration, label=label)
+            give_up_at=now + duration, label=label, is_player=is_player)
         # 播报给大脑用 label（怪物目标的 target 是 runtime id，念出来
         # 是一串数字，没法读）；日志和内部状态仍然用精确的 target。
         shown = label or target
