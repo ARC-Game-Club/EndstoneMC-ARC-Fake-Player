@@ -130,6 +130,48 @@ class RoamDriverTests(unittest.TestCase):
         self.assertEqual(h.walks, [])
         self.assertEqual(h.digs, [])
 
+    def test_poi_at_least_min_step_from_current_pos(self):
+        # 兴趣点必须离当前站位够远，不能原地罚站
+        h = Harness(bot_pos=(100.0, 64.0, 100.0),
+                    anchor=(101.0, 64.0, 101.0, "家"))
+        h.driver.dig_chance = 0.0
+        for _ in range(6):
+            h.driver.tick()
+            h.clock.now += 60.0
+        self.assertGreaterEqual(len(h.walks), 3)
+        for _, x, _, z in h.walks:
+            dist = ((x - 100.0) ** 2 + (z - 100.0) ** 2) ** 0.5
+            self.assertGreaterEqual(dist, h.driver.MIN_STEP - 1.5)
+
+    def test_dig_and_walk_alternate(self):
+        # 挖/走交替：连续两次不会都是挖（观感更像在玩）
+        h = Harness(bot_pos=(100.0, 64.0, 100.0),
+                    anchor=(100.0, 64.0, 100.0, "家"))
+        h.driver.dig_chance = 1.0
+        kinds = []
+        for _ in range(6):
+            h.driver.tick()
+            kinds.append("dig" if h.digs and not h.walks or
+                         (h.digs and len(h.digs) > len(h.walks)) else "walk")
+            h.clock.now += 60.0
+        digs = len(h.digs)
+        walks = len(h.walks)
+        # 6 次行动里：挖和走都出现，且差不大于 1（交替）
+        self.assertGreater(digs, 0)
+        self.assertGreater(walks, 0)
+        self.assertLessEqual(abs(digs - walks), 1)
+
+    def test_note_failure_shortens_wait(self):
+        h = Harness()
+        h.driver.tick()
+        h.clock.now += 30.0          # 间隔已过
+        h.driver.note_failure("Aqing", "没有可达路径")
+        h.driver.tick()              # 3 秒内——不该行动
+        self.assertEqual(len(h.walks) + len(h.digs), 1)
+        h.clock.now += 3.0
+        h.driver.tick()              # 3 秒到——立刻重试
+        self.assertEqual(len(h.walks) + len(h.digs), 2)
+
 
 def main():
     loader = unittest.defaultTestLoader

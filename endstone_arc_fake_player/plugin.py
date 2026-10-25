@@ -89,7 +89,7 @@ from .economy import EconomyBridge
 from .executor import BatchExecutor, Plan, PlanState, Step
 from .identity import IdentityRegistry, looks_synthetic
 from .llm import LLMClient
-from .pathfinder import make_probe
+from .pathfinder import make_probe, walkable_surface
 from .realbody import RealBodyActions
 from .roam import RoamDriver
 from .social import CombatReflex, FavorStore
@@ -300,9 +300,7 @@ class ArcFakePlayerPlugin(Plugin):
             anchor=self._roam_anchor,
             bot_pos=self._bot_pos,
             surface=self._roam_surface,
-            walk=lambda n, x, y, z: self._bridge.walk(
-                n, x, y, z, timeout=200) >= 0,
-            dig=lambda n, x, y, z: self._bridge.dig(n, x, y, z) >= 0,
+            walk=self._roam_walk, dig=self._roam_dig,
             log=lambda m: self.logger.debug(m))
         self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
 
@@ -2847,12 +2845,20 @@ class ArcFakePlayerPlugin(Plugin):
         self._save_homes()
 
     def _roam_busy(self, name: str) -> bool:
-        """闲逛让路条件：打架 / 枪战对局 / 有执行计划 / 等真身。"""
+        """闲逛让路条件：打架 / 枪战对局 / 有执行计划 / 等真身 /
+        身体控制器正在执行动作（挖掘的走近/挖掘中）。
+
+        最后一条是关键：上一版闲逛的 walk 会打断 bot:dig 的走近，
+        dig 的轮询又把人拽回去——来回抵消，假人"走一步然后罚站"。
+        """
         agent = self._agents.get(name)
-        return (self._reflex.is_engaged(name)
+        if (self._reflex.is_engaged(name)
                 or name in self._arena_next
                 or name in self._pending_crowd
-                or bool(getattr(agent, "_inflight", None)))
+                or bool(getattr(agent, "_inflight", None))):
+            return True
+        ctl = self._bodies.get(name)
+        return ctl is not None and bool(getattr(ctl, "busy", False))
 
     def _roam_anchor(self, name: str) -> tuple[float, float, float, str] | None:
         """闲逛锚点：家 > 自己领地传送点 > 随机公共传送点。"""
@@ -2913,21 +2919,39 @@ class ArcFakePlayerPlugin(Plugin):
         import random as _random
         return _random.choice(cached)
 
+    def _roam_walk(self, name: str, x: int, y: int, z: int) -> bool:
+        """闲逛走位：失败要回灌给驱动（3 秒重试），不能干等一个间隔。"""
+        rid = self._bridge.walk(
+            name, x, y, z, timeout=200,
+            callback=lambda ok, err, info: None if ok
+            else self._roam.note_failure(name, str(err or "走位失败")))
+        return rid >= 0
+
+    def _roam_dig(self, name: str, x: int, y: int, z: int) -> bool:
+        """闲逛挖一块：同样把失败回灌。"""
+        rid = self._bridge.dig(
+            name, x, y, z,
+            callback=lambda ok, err, info: None if ok
+            else self._roam.note_failure(name, str(err or "挖掘失败")))
+        return rid >= 0
+
     def _roam_surface(self, x: float, z: float, near_y: float) -> float | None:
-        """(x,z) 这一列在 near_y 附近可站立的 y。从上往下找第一块实心。"""
+        """(x,z) 这一列在 near_y 附近**可站立**的 y。
+
+        用寻路器同款的 walkable_surface（脚下实心、身体两格空、不站
+        岩浆/火），窗口放宽到 +8/-14——家附近常有 64~76 的丘陵，手搓的
+        窄窗口会大量静默失败，表现成"定在家的那个点上罚站"。
+        """
         try:
             dim = self.server.level.get_dimension("overworld")
         except Exception:
             return None
-        y0 = int(near_y) + 6
         try:
-            for y in range(y0, max(-64, int(near_y) - 12), -1):
-                name = self._world.get_block_name(dim, int(x), y, int(z))
-                if name and name.strip() not in ("", "minecraft:air", "air"):
-                    return float(y + 1)
+            y = walkable_surface(dim, self._world, int(x), int(z),
+                                 int(near_y), range_down=14, range_up=8)
+            return float(y) if y is not None else None
         except Exception:
             return None
-        return None
 
     # ---- OP 管理表单（游戏内 UI；控制台仍可用文本命令） ----
 

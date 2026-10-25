@@ -37,6 +37,8 @@ class RoamState:
     next_at: float = 0.0
     #: 当前锚点（x, y, z, 来源标签）。缓存下来用于日志与调试。
     anchor: tuple[float, float, float, str] | None = None
+    #: 上一个动作是不是挖（挖/走交替，观感更像在"玩"而不是刷任务）
+    last_was_dig: bool = False
 
 
 class RoamDriver:
@@ -63,6 +65,9 @@ class RoamDriver:
     FAR_FROM_ANCHOR = 60.0
     #: 一"腿"的长度（格）
     LEG_LENGTH = 48.0
+    #: 兴趣点必须离**当前站位**至少这么远——不然每个周期都只在原地
+    #: 一两格内挪，看起来就是"定在家那个点上罚站"。
+    MIN_STEP = 4.0
 
     def __init__(self, *, names: Callable[[], list[str]], busy: Callable[[str], bool],
                  anchor: Callable[[str], tuple | None],
@@ -87,6 +92,17 @@ class RoamDriver:
 
     def state_of(self, name: str) -> RoamState:
         return self._states.setdefault(name, RoamState())
+
+    def note_failure(self, name: str, why: str = "") -> None:
+        """动作执行失败（引擎寻路不到/被拒）时由回调告知。
+
+        默认要等满一个行动间隔（10~26s）才会再试；失败时缩短到 3 秒，
+        否则一次失败就能让假人在原地罚站半个间隔以上。
+        """
+        st = self.state_of(name)
+        st.next_at = self._clock() + 3.0
+        if why:
+            self._log(f"[{name}] 闲逛动作失败，3 秒后重试: {why}")
 
     # ------------------------------------------------------------------
 
@@ -135,21 +151,31 @@ class RoamDriver:
             st.next_at = now + self._rng.uniform(*self.ACTION_GAP)
             return
 
-        # 正常闲逛：锚点附近随机一个兴趣点
+        # 正常闲逛：锚点附近随机一个兴趣点。
+        # 候选要有三个性质：在锚点半径内、离**当前站位**够远（MIN_STEP，
+        # 保证每步肉眼可见）、那一列真的能站（surface）。
         lo, hi = self.POI_RADIUS if anchor is not None else (
             self.POI_RADIUS[0] // 2, self.POI_RADIUS[1] // 2)
-        for _ in range(4):
+        tx = ty = tz = None
+        for _ in range(8):
             ang = self._rng.uniform(0, math.tau)
             r = self._rng.uniform(lo, hi)
-            tx, tz = ax + math.cos(ang) * r, az + math.sin(ang) * r
-            ty = self._surface(tx, tz, pos[1])
-            if ty is not None:
+            cx, cz = ax + math.cos(ang) * r, az + math.sin(ang) * r
+            if math.dist((cx, cz), (pos[0], pos[2])) < self.MIN_STEP:
+                continue
+            cy = self._surface(cx, cz, pos[1])
+            if cy is not None:
+                tx, ty, tz = cx, cy, cz
                 break
-        else:
+        if tx is None:
+            # 一个能站的点都没挑到（地形太陡/未加载）——小退避后重试
             st.next_at = now + 6.0
             return
 
-        want_dig = self.dig_chance > 0 and self._rng.random() < self.dig_chance
+        # 挖/走交替：连续两次不重复同一种动作
+        want_dig = (self.dig_chance > 0 and not st.last_was_dig
+                    and self._rng.random() < self.dig_chance * 1.34)
+        st.last_was_dig = want_dig
         if want_dig:
             # 挖"兴趣点脚下的那块"：bot:dig 自带走近，挖完正好人就在
             # 兴趣点上——一步到位地"走过去顺便挖一块"
