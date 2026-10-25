@@ -79,6 +79,7 @@ from .actions import ActionCompiler
 from .activity import ActivityLog
 from .agent import (DEFAULT_BODY, DEFAULT_GAME_KNOWLEDGE, DEFAULT_IDENTITY,
                     DEFAULT_ITEM_NAMES, DEFAULT_PERSONA, DEFAULT_RULES,
+                    DEFAULT_SPEECH,
                     DEFAULT_SURFACE_HINT, Agent, AgentConfig)
 from .body import BodyRegistry
 from .bridge import FakePlayerBridge
@@ -636,6 +637,9 @@ class ArcFakePlayerPlugin(Plugin):
             "prompt_body": DEFAULT_BODY,
             "prompt_persona": DEFAULT_PERSONA,
             "prompt_rules": DEFAULT_RULES,
+            # 怎么说话（去 AI 味守则）：短、直接、口语、有态度、禁书面词。
+            # 真人聊天没有"值得注意的是"，改这里全服假人的口吻一起变。
+            "prompt_speech": DEFAULT_SPEECH,
             # 解释"附近方块只列表面方块"。关掉 surface_only 时它不再贴切，
             # 所以 build_system 那边会按开关决定带不带这一段。
             "prompt_surface_hint": DEFAULT_SURFACE_HINT,
@@ -2795,6 +2799,7 @@ class ArcFakePlayerPlugin(Plugin):
                 body=str(self._cfg["prompt_body"]),
                 persona=persona or str(self._cfg["prompt_persona"]),
                 style=self._style_block(name),
+                speech=str(self._cfg.get("prompt_speech", DEFAULT_SPEECH)),
                 rules=(str(self._cfg["prompt_rules"]) + "\n\n"
                        + str(self._cfg.get("prompt_command_policy", ""))
                        + "\n\n" + str(self._cfg.get("prompt_social", ""))),

@@ -47,7 +47,8 @@ from typing import Any, Callable
 #:   6 → 聊天个性：chat_reply_chance（公屏搭话概率，bot_settings.json 可按 AI 覆盖）
 #:   7 → 话痨治理：rules 新增第 8 条"说话要克制"（prompt_rules 旧默认值升级）
 #:   8 → 枪战自动补位：shooter_fill（真人进大厅自动派 AI，quiet 加入）
-CONFIG_VERSION = 8
+#:   9 → 说话方式：prompt_speech（去 AI 味的聊天守则，新增键直接补）
+CONFIG_VERSION = 9
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:

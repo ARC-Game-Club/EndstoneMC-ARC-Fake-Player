@@ -260,6 +260,13 @@ def main() -> int:
     agent.config.spontaneous_say_min = 0.0
     agent.config.spontaneous_say_max = 0.0
 
+    # ---- 说话方式段注入 ----
+    from endstone_arc_fake_player.agent import build_system as _bs
+    agent.config.speech = "短、口语、有态度，禁'值得注意'"
+    sys_text3 = _bs(agent.state)
+    check("说话守则进系统提示词", "短、口语、有态度" in sys_text3)
+    agent.config.speech = ""
+
     # ---- 长期使命注入 ----
     from endstone_arc_fake_player.agent import build_system
     probe = agent.state
