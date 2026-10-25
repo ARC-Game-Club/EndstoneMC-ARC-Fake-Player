@@ -1,5 +1,40 @@
 # arc_fake_player
 
+## 3.5：合成身份——假人无缝接入弧光核心
+
+SimulatedPlayer 没过 Xbox 认证，引擎给的 xuid 是**空字符串**且改不了；
+而弧光核心的 `player_basic_info` / 经济全以 xuid 为主键——空 xuid 意味着
+**所有假人挤在同一行数据里**（共享钱包、互相覆盖统计）。
+
+**合成身份注册表**（`identity.py`，落盘 `plugins/arc_fake_player/
+identities.json`）：每个假人一个终身稳定的
+
+- **xuid**：16 位数字、9 开头（真实 XUID 常见 2/3 开头，一眼可辨且永不
+  撞车），由 `SHA-256("arc_fake_player:"+名字)` 派生——同名永远同值，
+  重装/换机不变；角色卡可显式钉死（`characters` 里写 `xuid`/`uuid`，
+  跨服务器同一个"人"）
+- **uuid**：UUIDv5，同样稳定
+
+**核心侧配合（arc_core ≥0.9.82）**：`_resolve_xuid` 在玩家 xuid 为空时
+调本插件 `api_resolve_xuid(player)`（会校验该玩家确实是我们的模拟玩家，
+同名真人/离线登录者不认领），`ensure_player_data_initialized` /
+`init_player_basic_info` / `init_player_local_info` / `init_player_economy_info`
+/ `update_player_name` / `get_player_money` 六处主键全部走它。又因这版
+Endstone 的 `PlayerJoinEvent` **不触发** SimulatedPlayer，核心的 join
+初始化永远不会为假人跑——所以本插件在每具身体接上时**主动调**
+`ensure_player_data_initialized`（`_ensure_core_identity`）。
+
+**钱包键切换**：经济键从旧 `fake_<名字>` 换成合成 xuid，首次建钱包时
+旧键余额自动迁移（取较大值）；"首次"判定用注册表的一次性标记
+（`wallet_init`），角色轮换不会反复发卡面初始金钱。
+
+实测（测试服）：三个角色假人 + 助手身体在核心库各有独立
+`player_basic_info` 行（合成 xuid 与真人并列），钱包为各自角色卡的
+初始金额（120/260/80），助手 TianXing 也有自己的身份行。
+
+仓库：ARC-Game-Club/EndstoneMC-ARC-Fake-Player（组织由 ARC-Minecraft
+更名而来）。
+
 ## 3.4：枪战 arena 战斗 AI（进对局自动开打）
 
 **对局内战斗逻辑**（服主定的）：找到**最近的敌方玩家** → 走过去 →

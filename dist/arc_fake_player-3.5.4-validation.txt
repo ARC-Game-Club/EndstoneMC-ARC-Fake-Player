@@ -1,0 +1,33 @@
+arc_fake_player 3.5.4 validation (2026-10-25 Asia/Shanghai)
+
+Python regression suite: 1116 checks passed across 12 files
+(identity tests: stable synthetic xuid/uuid, pin-first-wins,
+pin(None) never yields the string "None", mark-once wallet init).
+Command: python -X utf8 tests/run_all.py -q
+
+Synthetic identity integration, verified live on MCBETestServer
+(BDS 1.26.45, Endstone 0.11.10, arc_core 0.9.82):
+- identities.json holds one stable 16-digit 9-prefixed xuid + uuid5
+  per bot (3 crowd cards + assistant TianXing).
+- arc_core DB player_basic_info: one row per bot keyed by synthetic
+  xuid alongside the real player's row; player_economy wallets carry
+  each card's initial money (120/260/80).
+- Root causes fixed along the way:
+  1) str(None).strip() == "None" is truthy — pin() and crowd_spawn
+     both produced xuid="None" before the normalization fix;
+  2) PlayerJoinEvent does NOT fire for SimulatedPlayers in this
+     Endstone build — arc_core's join init never ran for bots; the
+     plugin now calls ensure_player_data_initialized itself when a
+     body attaches (_ensure_core_identity);
+  3) arc_core get_player_money_by_xuid is get-or-create, so wallet
+     "first time" is decided by a one-shot marker in the identity
+     registry (no free money on every rotation).
+
+Repos pushed:
+- ARC-Game-Club/EndstoneMC-ARC-Fake-Player (new, v3.5.4)
+- ARC-Game-Club/EndstoneMC-ARC-AI-Helper v2.4.0 (rebased on 2.3.13)
+- ARC-Game-Club/EndStone-ARC-Shooter-Game v0.4.26 (rebased on 0.4.25)
+- ARC-Game-Club/EndstoneMC-ARC-Core-Plugin v0.9.82 (resolver patch
+  re-applied onto 0.9.81; note: org renamed from ARC-Minecraft)
+
+Wheel: endstone_arc_fake_player-3.5.4-py3-none-any.whl
