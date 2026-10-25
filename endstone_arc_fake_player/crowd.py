@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -183,10 +184,17 @@ class CrowdScheduler:
         self.sessions: dict[str, Session] = {}
         #: 等待上线的空位
         self.pending: list[Pending] = []
-        #: 卡片轮换游标。按顺序发牌、发完一轮再从头，配合"跳过在线的"，
-        #: 保证同一张卡不会连续霸场。
+        #: 下一个允许上线的时间（monotonic）。**每成功上线一个角色**
+        #: 就把这里推后一个随机间隔——启动补位也一样：三个人间隔
+        #: 1~5 分钟陆续进服，而不是同一秒齐刷刷上线（太假）。
+        self._next_join_due: float | None = None
+        #: 最近下线的名字（小写）。挑卡时优先避开——"刚走的人秒回"
+        #: 是很出戏的。池子不够挑时放开。
+        self._recent: deque[str] = deque(maxlen=3)
+        #: 兼容字段：3.7 及以前按序发牌的游标。已改随机挑卡，保留
+        #: 属性只为老测试/外部引用不炸。
         self._cursor = 0
-        #: 是否已经完成过启动期补位（启动期补位不等 gap，直接 stagger 上）
+        #: 是否已经完成过启动期补位（历史行为见 tick 第 4 步）
         self._bootstrapped = False
         #: LLM 未就绪只告警一次的状态位
         self._llm_wait_warned = False
@@ -268,9 +276,15 @@ class CrowdScheduler:
             self._bootstrapped = True
 
         # 5) 到点的空位：挑卡上线。
+        #    进服冷却：上一个人上线后必须歇一个随机间隔，下一个才进——
+        #    真人从来不会三人同秒进服。冷却只挡"新上线"，不影响下线。
+        #    注意闸门在循环**内部**：_fill_slot 成功会立刻推后冷却时间，
+        #    同一拍里排在后面的空位必须重新看到它。
         for slot in list(self.pending):
             if slot.due > now:
                 continue
+            if self._next_join_due is not None and now < self._next_join_due:
+                break
             self.pending.remove(slot)
             self._fill_slot(now)
 
@@ -281,6 +295,7 @@ class CrowdScheduler:
 
     def _retire(self, name: str, why: str) -> None:
         self.sessions.pop(name, None)
+        self._recent.append(str(name).lower())
         try:
             self._plugin.crowd_retire(name, why)
         except Exception as exc:
@@ -310,21 +325,30 @@ class CrowdScheduler:
             return
         self.sessions[card.name] = Session(
             card=card, deadline=now + play * 60.0, started_at=now)
+        # 每次有人进服，下一个要隔一个随机间隔再进（rejoin_gap 配置）。
+        self._next_join_due = now + self._random_minutes(
+            "rejoin_gap_min_minutes", "rejoin_gap_max_minutes", 1, 5) * 60.0
         self._plugin.crowd_log(
             "info", f"角色 {card.name} 已上线，计划游玩 {play:.0f} 分钟")
 
     def _pick_card(self) -> CharacterCard | None:
-        """挑下一张卡：按序发牌，跳过不可用的名字。"""
+        """随机挑一张卡进服（跳过在线/占用/真人重名的名字）。
+
+        3.7 及以前是按序发牌（游标轮转）——每次进服的都那几个人按
+        固定顺序出场，看两轮就露馅。现在从可用池里随机抽，并优先
+        避开"最近刚下线"的名字（刚走的人秒回也很出戏）；池子太小
+        时放开限制。
+        """
         cards = self._plugin.crowd_cards()
         if not cards:
             return None
         taken = self._taken_names()
-        for _ in range(len(cards)):
-            card = cards[self._cursor % len(cards)]
-            self._cursor += 1
-            if card.name.lower() not in taken:
-                return card
-        return None
+        avail = [c for c in cards if c.name.lower() not in taken]
+        if not avail:
+            return None
+        fresh = [c for c in avail if c.name.lower() not in self._recent]
+        pool = fresh if fresh else avail
+        return self._rng.choice(pool)
 
     def _taken_names(self) -> set[str]:
         taken = {n.lower() for n in self.sessions}

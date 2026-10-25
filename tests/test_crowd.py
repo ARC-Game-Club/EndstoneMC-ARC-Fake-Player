@@ -126,10 +126,19 @@ class CrowdSchedulerTests(unittest.TestCase):
         self.sched = CrowdScheduler(self.plugin, clock=self.clock,
                                     rng=random.Random(42))
 
-    def tick(self, n=1, seconds=30.0):
+    def tick(self, n=1, seconds: float = 30.0):
         for _ in range(n):
             self.clock.advance(seconds)
             self.sched.tick()
+
+    def run_until(self, predicate, *, max_ticks: int = 400,
+                  seconds: float = 30.0):
+        """反复 tick 直到条件成立（进服有随机间隔，不能一次到位）。"""
+        for _ in range(max_ticks):
+            if predicate():
+                return
+            self.tick(1, seconds)
+        self.assertTrue(predicate(), "run_until 超时")
 
     def test_disabled_drains_pending(self):
         self.plugin.config["enabled"] = False
@@ -145,33 +154,46 @@ class CrowdSchedulerTests(unittest.TestCase):
         warns = [m for lvl, m in self.plugin.logs if lvl == "warning"]
         self.assertEqual(len(warns), 1)
 
-    def test_startup_fills_to_target(self):
+    def test_startup_staggers_joins(self):
+        """启动补位不再齐刷刷上线：第一拍只进一个人，之后每个新进服
+        都要隔一个随机间隔（rejoin_gap）。"""
+        self.plugin.config.update({
+            "rejoin_gap_min_minutes": 1, "rejoin_gap_max_minutes": 1,
+        })
         self.sched.tick()
+        # 只有 1 个人进服，另外 2 个空位在等进服冷却
+        self.assertEqual(len(self.plugin.spawned), 1)
+        self.assertEqual(len(self.sched.pending), 2)
+        self.assertIsNotNone(self.sched._next_join_due)
+        # 30 秒后仍在冷却（gap=1 分钟）
+        self.tick(1)
+        self.assertEqual(len(self.plugin.spawned), 1)
+
+    def test_startup_fills_to_target(self):
+        self.run_until(lambda: len(self.sched.sessions) == 3)
         self.assertEqual(len(self.plugin.spawned), 3)
-        self.assertEqual(len(self.sched.sessions), 3)
 
     def test_expires_at_deadline_and_rejoins_after_gap(self):
         self.plugin.config.update({
+            "target_count": 1,
             "play_minutes_min": 10, "play_minutes_max": 10,   # 固定 10 分钟
             "rejoin_gap_min_minutes": 2, "rejoin_gap_max_minutes": 2,
         })
         self.sched.tick()
-        first = set(self.sched.sessions)
-        # 9 分钟：都还在线
+        first = self.plugin.spawned[0]
+        # 9 分钟：还在线
         self.tick(18, 30.0)
-        self.assertEqual(set(self.sched.sessions), first)
-        # 到点（10 分钟过后）：全部下线，空位进入 gap 等待
-        self.tick(2, 30.0)
+        self.assertIn(first, self.sched.sessions)
+        # 到点：下线，空位进入 gap 等待
+        self.sched.sessions[first].deadline = self.clock.now
+        self.tick(1)
         self.assertEqual(len(self.sched.sessions), 0)
-        self.assertEqual(len(self.plugin.retired), 3)
-        self.assertEqual(len(self.sched.pending), 3)
         # gap 2 分钟未到：不补
         self.tick(3, 30.0)
         self.assertEqual(len(self.sched.sessions), 0)
-        # gap 过了：三张新卡上线（A/B/C/D 共 4 张，占 3 张剩 1 张，
-        # 上一轮用过的会按发牌顺序轮换）
-        self.tick(2, 30.0)
-        self.assertEqual(len(self.sched.sessions), 3)
+        # gap 过了：补人（不是刚走的那个）
+        self.run_until(lambda: len(self.sched.sessions) == 1)
+        self.assertNotEqual(self.plugin.spawned[-1], first)
 
     def test_dead_body_triggers_retire_and_refill(self):
         self.sched.tick()
@@ -180,15 +202,41 @@ class CrowdSchedulerTests(unittest.TestCase):
         self.tick(1)
         self.assertIn((victim, "身体消失"), self.plugin.retired)
 
-    def test_card_rotation_avoids_active_names(self):
+    def test_fill_uses_all_cards_when_target_matches_pool(self):
         self.plugin.config["target_count"] = 4
-        self.sched.tick()
+        self.run_until(lambda: len(self.sched.sessions) == 4)
         self.assertEqual(sorted(self.plugin.spawned), ["A", "B", "C", "D"])
+
+    def test_pick_is_random_not_round_robin(self):
+        """挑卡是随机的：不同种子下首个上线角色应有多个取值
+        （按序发牌永远只出同一张）。"""
+        firsts = set()
+        for seed in range(30):
+            plugin = FakePlugin(cards=[make_card(n) for n in "ABCD"])
+            clock = FakeClock()
+            sched = CrowdScheduler(plugin, clock=clock,
+                                   rng=random.Random(seed))
+            sched.tick()
+            firsts.add(plugin.spawned[0])
+        self.assertGreater(len(firsts), 1)
+
+    def test_recently_retired_not_re_picked(self):
+        """刚下线的名字短时间内不该立刻回来（出戏）。"""
+        self.plugin.config.update({
+            "target_count": 1,
+            "rejoin_gap_min_minutes": 1, "rejoin_gap_max_minutes": 1,
+        })
+        self.sched.tick()
+        first = self.plugin.spawned[0]
+        # 到点下线 → 空位补人：新进来的不该是刚走的那个
+        self.sched.sessions[first].deadline = self.clock.now
+        self.run_until(lambda: len(self.plugin.spawned) >= 2)
+        self.assertNotEqual(self.plugin.spawned[1], first)
 
     def test_reserved_and_real_player_names_skipped(self):
         self.plugin.reserved = {"A"}
         self.plugin.real_players = {"B"}
-        self.sched.tick()
+        self.run_until(lambda: len(self.sched.sessions) >= 1)
         self.assertNotIn("A", self.plugin.spawned)
         self.assertNotIn("B", self.plugin.spawned)
 
@@ -196,11 +244,11 @@ class CrowdSchedulerTests(unittest.TestCase):
         self.plugin.spawn_fail = {"A"}
         self.plugin.config["target_count"] = 1
         self.sched.tick()
-        # A 失败 → 退避 60 秒；30 秒后再 tick 还没人
-        self.tick(1)
         self.assertEqual(self.plugin.spawned, [])
-        self.tick(2)   # 60 秒过了 → 发牌游标已过 A，换 B 上
-        self.assertEqual(self.plugin.spawned, ["B"])
+        # 60 秒退避后重试；随机挑卡可能又撞 A，但总会轮到能上线的卡
+        self.tick(2)
+        self.run_until(lambda: len(self.plugin.spawned) >= 1)
+        self.assertNotIn("A", self.plugin.spawned)
 
     def test_forget_then_refill_keeps_count(self):
         self.sched.tick()
@@ -229,20 +277,68 @@ class CrowdSchedulerTests(unittest.TestCase):
             "target_count": 2,
             "rejoin_gap_min_minutes": 1, "rejoin_gap_max_minutes": 1,
         })
-        self.sched.tick()
-        self.assertEqual(len(self.sched.sessions), 2)
+        self.run_until(lambda: len(self.sched.sessions) == 2)
         # 目标提到 3：新空位要等 gap（1 分钟），不是立刻冒出来
         self.plugin.config["target_count"] = 3
         self.tick(1)
         self.assertEqual(len(self.sched.sessions), 2)
-        self.tick(2)
-        self.assertEqual(len(self.sched.sessions), 3)
+        self.run_until(lambda: len(self.sched.sessions) == 3)
 
     def test_describe_mentions_counts(self):
-        self.sched.tick()
+        self.run_until(lambda: len(self.sched.sessions) == 3)
         text = "\n".join(self.sched.describe())
         self.assertIn("目标 3 人", text)
         self.assertIn("在线 3", text)
+
+
+class JoinLeaveAnnounceTests(unittest.TestCase):
+    """进/退服播报（plugin.py 上的 _announce_*，用假 self 直调）。"""
+
+    CFG = {
+        "join_message": "§e{name} 加入了游戏",
+        "leave_message": "§e{name} 离开了游戏",
+    }
+
+    def _make_fake(self, cfg=None):
+        import endstone_arc_fake_player.plugin as plugin_mod
+        from types import MethodType
+
+        class Server:
+            def __init__(self):
+                self.sent = []
+
+            def broadcast_message(self, text):
+                self.sent.append(text)
+
+        fake = SimpleNamespace(
+            _stealth={"BotA"}, _cfg=dict(cfg if cfg is not None else self.CFG),
+            server=Server(), _record=lambda *a, **k: None)
+        # _announce_* 内部调 self._announce——把真方法绑到假 self 上
+        fake._announce = MethodType(plugin_mod.ArcFakePlayerPlugin._announce,
+                                    fake)
+        return fake, plugin_mod.ArcFakePlayerPlugin
+
+    def test_join_announced_for_stealth_bot(self):
+        fake, cls = self._make_fake()
+        cls._announce_join(fake, "BotA")
+        self.assertEqual(fake.server.sent, ["§eBotA 加入了游戏"])
+
+    def test_leave_announced(self):
+        fake, cls = self._make_fake()
+        cls._announce_leave(fake, "BotA")
+        self.assertEqual(fake.server.sent, ["§eBotA 离开了游戏"])
+
+    def test_manual_spawn_not_announced(self):
+        """不在 _stealth 里的手动假人不播报（它有自己的回执）。"""
+        fake, cls = self._make_fake()
+        cls._announce_join(fake, "ManualBot")
+        self.assertEqual(fake.server.sent, [])
+
+    def test_empty_template_disables(self):
+        fake, cls = self._make_fake({"join_message": "", "leave_message": ""})
+        cls._announce_join(fake, "BotA")
+        cls._announce_leave(fake, "BotA")
+        self.assertEqual(fake.server.sent, [])
 
 
 class EconomyBridgeTests(unittest.TestCase):

@@ -647,6 +647,13 @@ class ArcFakePlayerPlugin(Plugin):
             # 公屏闲聊（没点名）时 AI 搭话的概率（0~1）。每个 AI 可在
             # 管理表单/角色卡里单独覆盖；@点名永远必回。
             "chat_reply_chance": 0.15,
+            # ---- 进/退服播报 ----
+            # 轮换假人上线/下线时广播一条**原版风格**的消息（真玩家进退服
+            # 客户端会自己显示，SimulatedPlayer 不会——不补这条，在线人数
+            # 变了却没有动静，一眼假）。{name} 替换成假人名；留空关闭。
+            # 只对自动在线的群演假人生效；手动 /ai spawn 的有自己的回执。
+            "join_message": "§e{name} 加入了游戏",
+            "leave_message": "§e{name} 离开了游戏",
             # ---- 锚点闲逛（日常生活）----
             # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
             # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
@@ -2864,6 +2871,7 @@ class ArcFakePlayerPlugin(Plugin):
             self._apply_pending_gm(name, player)
             self._ensure_core_identity(player, name)
             self._init_wallet_once(name, money)
+            self._announce_join(name)
             self._record("spawn", f"角色卡真身已加入，目标: {goal[:60]}",
                          who=name)
 
@@ -3609,6 +3617,7 @@ class ArcFakePlayerPlugin(Plugin):
             self._apply_pending_gm(name, player)
             self._ensure_core_identity(player, name)
             self._init_wallet_once(name, money)
+            self._announce_join(name)
         else:
             # 等真身加入，_try_attach_pending 接管
             self._pending_crowd[name] = (goal, persona, money,
@@ -3619,6 +3628,7 @@ class ArcFakePlayerPlugin(Plugin):
 
     def crowd_retire(self, name: str, why: str) -> None:
         """让一个角色下线：停大脑 → 收动作 → 撤身体。"""
+        was_stealth = name in self._stealth
         self._stealth.discard(name)
         self._pending_gm.pop(name, None)
         self._pending_crowd.pop(name, None)
@@ -3652,7 +3662,32 @@ class ArcFakePlayerPlugin(Plugin):
                 actor.remove()
             except Exception:
                 pass
+        if was_stealth:
+            self._announce_leave(name)
         self._record("crowd", f"已下线（{why}）", who=name)
+
+    # ------------------------------------------------------------------
+    # 进/退服播报（原版风格，只给轮换的群演假人）
+    # ------------------------------------------------------------------
+
+    def _announce_join(self, name: str) -> None:
+        """真玩家进服时客户端会自己显示"xx 加入了游戏"；假人不会——
+        由我们替它广播一条同款文案，不然在线人数变了公屏却没动静。"""
+        if name not in self._stealth:
+            return
+        self._announce("join_message", name)
+
+    def _announce_leave(self, name: str) -> None:
+        self._announce("leave_message", name)
+
+    def _announce(self, key: str, name: str) -> None:
+        tpl = str(self._cfg.get(key) or "").strip()
+        if not tpl:
+            return
+        try:
+            self.server.broadcast_message(tpl.replace("{name}", name))
+        except Exception:
+            pass
 
     # ---- 出生点选址 ----------------------------------------------------
 
