@@ -196,6 +196,37 @@ def main() -> int:
           len(agent.state.recent_events) > 0,
           str(list(agent.state.recent_events)[:3]))
 
+    # ---- 随机决策间隔 ----
+    # 固定 min=max=50：think 后应掷出 50 秒间隔，30 秒时不再思考、51 秒时到点
+    agent.config.decision_interval_min = 50.0
+    agent.config.decision_interval_max = 50.0
+    agent.state.last_decision = 0.0
+    agent.state.decision_gap = 0.0
+    agent.think()
+    check("随机间隔已掷出", wait(lambda: abs(agent.state.decision_gap - 50.0) < 1e-6),
+          str(agent.state.decision_gap))
+    # 探测用的 think 会提交计划，先排干执行器，别让 wait_for_plan 闸门干扰
+    wait(lambda: not agent.state.thinking and not executor.busy)
+    for _ in range(50):
+        if not executor.busy:
+            break
+        done = executor.tick()
+        agent.reap_finished(done)
+        time.sleep(0.01)
+    now = time.monotonic()
+    agent.state.last_decision = now - 30.0
+    check("间隔内不再思考", not agent.should_think(time.monotonic()))
+    agent.state.last_decision = now - 51.0
+    check("到点恢复思考", agent.should_think(time.monotonic()))
+    # 未启用随机（max=0）时回退固定 interval
+    agent.config.decision_interval_max = 0.0
+    agent.state.decision_gap = 0.0
+    agent.config.decision_interval = 12.0
+    agent.state.last_decision = now - 13.0
+    check("固定间隔模式下到点思考", agent.should_think(time.monotonic()))
+    agent.state.last_decision = now - 5.0
+    check("固定间隔模式下间隔内不思考", not agent.should_think(time.monotonic()))
+
     # 检查最终提示词里包含上批动作
     agent.state.last_decision = 0.0
     agent.observe(world.snapshot(actor))

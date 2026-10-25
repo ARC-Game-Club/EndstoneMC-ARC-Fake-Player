@@ -183,6 +183,13 @@ class AgentConfig:
     goal: str = "活下来并发展：找食物、收集木头和石头、天黑前有个能躲的地方。"
     #: 两次决策之间的最小间隔（秒）。批量工具让这个值可以设得比较大。
     decision_interval: float = 12.0
+    #: 随机决策间隔（秒）。max > 0 时启用：每轮决策结束后掷一次
+    #: uniform(min, max) 作为下一轮的间隔——比固定间隔更像人（真人
+    #: 不会每 20 秒整点"想一次事"），也把基础 token 消耗压到可调。
+    #: min 也应 ≥ 30：聊天唤醒、战斗反射、闲逛驱动都不走大模型，
+    #: 拉长间隔的代价只是"自发行动"变从容，别的感觉不到。
+    decision_interval_min: float = 0.0
+    decision_interval_max: float = 0.0
     #: 计划执行期间即使到期也不打断，避免"想一半去做别的"
     wait_for_plan: bool = True
     temperature: float = 0.3
@@ -241,6 +248,8 @@ class AgentState:
     landmarks: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     last_snapshot: Snapshot | None = None
     last_decision: float = 0.0
+    #: 下一次决策要等多久（随机间隔模式下由 think() 掷出）。0 = 未启用。
+    decision_gap: float = 0.0
     thinking: bool = False
     turns: int = 0
     errors: int = 0
@@ -509,7 +518,7 @@ class Agent:
         # 既没意义，还可能把限流打成封禁。
         if s.retry_at and now < s.retry_at:
             return False
-        if now - s.last_decision < s.config.decision_interval:
+        if now - s.last_decision < (s.decision_gap or self.config.decision_interval):
             return False
         # 上一批还在跑：默认等它做完，避免指令互相打架
         if self.config.wait_for_plan and self._inflight:
@@ -523,6 +532,15 @@ class Agent:
         s.thinking = True
         s.last_decision = time.monotonic()
         s.turns += 1
+        # 随机决策间隔：这一轮开始时掷下一轮要等多久（1~5 分钟量级，
+        # 具体看配置）。被聊天/事件立即唤醒的场景同样适用——唤醒是
+        # 把 last_decision 清零，间隔在下一次 think 时重掷。
+        if self.config.decision_interval_max > 0:
+            import random as _random
+            lo = max(1.0, self.config.decision_interval_min
+                     or self.config.decision_interval)
+            hi = max(lo, self.config.decision_interval_max)
+            s.decision_gap = _random.uniform(lo, hi)
 
         snapshot = s.last_snapshot
         events = list(s.recent_events)

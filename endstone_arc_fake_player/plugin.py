@@ -529,6 +529,12 @@ class ArcFakePlayerPlugin(Plugin):
             "timeout": 45.0,
             "native_tools": True,
             "decision_interval": 12.0,
+            # 随机决策间隔（秒）：max > 0 启用，每轮决策结束后掷一次
+            # uniform(min, max) 当作下一轮的间隔。基础心跳是 token 大头，
+            # 拉到分钟级后，两次决策之间由闲逛/反击这些不走大模型的
+            # 反射层撑着，看起来依然是个活人。0/0 = 用固定 decision_interval。
+            "decision_interval_min_seconds": 0,
+            "decision_interval_max_seconds": 0,
             "steps_per_tick": 6,
             "default_goal": "活下来并发展：找食物、收集木头和石头、天黑前有个能躲的地方。",
             "spawn_entity": "minecraft:npc",
@@ -2736,6 +2742,10 @@ class ArcFakePlayerPlugin(Plugin):
             config = AgentConfig(
                 name=name, goal=goal,
                 decision_interval=float(self._cfg["decision_interval"]),
+                decision_interval_min=float(
+                    self._cfg.get("decision_interval_min_seconds", 0) or 0),
+                decision_interval_max=float(
+                    self._cfg.get("decision_interval_max_seconds", 0) or 0),
                 context_max_chars=int(self._cfg["context_max_chars"]),
                 # 夹到 >= 1：0 会让压缩变成"清空全部历史"（见 agent.py
                 # 里 `_compact_history` 的注释）。这里先夹住，用户填 0
