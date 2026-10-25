@@ -225,8 +225,10 @@ function runScenario(opt) {
         Tags: { suiteDefault: "suiteDefault" },
     };
     const ItemStack = class { constructor(id, n) { this.typeId = id; this.amount = n; } };
-    new Function("gametest", "system", "world", "ItemStack", "console", SRC)(
-        gametest, system, world, ItemStack, { log() {}, warn() {} });
+    const EquipmentSlot = { Head: "Head", Chest: "Chest", Legs: "Legs",
+        Feet: "Feet", Offhand: "Offhand", Mainhand: "Mainhand" };
+    new Function("gametest", "system", "world", "ItemStack", "EquipmentSlot", "console", SRC)(
+        gametest, system, world, ItemStack, EquipmentSlot, { log() {}, warn() {} });
 
     const send = (id, payload) =>
         receivers.forEach((cb) => cb({ id, message: JSON.stringify({ ...payload, t: "tok" }), sourceType: "Server" }));

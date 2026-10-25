@@ -260,13 +260,21 @@ class ArcFakePlayerPlugin(Plugin):
         self._world = WorldAdapter(
             self.logger, surface_only=bool(self._cfg["surface_only"]))
         # 感知里的"附近玩家"一行靠这个（scan_entities 会合并玩家列表）。
-        self._world.bind_players(lambda: list(self.server.online_players))
+        # 过滤掉**自己人**（我们的假人 + 外部身体）：假人互相看不见，
+        # 大脑就不会主动找另一个假人搭话——两个 AI 在公屏你来我往
+        # 的"尬聊"就是这么来的。真人和离线玩家不受影响。
+        self._world.bind_players(lambda: [
+            p for p in self.server.online_players
+            if str(getattr(p, "name", "") or "") not in self._reserved_names()])
         self._executor = BatchExecutor(
             self.logger, max_steps_per_tick=int(self._cfg["steps_per_tick"]))
 
         # 桥接层：发命令用 dispatch_command
         self._bridge = FakePlayerBridge(self.logger, self._dispatch)
         self._bridge.new_token()
+        # 领地守卫：假人挖/放的每一个方块先过 arc_core 权限
+        # （别人领地里不动土——群演假人不能当破保护的外挂用）。
+        self._bridge.modify_guard = self._land_modify_guard
         # 身体注册表：管理每具假人的真实动作队列
         self._bodies = BodyRegistry(self._bridge, self._world, self.logger)
 
@@ -293,10 +301,16 @@ class ArcFakePlayerPlugin(Plugin):
             walk=lambda b, x, y, z: self._bridge.walk(
                 b, x, y, z, timeout=100) >= 0,
             bot_pos=self._bot_pos,
-            target_pos=self._human_pos,
+            # 真人按名字查坐标；怪物按 runtime id 查（注册表由
+            # _mob_on_attacked 播种）。两者都查不到 = 目标消失。
+            target_pos=lambda t: self._human_pos(t) or self._mob_pos(t),
             bot_health=self._bot_health,
             on_event=self._reflex_event,
             logger=self.logger)
+        #: 怪物反击目标注册表：str(runtime_id) → (Actor 引用, 过期时刻)。
+        #: Actor 句柄约一分钟会过期，所以带 TTL 惰性清理；过期/失效后
+        #: 反射按"目标消失"正常脱战。
+        self._mob_targets: dict[str, tuple[Any, float]] = {}
         #: (假人, 玩家) → 寻仇冷却到期时刻。engage 时预记，防止脱战后
         #: 立刻被复仇扫描重新拉起、无限缠斗。
         self._vengeance_cd: dict[tuple[str, str], float] = {}
@@ -364,6 +378,9 @@ class ArcFakePlayerPlugin(Plugin):
         # 每 30 秒：自动在线调度（角色卡轮换、到点换人）
         self._guard(self._crowd_tick, "自动在线", delay=CrowdScheduler.TICK_PERIOD,
                     period=CrowdScheduler.TICK_PERIOD)
+        # 每 15 秒：护甲自穿——管理员 /give 的装备进背包后自动上身。
+        # JS 侧对"已穿最好"是空操作，所以常开没有副作用。
+        self._guard(self._equip_tick, "护甲自穿", delay=300, period=300)
 
         self.logger.info(f"{C.GREEN}LLM 虚拟玩家插件已启用{C.RESET}")
         self.logger.info("配置模型：/ai set <base_url> <api_key> <model>")
@@ -2007,6 +2024,112 @@ class ArcFakePlayerPlugin(Plugin):
                  + ("身体已自动反击。" if cfg.get("reflex_enabled", True)
                     else "你没有自动反击，自己决定怎么办。"))
 
+    def _mob_on_attacked(self, bot: str, mob_name: str,
+                         attacker: Any, damage: float) -> None:
+        """怪物（非玩家 Actor）打了假人 → 条件反射反击。
+
+        和真人路径的差别：不记好感度、不进仇人名单（怪物没有"关系"
+        可言）、没有管理员豁免（怪物不存在 OP）。目标用 runtime id
+        定位——JS 侧 doAttack 支持按实体 id 精确匹配。
+        """
+        cfg = self._social_cfg()
+        if not cfg.get("enabled", True):
+            return
+        if not cfg.get("mob_reflex_enabled", True):
+            return          # 想让大脑自己决定怎么应付怪物时关掉
+        try:
+            key = str(int(getattr(attacker, "runtime_id", -1)))
+        except (TypeError, ValueError):
+            return
+        if key == "-1":
+            return
+        self._mob_targets[key] = (attacker, time.monotonic() + 120.0)
+        duration = float(cfg.get("reflex_duration_seconds", 90.0))
+        self._reflex.engage(bot, key, reason="怪物来袭",
+                            duration=duration, label=mob_name)
+        try:
+            self._executor.cancel_all(bot)
+        except Exception:
+            pass
+        self.logger.info(f"[{bot}] 被 {mob_name} 攻击，已自动反击")
+        self._reflex_event(
+            bot, f"你被 {mob_name} 攻击了（伤害 {damage:.0f}），"
+                 f"身体已自动反击。")
+
+    def _mob_pos(self, key: str) -> tuple[float, float, float] | None:
+        """怪物目标坐标（反射追击用）。句柄过期/实体死亡返回 None。"""
+        entry = self._mob_targets.get(key)
+        if entry is None:
+            return None
+        actor, expire_at = entry
+        if time.monotonic() > expire_at:
+            self._mob_targets.pop(key, None)
+            return None
+        try:
+            if not bool(getattr(actor, "is_valid", False)):
+                self._mob_targets.pop(key, None)
+                return None
+            loc = actor.location
+            return (loc.x, loc.y, loc.z)
+        except Exception:
+            self._mob_targets.pop(key, None)
+            return None
+
+    # ------------------------------------------------------------------
+    # 护甲自穿 / 领地守卫
+    # ------------------------------------------------------------------
+
+    def _equip_tick(self) -> None:
+        """周期性让每个在线假人把背包里最好的护甲穿上。"""
+        for name in list(self._agents):
+            if self._live_actor(name) is not None:
+                self._bridge.equip(name)
+        for name in list(self._external):
+            if self._live_external(name) is not None:
+                self._bridge.equip(name)
+
+    def _land_modify_guard(self, name: str, x: int, y: int, z: int):
+        """挖/放方块前的领地守卫。返回 None=放行，字符串=拒绝原因。
+
+        走 arc_core 的 api_check_land_access——和真人完全同一套规则：
+        荒野放行；假人自己的领地（合成 xuid 名下）放行；公共领地按
+        公共规则；**别人的私人领地拒绝**。arc_core 缺席或出错时放行
+        （fail-open）：没有领地系统的服务器不该因此废掉假人的挖掘。
+        """
+        core = None
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return None
+        if core is None or not callable(getattr(core, "api_check_land_access",
+                                                None)):
+            return None
+        actor = self._live_actor(name)
+        if actor is None:
+            actor = self._live_external(name)
+        if actor is None:
+            return None
+        try:
+            dim = getattr(actor.dimension, "name", None) or str(actor.dimension)
+        except Exception:
+            return None
+        xuid = ""
+        try:
+            xuid = str(self._identities.xuid_of(name) or "")
+        except Exception:
+            xuid = ""
+        try:
+            res = core.api_check_land_access(
+                str(dim), (int(x), int(y), int(z)),
+                player_name=name, xuid=xuid, action="build")
+        except Exception as exc:
+            self.logger.debug(f"领地权限查询失败（按放行）: {exc}")
+            return None
+        if not isinstance(res, dict) or res.get("allowed"):
+            return None
+        return ("这里受领地保护，不能破坏或放置方块"
+                "（先离开这片领地，或找主人授权）")
+
     def _social_tick(self, bot: str, agent: Any, actor: Any, now: float) -> None:
         """感知循环里的社交驱动：寻仇扫描 + 好感度摘要。"""
         cfg = self._social_cfg()
@@ -2086,12 +2209,17 @@ class ArcFakePlayerPlugin(Plugin):
             aname = str(getattr(attacker, "name", "") or "")
             if not aname or aname == vname:
                 return
-            # 只对**真人攻击者**反击与记仇：假人互殴不触发（两个 AI 打成
-            # 无限互相寻仇的战争太荒诞），怪物交给大脑决策。
-            if not str(getattr(attacker, "xuid", "") or "").strip():
-                return
             damage = float(getattr(event, "damage", 0) or 0)
-            self._social_on_attacked(vname, aname, attacker, damage)
+            if hasattr(attacker, "xuid"):
+                # 玩家攻击者（真人）——只对**真人**反击与记仇：假人互殴
+                # 不触发（两个 AI 打成无限互相寻仇的战争太荒诞）。
+                if not str(getattr(attacker, "xuid", "") or "").strip():
+                    return
+                self._social_on_attacked(vname, aname, attacker, damage)
+            else:
+                # 怪物/投射物主人（非玩家 Actor）——同样条件反射反击，
+                # 但不进好感度/仇人体系（那是给真人玩家的）。
+                self._mob_on_attacked(vname, aname, attacker, damage)
         except Exception as exc:
             self.logger.debug(f"伤害事件处理失败: {exc}")
 
@@ -2185,6 +2313,11 @@ class ArcFakePlayerPlugin(Plugin):
             return
         low = msg.lower()
         speaker = str(getattr(event.player, "name", "") or "")
+        # 说话的是自己人（我们的假人 / 外部身体如天星）→ 一律不理。
+        # 不然假人 A 的话里带上 B 的名字，B 会"必回"，两个 AI 就地
+        # 表演一段没人看的尬聊。真人（含离线模式）不受影响。
+        if speaker and (speaker in self._agents or speaker in self._external):
+            return
         is_op = bool(getattr(event.player, "is_op", False))
 
         named_any = False
@@ -3397,6 +3530,10 @@ class ArcFakePlayerPlugin(Plugin):
             return False
 
     def crowd_reserved_names(self) -> set[str]:
+        return set(self._agents) | set(self._external)
+
+    def _reserved_names(self) -> set[str]:
+        """所有"自己人"的名字：我们的假人 + 外部身体（如天星）。"""
         return set(self._agents) | set(self._external)
 
     def crowd_real_player_names(self) -> set[str]:
@@ -4847,17 +4984,18 @@ class ArcFakePlayerPlugin(Plugin):
             pass
 
     def _agent_log(self, message: str) -> None:
-        """Agent 的日志出口：控制台 + 广播 + 活动日志。
+        """Agent 的日志出口：控制台 + 活动日志。
 
         message 已经带了 "[名字] " 前缀（agent._log 加的），所以这里
         要把它拆出来单独当 who，否则日志里会出现 "[挖矿] [Steve] 挖了…"
         这种两层括号。
+
+        ⚠️ **绝不往公屏广播。** 这些是 AI 的内心活动（💭 思考、⚠ 工具
+        失败、🎮 动作摘要）——群演假人要把玩家身份演到底，把这些打到
+        公屏等于自己拆穿自己。真要说的话走 `_broadcast`（say 工具），
+        那才是"聊天"；这里只是后台流水。服主看控制台 / activity.log。
         """
         self.logger.info(message)
-        try:
-            self.server.broadcast_message(f"{C.DARK_AQUA}{message}{C.RESET}")
-        except Exception:
-            pass
         who, text = message, ""
         if message.startswith("[") and "] " in message:
             who, text = message[1:].split("] ", 1)

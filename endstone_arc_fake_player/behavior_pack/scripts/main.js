@@ -23,6 +23,7 @@
  *   bot:place     {n,x,y,z,block,face}                放置方块
  *   bot:attack    {n,target,times}                    攻击实体
  *   bot:select    {n,item}                            切换手持物品
+ *   bot:equip     {n}                                 穿上背包里最好的护甲
  *   bot:stop      {n}                                 停止一切动作
  *   bot:list      {}                                  列出假人
  *
@@ -64,7 +65,7 @@
  */
 
 import * as gametest from "@minecraft/server-gametest";
-import { system, world, ItemStack } from "@minecraft/server";
+import { system, world, ItemStack, EquipmentSlot } from "@minecraft/server";
 
 // ---------------------------------------------------------------------------
 // 状态
@@ -1468,6 +1469,85 @@ function doAttack(req, id) {
 // 杂项
 // ---------------------------------------------------------------------------
 
+// 护甲材质等级：数值越大越好。只认原版护甲（自定义命名空间的护甲
+// 属性没谱，不擅自往身上套）。
+const ARMOR_RANK = {
+    leather: 1, golden: 2, chainmail: 3, turtle: 4, copper: 4,
+    iron: 5, diamond: 6, netherite: 7,
+};
+const ARMOR_SLOT = {
+    helmet: EquipmentSlot.Head,
+    chestplate: EquipmentSlot.Chest,
+    leggings: EquipmentSlot.Legs,
+    boots: EquipmentSlot.Feet,
+};
+
+function doEquip(req, id) {
+    const sim = sims.get(req.n);
+    if (!sim) {
+        result(id, false, "假人不存在");
+        return;
+    }
+    guard(id, () => {
+        const cont = playerInventory(sim);
+        let eq = null;
+        try {
+            eq = sim.getComponent("minecraft:equippable");
+        } catch (e) { /* 组件不可用 */ }
+        if (!eq) throw new Error("装备栏不可访问");
+        const worn = [];
+        for (const kind of ["helmet", "chestplate", "leggings", "boots"]) {
+            const slot = ARMOR_SLOT[kind];
+            // 已穿戴的等级
+            let curRank = -1;
+            try {
+                const cur = eq.getEquipment(slot);
+                if (cur) {
+                    const m = String(cur.typeId || "").split(":")[1] || "";
+                    curRank = ARMOR_RANK[m.replace("_" + kind, "")] ?? -1;
+                }
+            } catch (e) { /* 读不到按空装备处理 */ }
+            // 背包里最好的同类护甲
+            let bestSlot = -1, bestRank = curRank, bestItem = null;
+            for (let i = 0; i < cont.size; i++) {
+                const it = cont.getItem(i);
+                if (!it) continue;
+                const typeId = String(it.typeId || "");
+                if (!typeId.startsWith("minecraft:")) continue;
+                const short = typeId.split(":")[1];
+                if (!short.endsWith("_" + kind)) continue;
+                const rank = ARMOR_RANK[short.slice(0, -kind.length - 1)] ?? 0;
+                if (rank > bestRank) { bestRank = rank; bestSlot = i; bestItem = it; }
+            }
+            if (bestItem) {
+                try {
+                    cont.setItem(bestSlot, undefined);
+                    eq.setEquipment(slot, bestItem);
+                    worn.push(kind);
+                } catch (e) {
+                    // 穿戴失败要把东西放回去，不能白拿玩家一格
+                    try { cont.setItem(bestSlot, bestItem); } catch (_) {}
+                }
+            }
+        }
+        // 副手盾牌（没拿东西才补）
+        try {
+            if (!eq.getEquipment(EquipmentSlot.Offhand)) {
+                for (let i = 0; i < cont.size; i++) {
+                    const it = cont.getItem(i);
+                    if (it && String(it.typeId || "").endsWith("shield")) {
+                        cont.setItem(i, undefined);
+                        eq.setEquipment(EquipmentSlot.Offhand, it);
+                        worn.push("offhand");
+                        break;
+                    }
+                }
+            }
+        } catch (e) { /* 副手失败不致命 */ }
+        result(id, true, worn.length ? ("已穿戴: " + worn.join(",")) : "无需更换");
+    });
+}
+
 function doSelect(req, id) {
     const sim = sims.get(req.n);
     if (!sim) {
@@ -1687,6 +1767,9 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
             break;
         case "bot:jump":
             safely(() => doJump(data, id));
+            break;
+        case "bot:equip":
+            safely(() => doEquip(data, id));
             break;
         case "bot:drop":
             safely(() => doDrop(data, id));

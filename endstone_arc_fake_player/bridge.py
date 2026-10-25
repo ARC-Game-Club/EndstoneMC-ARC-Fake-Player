@@ -63,6 +63,13 @@ class FakePlayerBridge:
         self._logger = logger
         self._dispatch = dispatch
 
+        #: 领地/保护守卫：``(名字, x, y, z) -> 拒绝原因 | None``。
+        #: 由插件层注入（它才知道 arc_core 和假人的合成 xuid）；
+        #: None 表示放行，返回字符串表示"这个方块动不得"并被写进
+        #: 动作失败原因反馈给大脑。保持 None 时一切照旧（可单测）。
+        self.modify_guard: Callable[[str, int, int, int],
+                                    str | None] | None = None
+
         self._token = ""
         self._seq = 0
         self._lock = threading.Lock()
@@ -279,6 +286,15 @@ class FakePlayerBridge:
         ``bot:dug`` 到达时通过 callback 告知，参数是
         ``(ok, error_text, info)``，info 里带 swing（挥臂次数）。
         """
+        # 领地守卫：被拦下的挖掘**不发指令**，直接以一次失败回调收场
+        # ——语义与 bot:dug 失败完全一致，调用方（执行器/闲逛驱动）
+        # 的失败路径原样复用，原因文本会进大脑的反馈。
+        reason = self._modify_blocked(name, x, y, z)
+        if reason is not None:
+            req_id = self._next_id()
+            if callback is not None:
+                callback(False, reason, {})
+            return req_id
         req_id = self._next_id()
         if callback is not None:
             self._dig_callbacks[req_id] = callback
@@ -290,9 +306,29 @@ class FakePlayerBridge:
             return -1
         return req_id
 
+    def _modify_blocked(self, name: str, x: int, y: int, z: int) -> str | None:
+        """守卫未注入或放行时返回 None；守卫抛异常按放行（fail-open）。"""
+        if self.modify_guard is None:
+            return None
+        try:
+            return self.modify_guard(name, int(x), int(y), int(z))
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.debug(f"领地守卫异常（按放行）: {exc}")
+                except Exception:
+                    pass
+            return None
+
     def place(self, name: str, x: int, y: int, z: int, block: str, *,
               face: str = "Up",
               callback: Callable[[bool, str, dict], None] | None = None) -> int:
+        reason = self._modify_blocked(name, x, y, z)
+        if reason is not None:
+            req_id = self._next_id()
+            if callback is not None:
+                callback(False, reason, {})
+            return req_id
         return self.send_tracked(
             "bot:place",
             {"n": name, "x": int(x), "y": int(y), "z": int(z),
@@ -329,6 +365,15 @@ class FakePlayerBridge:
         绕过碰撞检测，假人能穿天花板。
         """
         return self._raw_send("bot:jump", {"n": name})
+
+    def equip(self, name: str) -> bool:
+        """让假人把背包里最好的护甲穿上（含副手盾牌）。
+
+        具体挑哪件、怎么穿由 JS 侧 doEquip 决定（背包和装备栏都归
+        行为包管）。已穿最好的时候 JS 侧是空操作，所以周期性调用
+        也只是浪费一条 scriptevent 日志，无副作用。
+        """
+        return self._raw_send("bot:equip", {"n": name})
 
     def drop(self, name: str, item: str, count: int = 1, *, to: str = "",
              callback: Callable[[bool, str, dict], None] | None = None) -> int:

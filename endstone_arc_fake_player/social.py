@@ -178,6 +178,8 @@ class Engagement:
 
     target: str
     reason: str = ""
+    #: 播报用的人话名字（怪物目标的 target 是 runtime id）。
+    label: str = ""
     engaged_at: float = 0.0
     give_up_at: float = 0.0
     # 初始为"-无穷"：接管的**第一拍**必须立刻出手/追击，
@@ -237,7 +239,7 @@ class CombatReflex:
     # -- 接管 / 放手 ------------------------------------------------------
 
     def engage(self, bot: str, target: str, *, reason: str = "",
-               duration: float = 90.0) -> None:
+               duration: float = 90.0, label: str = "") -> None:
         now = self._clock()
         old = self._engaged.get(bot)
         if old is not None and old.target == target:
@@ -246,12 +248,15 @@ class CombatReflex:
             return
         self._engaged[bot] = Engagement(
             target=target, reason=reason, engaged_at=now,
-            give_up_at=now + duration)
-        self._on_event(bot, f"你受到攻击，已自动反击{target}"
+            give_up_at=now + duration, label=label)
+        # 播报给大脑用 label（怪物目标的 target 是 runtime id，念出来
+        # 是一串数字，没法读）；日志和内部状态仍然用精确的 target。
+        shown = label or target
+        self._on_event(bot, f"你受到攻击，已自动反击{shown}"
                         + (f"（{reason}）" if reason else ""))
         if self._logger:
             try:
-                self._logger.info(f"[{bot}] 反击条件反射激活 → {target}")
+                self._logger.info(f"[{bot}] 反击条件反射激活 → {shown}")
             except Exception:
                 pass
 
@@ -259,7 +264,7 @@ class CombatReflex:
         e = self._engaged.pop(bot, None)
         if e is None:
             return None
-        self._on_event(bot, f"与 {e.target} 的战斗结束（{why or '结束'}）")
+        self._on_event(bot, f"与 {e.label or e.target} 的战斗结束（{why or '结束'}）")
         return e.target
 
     # -- 主循环 ----------------------------------------------------------

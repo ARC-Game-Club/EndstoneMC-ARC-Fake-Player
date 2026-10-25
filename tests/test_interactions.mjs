@@ -99,6 +99,8 @@ function fixture() {
     const chain = { structureName() { return this; }, maxTicks() { return this; }, tag() { return this; } };
     const sandbox = {
         console: { log() {}, warn() {} }, ItemStack: Stack,
+        EquipmentSlot: { Head: "Head", Chest: "Chest", Legs: "Legs",
+            Feet: "Feet", Offhand: "Offhand", Mainhand: "Mainhand" },
         world: { getDimension() { return dimension; }, getDefaultGameMode() { return "Adventure"; } },
         gametest: { register() { return chain; }, Tags: { suiteDefault: "default" }, spawnSimulatedPlayer() { return sim; } },
         system: {
