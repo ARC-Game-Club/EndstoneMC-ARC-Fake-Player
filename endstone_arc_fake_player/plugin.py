@@ -654,6 +654,13 @@ class ArcFakePlayerPlugin(Plugin):
             # 只对自动在线的群演假人生效；手动 /ai spawn 的有自己的回执。
             "join_message": "§e{name} 加入了游戏",
             "leave_message": "§e{name} 离开了游戏",
+            # ---- QQ 群同步 ----
+            # 真人聊天走 PlayerChatEvent 被同步插件转进 QQ 群；假人的
+            # broadcast 不触发聊天事件，群里看不到——由插件直调
+            # arc_qq_sync_astrbot 的 api_send_event 补同一条链路同一种
+            # 格式。同步插件不在就静默跳过。
+            "qq_sync_chat": True,
+            "qq_sync_join_leave": True,
             # ---- 锚点闲逛（日常生活）----
             # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
             # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
@@ -3682,12 +3689,44 @@ class ArcFakePlayerPlugin(Plugin):
 
     def _announce(self, key: str, name: str) -> None:
         tpl = str(self._cfg.get(key) or "").strip()
-        if not tpl:
+        if tpl:
+            try:
+                self.server.broadcast_message(tpl.replace("{name}", name))
+            except Exception:
+                pass
+        # 进退服也同步 QQ 群（真人进退服在群里是有消息的）。
+        self._qq_sync("join" if key == "join_message" else "quit", name)
+
+    def _qq_sync(self, event_type: str, name: str, message: str = "") -> None:
+        """把假人的聊天/进退服推给 QQ 同步插件。
+
+        真人聊天走 PlayerChatEvent → arc_qq_sync_astrbot 转发进群；
+        假人的 broadcast 不触发事件，群里看不到。这里直调它的
+        ``api_send_event``（同一条链路、同一种格式：💬 名字: 消息 /
+        🟢 加入 / 🔴 离开）。插件不在、开关关掉、调用失败都静默——
+        QQ 同步是锦上添花，不能反过来影响游戏内聊天。
+        """
+        if event_type == "chat":
+            if not bool(self._cfg.get("qq_sync_chat", True)):
+                return
+        elif event_type in ("join", "quit"):
+            if not bool(self._cfg.get("qq_sync_join_leave", True)):
+                return
+        try:
+            plug = self.server.plugin_manager.get_plugin(
+                "arc_qq_sync_astrbot")
+        except Exception:
+            return
+        fn = getattr(plug, "api_send_event", None)
+        if not callable(fn):
             return
         try:
-            self.server.broadcast_message(tpl.replace("{name}", name))
-        except Exception:
-            pass
+            fn(event_type, name, name, message)
+        except Exception as exc:
+            try:
+                self.logger.debug(f"QQ 同步 {event_type}({name}) 失败: {exc}")
+            except Exception:
+                pass
 
     # ---- 出生点选址 ----------------------------------------------------
 
@@ -5010,6 +5049,10 @@ class ArcFakePlayerPlugin(Plugin):
 
     def _broadcast(self, name: str, message: str) -> None:
         self.server.broadcast_message(f"{C.AQUA}<{name}>{C.RESET} {message}")
+        # 真人聊天会触发 PlayerChatEvent、被 QQ 同步插件转进群；假人的
+        # broadcast 不触发任何事件——群里"看不到这个人说话"就穿帮了。
+        # 这里直调同步插件的 api_send_event 补一条，格式与真人完全一致。
+        self._qq_sync("chat", name, message)
 
     def _record(self, kind: str, message: str, *, who: str = "") -> None:
         """往活动日志里记一条。记录失败不影响任何逻辑。"""

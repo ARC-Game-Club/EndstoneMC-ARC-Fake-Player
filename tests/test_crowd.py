@@ -313,9 +313,11 @@ class JoinLeaveAnnounceTests(unittest.TestCase):
         fake = SimpleNamespace(
             _stealth={"BotA"}, _cfg=dict(cfg if cfg is not None else self.CFG),
             server=Server(), _record=lambda *a, **k: None)
-        # _announce_* 内部调 self._announce——把真方法绑到假 self 上
+        # _announce_* 内部调 self._announce / self._qq_sync——把真方法绑到
+        # 假 self 上（假 server 没有 plugin_manager，_qq_sync 会安静返回）
         fake._announce = MethodType(plugin_mod.ArcFakePlayerPlugin._announce,
                                     fake)
+        fake._qq_sync = MethodType(plugin_mod.ArcFakePlayerPlugin._qq_sync, fake)
         return fake, plugin_mod.ArcFakePlayerPlugin
 
     def test_join_announced_for_stealth_bot(self):
@@ -339,6 +341,82 @@ class JoinLeaveAnnounceTests(unittest.TestCase):
         cls._announce_join(fake, "BotA")
         cls._announce_leave(fake, "BotA")
         self.assertEqual(fake.server.sent, [])
+
+
+class QQSyncTests(unittest.TestCase):
+    """假人聊天/进退服 → QQ 群同步（_qq_sync 直调）。"""
+
+    def _make_fake(self, cfg=None, qq_plugin=None, raise_on_get=False):
+        import endstone_arc_fake_player.plugin as plugin_mod
+        from types import MethodType
+
+        class Manager:
+            def get_plugin(self, name):
+                if raise_on_get:
+                    raise RuntimeError("no such plugin")
+                return qq_plugin
+
+        class Server:
+            def __init__(self):
+                self.plugin_manager = Manager()
+
+        fake = SimpleNamespace(
+            _cfg=dict(cfg if cfg is not None else {
+                "qq_sync_chat": True, "qq_sync_join_leave": True}),
+            server=Server(),
+            logger=SimpleNamespace(debug=lambda *_: None))
+        fake._qq_sync = MethodType(plugin_mod.ArcFakePlayerPlugin._qq_sync,
+                                   fake)
+        return fake, plugin_mod.ArcFakePlayerPlugin
+
+    @staticmethod
+    def _qq_plugin():
+        calls = []
+
+        class QQ:
+            def api_send_event(self, *args):
+                calls.append(args)
+                return True
+
+        return QQ(), calls
+
+    def test_chat_pushed_to_qq(self):
+        qq, calls = self._qq_plugin()
+        fake, cls = self._make_fake(qq_plugin=qq)
+        cls._qq_sync(fake, "chat", "BotA", "大家好")
+        self.assertEqual(calls, [("chat", "BotA", "BotA", "大家好")])
+
+    def test_chat_disabled(self):
+        qq, calls = self._qq_plugin()
+        fake, cls = self._make_fake({"qq_sync_chat": False}, qq_plugin=qq)
+        cls._qq_sync(fake, "chat", "BotA", "大家好")
+        self.assertEqual(calls, [])
+
+    def test_join_leave_gated_separately(self):
+        qq, calls = self._qq_plugin()
+        fake, cls = self._make_fake({"qq_sync_join_leave": False},
+                                    qq_plugin=qq)
+        cls._qq_sync(fake, "join", "BotA")
+        cls._qq_sync(fake, "quit", "BotA")
+        self.assertEqual(calls, [])
+        cls._qq_sync(fake, "chat", "BotA", "hi")   # 聊天不受影响
+        self.assertEqual(len(calls), 1)
+
+    def test_plugin_missing_is_silent(self):
+        fake, cls = self._make_fake(raise_on_get=True)
+        cls._qq_sync(fake, "chat", "BotA", "x")   # 不抛即为通过
+
+    def test_plugin_without_api_is_silent(self):
+        fake, cls = self._make_fake(qq_plugin=object())
+        cls._qq_sync(fake, "chat", "BotA", "x")
+
+    def test_api_exception_swallowed(self):
+        class BadQQ:
+            def api_send_event(self, *a, **k):
+                raise RuntimeError("hub down")
+
+        fake, cls = self._make_fake(qq_plugin=BadQQ())
+        cls._qq_sync(fake, "chat", "BotA", "x")   # 不抛即为通过
 
 
 class EconomyBridgeTests(unittest.TestCase):
