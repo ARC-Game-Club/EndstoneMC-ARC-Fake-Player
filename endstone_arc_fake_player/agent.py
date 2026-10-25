@@ -181,6 +181,10 @@ DEFAULT_ITEM_NAMES = """# 物品对照表（观测与参数里用的是**代码�
 class AgentConfig:
     name: str
     goal: str = "活下来并发展：找食物、收集木头和石头、天黑前有个能躲的地方。"
+    #: 长期使命——服主在角色卡 long_goal 里给的角色定位（如"枪战房常驻
+    #: 等人开局""偷袭者暗中发育"）。**AI 只能改短期 goal，改不了它**；
+    #: 空串时提示词里显示"没有指定"。
+    long_goal: str = ""
     #: 两次决策之间的最小间隔（秒）。批量工具让这个值可以设得比较大。
     decision_interval: float = 12.0
     #: 随机决策间隔（秒）。max > 0 时启用：每轮决策结束后掷一次
@@ -305,6 +309,11 @@ SYSTEM_TEMPLATE = string.Template("""$identity
 
 $body
 
+# 长期使命
+$long_goal
+
+（使命是服主给你的角色定位，**不可更改**；下面的"长期目标"是你自己安排的近期计划，可用 goal 工具随时更新——近期计划要服务于使命。）
+
 # 长期目标
 $goal
 
@@ -350,6 +359,7 @@ def build_system(state: AgentState) -> str:
     return SYSTEM_TEMPLATE.safe_substitute(
         identity=identity,
         body=c.body,
+        long_goal=(c.long_goal or "（没有指定，按你自己的节奏来）"),
         goal=c.goal,
         persona=c.persona,
         style=c.style,

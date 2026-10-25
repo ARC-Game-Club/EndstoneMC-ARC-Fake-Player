@@ -227,6 +227,18 @@ def main() -> int:
     agent.state.last_decision = now - 5.0
     check("固定间隔模式下间隔内不思考", not agent.should_think(time.monotonic()))
 
+    # ---- 长期使命注入 ----
+    from endstone_arc_fake_player.agent import build_system
+    probe = agent.state
+    old_long = probe.config.long_goal
+    probe.config.long_goal = "枪战房常驻，有人开局就加入对枪"
+    sys_text = build_system(probe)
+    check("长期使命进系统提示词", "枪战房常驻" in sys_text and "长期使命" in sys_text)
+    check("使命段在目标段之前", sys_text.index("长期使命") < sys_text.index("长期目标"))
+    probe.config.long_goal = old_long
+    sys_text2 = build_system(probe)
+    check("未设使命时显示占位文案", "没有指定" in sys_text2)
+
     # 检查最终提示词里包含上批动作
     agent.state.last_decision = 0.0
     agent.observe(world.snapshot(actor))

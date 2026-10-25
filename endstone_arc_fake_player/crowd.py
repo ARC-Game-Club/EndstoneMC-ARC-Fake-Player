@@ -38,6 +38,10 @@ class CharacterCard:
     name: str
     persona: str = ""
     goal: str = ""
+    #: 长期使命（服主设定，AI 不可改）：这个角色在服务器里的定位，
+    #: 如"枪战房常驻，有人开局就加入"或"偷袭者：暗中发育"。
+    #: goal 是 AI 自己安排并可持续更新的近期计划，long_goal 是不变的锚。
+    long_goal: str = ""
     #: 初始金钱。None = 不建钱包；数值 = 上线时确保钱包至少有这么多
     #: （已有钱包不动，避免每次轮换都重置成富人）。
     money: float | None = None
@@ -77,6 +81,7 @@ class CharacterCard:
             name=name,
             persona=str(raw.get("persona", "") or ""),
             goal=str(raw.get("goal", "") or ""),
+            long_goal=str(raw.get("long_goal", "") or ""),
             money=money,
             xuid=(str(raw["xuid"]).strip() or None) if raw.get("xuid") else None,
             uuid=(str(raw["uuid"]).strip() or None) if raw.get("uuid") else None,

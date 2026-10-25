@@ -109,6 +109,15 @@ class CardLoadingTests(unittest.TestCase):
         self.assertEqual(cards[0].money, 5.0)
         self.assertEqual(cards[1].money, 12.5)
 
+    def test_long_goal_parsed(self):
+        cards = load_cards([
+            {"name": "A", "long_goal": "枪战房常驻，有人开局就加入"},
+            {"name": "B"},
+            "junk",
+        ])
+        self.assertEqual(cards[0].long_goal, "枪战房常驻，有人开局就加入")
+        self.assertEqual(cards[1].long_goal, "")
+
     def test_bad_money_becomes_none(self):
         card = CharacterCard.from_dict({"name": "A", "money": "abc"})
         self.assertIsNotNone(card)

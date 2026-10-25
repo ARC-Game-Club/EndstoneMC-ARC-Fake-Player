@@ -538,6 +538,8 @@ class ArcFakePlayerPlugin(Plugin):
             "decision_interval_max_seconds": 0,
             "steps_per_tick": 6,
             "default_goal": "活下来并发展：找食物、收集木头和石头、天黑前有个能躲的地方。",
+            # 手动 /ai spawn 的假人没有角色卡，用这个当长期使命（可空）。
+            "default_long_goal": "",
             "spawn_entity": "minecraft:npc",
             # auto = 行为包连上就用真身体；连不上就报错停摆，绝不换实现顶替
             # real = 强制要求真身体（连不上直接拒绝生成）
@@ -2737,7 +2739,7 @@ class ArcFakePlayerPlugin(Plugin):
     # ------------------------------------------------------------------
 
     def _start_agent(self, name: str, *, goal: str, persona: str,
-                     actor: Any) -> Any:
+                     actor: Any, long_goal: str = "") -> Any:
         """给一具身体装配 Python 大脑。失败返回 None。
 
         `_cmd_spawn` 和自动在线的角色上线走同一条路，保证手动/自动
@@ -2750,6 +2752,8 @@ class ArcFakePlayerPlugin(Plugin):
             identity = self._identities.of(name)
             config = AgentConfig(
                 name=name, goal=goal,
+                long_goal=(long_goal or str(self._cfg.get("default_long_goal", "")
+                                            or "")),
                 decision_interval=float(self._cfg["decision_interval"]),
                 decision_interval_min=float(
                     self._cfg.get("decision_interval_min_seconds", 0) or 0),
@@ -2899,7 +2903,7 @@ class ArcFakePlayerPlugin(Plugin):
             self._record("spawn", "外部身体真身已加入", who=name)
             self.logger.info(f"{C.GREEN}[{name}] 外部身体真身已加入{C.RESET}")
         # 自动在线角色
-        for name, (goal, persona, money, requested_at) in list(
+        for name, (goal, persona, money, requested_at, long_goal) in list(
                 self._pending_crowd.items()):
             player = self._find_sim_player(name)
             if player is None:
@@ -2913,7 +2917,7 @@ class ArcFakePlayerPlugin(Plugin):
                 continue
             self._pending_crowd.pop(name, None)
             agent = self._start_agent(name, goal=goal, persona=persona,
-                                      actor=player)
+                                      actor=player, long_goal=long_goal)
             if agent is None:
                 self._bridge.remove(name)
                 continue
@@ -3695,12 +3699,13 @@ class ArcFakePlayerPlugin(Plugin):
             chance=getattr(card, "chat_reply_chance", None),
             style=getattr(card, "style", None))
         goal = str(card.goal) if card.goal else str(self._cfg["default_goal"])
+        long_goal = str(getattr(card, "long_goal", "") or "")
         persona = str(card.persona or "")
         money = float(card.money) if card.money is not None else None
         if state == "joined":
             player = self._find_sim_player(name)
             agent = self._start_agent(name, goal=goal, persona=persona,
-                                      actor=player)
+                                      actor=player, long_goal=long_goal)
             if agent is None:
                 self._bridge.remove(name)
                 return False, "智能体创建失败"
@@ -3713,7 +3718,7 @@ class ArcFakePlayerPlugin(Plugin):
         else:
             # 等真身加入，_try_attach_pending 接管
             self._pending_crowd[name] = (goal, persona, money,
-                                         time.monotonic())
+                                         time.monotonic(), long_goal)
         self._record("spawn", f"角色卡上线请求已发出，目标: {goal[:60]}"
                      f"（身份 xuid={identity['xuid']}）", who=name)
         return True, "已上线" if state == "joined" else "已请求，等待真身加入"
