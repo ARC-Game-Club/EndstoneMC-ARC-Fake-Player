@@ -97,6 +97,13 @@ def main() -> int:
             ToolCall("mine_area", {"x1": 4, "y1": 63, "z1": 4, "x2": 6, "y2": 63, "z2": 6}),
             ToolCall("say", {"message": "我在挖石头"}),
         ]),
+        # 第 3 轮：say 放最前 + 两个后续工具——旧版在循环里重复结算 ctx，
+        # 会把这一句广播 3 遍（"一条消息发三遍"的回归用例）
+        LLMReply(ok=True, text="先说一句再干活。", calls=[
+            ToolCall("say", {"message": "大家注意"}),
+            ToolCall("mine_area", {"x1": 7, "y1": 63, "z1": 7, "x2": 9, "y2": 63, "z2": 9}),
+            ToolCall("goal", {"text": "挖完这片就收工"}),
+        ]),
     ]
     llm = ScriptedLLM(script)
     pool = ThreadPoolExecutor(max_workers=2)
@@ -161,6 +168,20 @@ def main() -> int:
     check("第 2 轮又执行 9 个方块", applied["break"] == 18, f"实际 {applied['break']}")
     check("say 触发广播", said == [("Bot", "我在挖石头")], str(said))
     check("say 不产生游戏步骤", applied["set"] == 0)
+
+    # 第 3 轮：say 在最前，后面还有两个工具
+    agent.state.last_decision = 0.0
+    agent.think()
+    check("第 3 轮提交", wait(lambda: not agent.state.thinking and len(said) >= 2))
+    for _ in range(50):
+        if not executor.busy:
+            break
+        done = executor.tick()
+        agent.reap_finished(done)
+        time.sleep(0.01)
+    check("say 只广播一次（旧版会三连发）",
+          said == [("Bot", "我在挖石头"), ("Bot", "大家注意")], str(said))
+    check("第 3 轮照常执行动作", applied["break"] == 27, f"实际 {applied['break']}")
 
     # 统计
     s = agent.snapshot()

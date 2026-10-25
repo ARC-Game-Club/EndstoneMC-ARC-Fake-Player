@@ -909,19 +909,22 @@ class Agent:
                     if result.immediate and not result.ok:
                         self._log(f"⚠ {call.name}: {result.immediate}")
 
-                # 认知类副产物
-                if ctx.get("goal"):
-                    s.config.goal = ctx["goal"]
-                    self._log(f"🎯 新目标: {ctx['goal']}")
-                for line in ctx.get("notes", []):
-                    s.notes.append(line)
-                    self._log(f"📝 {line}")
-                for msg in ctx.get("say", []):
-                    if self._on_say:
-                        self._on_say(self.name, msg)
-                if ctx.get("done"):
-                    s.done_reason = ctx["done"]
-                    self._log(f"✅ {ctx['done']}")
+            # 认知类副产物——**必须在循环外结算一次**。ctx 是整轮共享的：
+            # 放在循环里，模型"先说一句话再调两个工具"时，同一条 say
+            # 会被后面的每个工具重新广播一遍（实测"一条消息刷三遍"的
+            # 根因），notes 也会被重复塞进长期记忆。
+            if ctx.get("goal"):
+                s.config.goal = ctx["goal"]
+                self._log(f"🎯 新目标: {ctx['goal']}")
+            for line in ctx.get("notes", []):
+                s.notes.append(line)
+                self._log(f"📝 {line}")
+            for msg in ctx.get("say", []):
+                if self._on_say:
+                    self._on_say(self.name, msg)
+            if ctx.get("done"):
+                s.done_reason = ctx["done"]
+                self._log(f"✅ {ctx['done']}")
 
             # 把地标同步进状态
             s.landmarks.update(self._compiler.notes)
