@@ -1,0 +1,32 @@
+arc_fake_player 3.2.0 validation (2026-10-25 Asia/Shanghai)
+
+Python regression suite: 1107 checks passed across 12 files
+(16 new in test_social.py: FavorStore persistence/clamp/cooldown/grudge/
+settle/describe + CombatReflex state machine full paths).
+Command: python -X utf8 tests/run_all.py -q
+
+JavaScript interaction regression suite: 20 tests passed.
+Digging simulation: 7 primary scenarios passed in default and strict mode.
+
+Python compileall and JavaScript syntax check: passed.
+Config schema v3 -> v4 migration verified on the live server config.
+
+In-game verification on MCBETestServer (BDS 1.26.45, Endstone 0.11.10,
+arc_ai_helper 2.4.0, no real players online):
+- Crowd scheduler end-to-end with a dummy LLM endpoint: Aqing/TieDan/MuTou
+  came online with randomized play times (80/87/38 min) + assistant TianXing
+  => 4/4 players online.
+- Card goals and stealth behavior active; /ai list shows per-bot favor line.
+- ActorDamageEvent smoke: attacker-less damage command and sim-vs-sim
+  bot:attack both correctly ignored (no favor change, no crash).
+- Console quirk found (not a plugin bug): raw console `ai set <url> ...`
+  fails to parse ":" in URLs ("Syntax error: Unexpected ':'"); set config
+  in config.json + /ai reload instead. In-game command bar unaffected.
+
+Not covered in-game: real-player attack -> reflex retaliation chain and
+vengeance loop (requires a real online player); covered by unit tests.
+Test LLM credentials cleared afterwards; auto_online left enabled.
+
+Environment: Python 3.13.9; Node.js v24.16.0; Windows.
+
+Wheel: endstone_arc_fake_player-3.2.0-py3-none-any.whl

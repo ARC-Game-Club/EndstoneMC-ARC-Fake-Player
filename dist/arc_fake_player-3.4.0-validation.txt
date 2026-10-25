@@ -1,0 +1,27 @@
+arc_fake_player 3.4.0 validation (2026-10-25 Asia/Shanghai)
+
+Python regression suite: 1107 checks passed across 12 files.
+JS interaction suite: 20/20 passed. Node syntax check passed.
+Partner: endstone_arc_shooter_game 0.4.26 (62 tests passed) adds
+api_lobby_info (state/team/enemies) used to feed the arena enemy list.
+
+Arena combat AI (per owner's spec): nearest enemy -> navigateToLocation
+pursuit -> getBlockFromRay line-of-sight -> useItemInHand() firing at the
+target; 0.25s loop in the behavior pack (bot:arena), enemy list refreshed
+from Python every 15s, auto-disable on gs leave / bot retire / enemies
+offline 30s.
+
+In-game verification on MCBETestServer (no real players): quick join ->
+autostart -> loadouts (no Unknown-item errors) -> arena AI activated and
+refreshed (bot:arena sent repeatedly) -> bot moving under AI control in
+the arena; one bot died to a floating test-map spawn (test-data artifact,
+heights since fixed in DB) and respawned back into the match. Two-bot
+kill exchange not observed live: the crude test map's spawn fall killed
+one bot repeatedly until it dropped; mechanism (attack/kill attribution
+vs players) was verified separately in 3.2.0.
+
+Test LLM credentials cleared afterwards; auto_online left enabled.
+
+Wheel: endstone_arc_fake_player-3.4.0-py3-none-any.whl
+SHA256: see dist listing; verified on MCBETestServer BDS 1.26.45 /
+Endstone 0.11.10.

@@ -1,0 +1,36 @@
+arc_fake_player 3.1.3 validation (2026-10-24 Asia/Shanghai)
+
+Python regression suite: 1091 checks passed across 11 files (22 new in test_crowd.py).
+Command: python -X utf8 tests/run_all.py -q
+
+JavaScript interaction regression suite: 20 tests passed.
+Command: node tests/test_interactions.mjs
+
+Digging simulation: 7 primary scenarios passed in default mode and 7 in strict mode.
+Commands:
+node verify_dig.mjs endstone_arc_fake_player/behavior_pack/scripts/main.js
+node verify_dig.mjs endstone_arc_fake_player/behavior_pack/scripts/main.js strict --strict
+(the exploratory strict-mode AIM_DELAY cases exceed the aim budget by design, same as 3.0.16)
+
+Python compileall and JavaScript syntax check: passed.
+
+In-game verification on MCBETestServer (BDS 1.26.45, Endstone 0.11.10,
+arc_core 0.9.71, arc_ai_helper 2.4.0):
+- v2→v3 config migration wrote auto_online/characters/prompt_command_policy.
+- Assistant persistent body (TianXing) via arc_ai_helper keepalive ->
+  api_ensure_body: spawn -> pending/attach by _try_attach_pending -> delayed
+  (8 s) game-mode switch -> stable across keepalive cycles (no re-spawn spam
+  after the stale-handle fix in _live_actor/_live_external).
+- bot:drop: replaceitem 10 iron_ingot, dropped 5 -> ITEM_ON_GROUND confirmed.
+- /ai money TianXing 500 then query -> wallet 500.00 through arc_core Economy.
+- /ai auto on + status: scheduler reports 4 cards, target 3, and correctly
+  refuses to spawn while LLM is unconfigured (single warning).
+- No fall damage on high-air bootstrap since the delayed gamemode switch.
+
+Not covered in-game: LLM-driven crowd bot behaviour and give_item/pay_money
+tool paths (no API key available on the test machine); covered by unit tests
+and the toolchain-level checks above.
+
+Environment: Python 3.13.9; Node.js v24.16.0; Windows.
+
+Wheel: endstone_arc_fake_player-3.1.3-py3-none-any.whl

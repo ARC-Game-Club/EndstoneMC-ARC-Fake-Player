@@ -1,0 +1,24 @@
+arc_fake_player 3.0.16 validation (2026-10-24 Asia/Shanghai)
+
+Python regression suite: 1068 checks passed across 10 files.
+Command: python -X utf8 tests/run_all.py -q
+
+JavaScript interaction regression suite: 20 tests passed.
+Command: node tests/test_interactions.mjs
+
+Digging simulation: 7 primary scenarios passed in default mode and 7 in strict mode.
+Commands:
+node verify_dig.mjs endstone_arc_fake_player/behavior_pack/scripts/main.js
+node verify_dig.mjs endstone_arc_fake_player/behavior_pack/scripts/main.js strict --strict
+Default mode retains distance-only checks. Strict mode rejects obstruction, with an aim timeout;
+the exploratory strict-mode 48/64-tick aim-delay cases intentionally exceed this limit.
+
+Python compileall and JavaScript syntax check: passed.
+Wheel integrity, behavior-pack resources, matching versions/UUID, metadata and entry-point import: passed.
+Entry-point import used the Endstone test stub; it is not a real server load test.
+
+Environment: Python 3.13.9; Node.js v24.16.0; Windows.
+No Bedrock/Endstone server, live player, or configured LLM endpoint was available for in-game testing.
+
+Wheel: endstone_arc_fake_player-3.0.16-py3-none-any.whl
+SHA256: c324dd5eac08cbc2c17de752f6f223cb26e504e3ea9ac8bbd53cafadb48339c0

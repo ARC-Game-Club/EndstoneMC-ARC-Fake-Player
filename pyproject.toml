@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# Endstone 的命名规范：distribution name（PyPI 名）必须用连字符
+# `endstone-<插件名>`，否则加载时直接报 "Invalid name" 拒绝加载。
+# entry point 键名 = 去掉 `endstone-` 前缀的部分（连字符可保留）。
+name = "endstone-arc-fake-player"
+version = "3.5.4"
+description = "arc_fake_player：LLM 驱动的 Endstone 模拟玩家插件（角色卡轮换 + 外部身体 API）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["endstone", "minecraft", "bedrock", "llm", "agent", "llm-agent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+]
+
+dependencies = ["endstone>=0.11"]
+
+# Endstone 将 entry point 中的连字符规范化为下划线。
+# 插件名为 arc_fake_player，数据目录为 plugins/arc_fake_player/。
+# 首次启动会复制 plugins/pureagent/config.json，保留原配置。
+[project.entry-points."endstone"]
+arc-fake-player = "endstone_arc_fake_player:ArcFakePlayerPlugin"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["endstone_arc_fake_player"]

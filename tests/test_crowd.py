@@ -1,0 +1,462 @@
+"""自动在线调度器（crowd.py）与经济桥（economy.py）的单元测试。
+
+两者都是零游戏依赖的纯逻辑：CrowdScheduler 通过 plugin 钩子回调，
+EconomyBridge 通过 plugin_manager 查 core.economy。这里全部用假对象，
+时钟与随机源注入，可以确定性地快进几小时。
+"""
+
+from __future__ import annotations
+
+import random
+import tempfile
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from endstone_arc_fake_player.crowd import (  # noqa: E402
+    CharacterCard, CrowdScheduler, load_cards,
+)
+from endstone_arc_fake_player.economy import EconomyBridge, wallet_key  # noqa: E402
+from endstone_arc_fake_player.identity import (  # noqa: E402
+    IdentityRegistry, looks_synthetic, synthetic_uuid, synthetic_xuid,
+)
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakePlugin:
+    """CrowdScheduler 钩子的假实现：记录调用，行为可控。"""
+
+    def __init__(self, *, cards=None, llm_ready=True, target=3,
+                 play=(10, 300), gap=(1, 5)) -> None:
+        self.config = {
+            "enabled": True,
+            "target_count": target,
+            "play_minutes_min": play[0],
+            "play_minutes_max": play[1],
+            "rejoin_gap_min_minutes": gap[0],
+            "rejoin_gap_max_minutes": gap[1],
+        }
+        self.cards = cards if cards is not None else []
+        self.llm_ready = llm_ready
+        self.online = {}          # name -> alive
+        self.reserved: set[str] = set()
+        self.real_players: set[str] = set()
+        self.retired: list[tuple[str, str]] = []
+        self.spawned: list[str] = []
+        self.spawn_fail: set[str] = set()
+        self.logs: list[tuple[str, str]] = []
+
+    # ---- 钩子（与 plugin.py 上的同名方法一一对应） ----
+    def crowd_config(self):
+        return self.config
+
+    def crowd_cards(self):
+        return self.cards
+
+    def crowd_llm_ready(self):
+        return self.llm_ready
+
+    def crowd_reserved_names(self):
+        return set(self.reserved)
+
+    def crowd_real_player_names(self):
+        return set(self.real_players)
+
+    def crowd_log(self, level, msg):
+        self.logs.append((level, msg))
+
+    def crowd_bot_alive(self, name):
+        return self.online.get(name, False)
+
+    def crowd_spawn(self, card):
+        if card.name in self.spawn_fail:
+            return False, "行为包未连接"
+        self.online[card.name] = True
+        self.spawned.append(card.name)
+        return True, "已上线"
+
+    def crowd_retire(self, name, why):
+        self.online.pop(name, None)
+        self.retired.append((name, why))
+
+
+def make_card(name):
+    return CharacterCard(name=name, persona="p", goal="g", money=100)
+
+
+class CardLoadingTests(unittest.TestCase):
+    def test_load_cards_valid_and_invalid(self):
+        cards = load_cards([
+            {"name": "A", "persona": "x", "goal": "y", "money": 5},
+            {"name": ""},               # 没名字 → 丢弃
+            "not-a-dict",               # 不是对象 → 丢弃
+            {"name": "B", "money": "12.5"},
+        ])
+        self.assertEqual([c.name for c in cards], ["A", "B"])
+        self.assertEqual(cards[0].money, 5.0)
+        self.assertEqual(cards[1].money, 12.5)
+
+    def test_bad_money_becomes_none(self):
+        card = CharacterCard.from_dict({"name": "A", "money": "abc"})
+        self.assertIsNotNone(card)
+        self.assertIsNone(card.money)
+
+    def test_non_list_returns_empty(self):
+        self.assertEqual(load_cards(None), [])
+        self.assertEqual(load_cards("x"), [])
+
+
+class CrowdSchedulerTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self.plugin = FakePlugin(cards=[make_card(n) for n in "ABCD"])
+        self.sched = CrowdScheduler(self.plugin, clock=self.clock,
+                                    rng=random.Random(42))
+
+    def tick(self, n=1, seconds=30.0):
+        for _ in range(n):
+            self.clock.advance(seconds)
+            self.sched.tick()
+
+    def test_disabled_drains_pending(self):
+        self.plugin.config["enabled"] = False
+        self.sched.tick()
+        self.assertEqual(self.plugin.spawned, [])
+
+    def test_llm_not_ready_blocks_spawning(self):
+        self.plugin.llm_ready = False
+        self.sched.tick()
+        self.assertEqual(self.plugin.spawned, [])
+        # 只告警一次
+        self.sched.tick()
+        warns = [m for lvl, m in self.plugin.logs if lvl == "warning"]
+        self.assertEqual(len(warns), 1)
+
+    def test_startup_fills_to_target(self):
+        self.sched.tick()
+        self.assertEqual(len(self.plugin.spawned), 3)
+        self.assertEqual(len(self.sched.sessions), 3)
+
+    def test_expires_at_deadline_and_rejoins_after_gap(self):
+        self.plugin.config.update({
+            "play_minutes_min": 10, "play_minutes_max": 10,   # 固定 10 分钟
+            "rejoin_gap_min_minutes": 2, "rejoin_gap_max_minutes": 2,
+        })
+        self.sched.tick()
+        first = set(self.sched.sessions)
+        # 9 分钟：都还在线
+        self.tick(18, 30.0)
+        self.assertEqual(set(self.sched.sessions), first)
+        # 到点（10 分钟过后）：全部下线，空位进入 gap 等待
+        self.tick(2, 30.0)
+        self.assertEqual(len(self.sched.sessions), 0)
+        self.assertEqual(len(self.plugin.retired), 3)
+        self.assertEqual(len(self.sched.pending), 3)
+        # gap 2 分钟未到：不补
+        self.tick(3, 30.0)
+        self.assertEqual(len(self.sched.sessions), 0)
+        # gap 过了：三张新卡上线（A/B/C/D 共 4 张，占 3 张剩 1 张，
+        # 上一轮用过的会按发牌顺序轮换）
+        self.tick(2, 30.0)
+        self.assertEqual(len(self.sched.sessions), 3)
+
+    def test_dead_body_triggers_retire_and_refill(self):
+        self.sched.tick()
+        victim = self.plugin.spawned[0]
+        self.plugin.online[victim] = False     # 身体消失（被打掉没回来）
+        self.tick(1)
+        self.assertIn((victim, "身体消失"), self.plugin.retired)
+
+    def test_card_rotation_avoids_active_names(self):
+        self.plugin.config["target_count"] = 4
+        self.sched.tick()
+        self.assertEqual(sorted(self.plugin.spawned), ["A", "B", "C", "D"])
+
+    def test_reserved_and_real_player_names_skipped(self):
+        self.plugin.reserved = {"A"}
+        self.plugin.real_players = {"B"}
+        self.sched.tick()
+        self.assertNotIn("A", self.plugin.spawned)
+        self.assertNotIn("B", self.plugin.spawned)
+
+    def test_spawn_failure_backs_off(self):
+        self.plugin.spawn_fail = {"A"}
+        self.plugin.config["target_count"] = 1
+        self.sched.tick()
+        # A 失败 → 退避 60 秒；30 秒后再 tick 还没人
+        self.tick(1)
+        self.assertEqual(self.plugin.spawned, [])
+        self.tick(2)   # 60 秒过了 → 发牌游标已过 A，换 B 上
+        self.assertEqual(self.plugin.spawned, ["B"])
+
+    def test_forget_then_refill_keeps_count(self):
+        self.sched.tick()
+        gone = self.plugin.spawned[0]
+        self.plugin.online.pop(gone)
+        self.sched.forget(gone)                # 管理员手动移除
+        self.tick(1)
+        self.assertNotIn(gone, self.sched.sessions)
+
+    def test_session_minutes_extend_and_zero_retires(self):
+        self.sched.tick()
+        name = self.plugin.spawned[0]
+        ok, msg = self.sched.set_session_minutes(name, 999)
+        self.assertTrue(ok)
+        self.tick(60)                          # 半小时过去：不该下线
+        self.assertIn(name, self.sched.sessions)
+        ok, _ = self.sched.set_session_minutes(name, 0)
+        self.assertTrue(ok)
+        self.tick(1)
+        self.assertNotIn(name, self.sched.sessions)
+        ok, _ = self.sched.set_session_minutes("nobody", 5)
+        self.assertFalse(ok)
+
+    def test_shortage_refill_uses_gap_after_bootstrap(self):
+        self.plugin.config.update({
+            "target_count": 2,
+            "rejoin_gap_min_minutes": 1, "rejoin_gap_max_minutes": 1,
+        })
+        self.sched.tick()
+        self.assertEqual(len(self.sched.sessions), 2)
+        # 目标提到 3：新空位要等 gap（1 分钟），不是立刻冒出来
+        self.plugin.config["target_count"] = 3
+        self.tick(1)
+        self.assertEqual(len(self.sched.sessions), 2)
+        self.tick(2)
+        self.assertEqual(len(self.sched.sessions), 3)
+
+    def test_describe_mentions_counts(self):
+        self.sched.tick()
+        text = "\n".join(self.sched.describe())
+        self.assertIn("目标 3 人", text)
+        self.assertIn("在线 3", text)
+
+
+class EconomyBridgeTests(unittest.TestCase):
+    def make_bridge(self, *, fail=None):
+        """core.economy 的最小假实现。fail 是要让它失败的方法名集合。
+
+        inc 用"只失败一次"的语义：模拟"给玩家加钱那一下失败、
+        回滚的第二次调用成功"——回滚要验证的正是这个顺序。
+        """
+        fail = fail or set()
+        balances = {}
+        inc_calls = {"n": 0}
+
+        def get(x):
+            return balances.get(x)
+
+        def set_(x, v):
+            if "set" in fail:
+                return False
+            balances[x] = v
+            return True
+
+        def dec(x, v):
+            if "dec" in fail:
+                return False
+            if balances.get(x, 0) < v:
+                return False
+            balances[x] -= v
+            return True
+
+        def inc(x, v):
+            inc_calls["n"] += 1
+            if "inc" in fail and inc_calls["n"] == 1:
+                return False
+            balances[x] = balances.get(x, 0) + v
+            return True
+
+        def init(x):
+            balances.setdefault(x, 100.0)
+            return True
+
+        core = SimpleNamespace(economy=SimpleNamespace(
+            get_player_money_by_xuid=get,
+            set_player_money_by_xuid=set_,
+            decrease_player_money_by_xuid=dec,
+            increase_player_money_by_xuid=inc,
+            init_player_economy_by_xuid=init,
+        ))
+        server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=lambda n: core))
+        bridge = EconomyBridge(server, _SilentLogger())
+        bridge._cached = core.economy
+        return bridge, balances
+
+    def test_wallet_key_is_stable_and_namespaced(self):
+        self.assertEqual(wallet_key("Aqing"), "fake_aqing")
+        self.assertEqual(wallet_key("Aqing"), wallet_key("AQING"))
+
+    def test_no_core_means_unavailable(self):
+        server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=lambda n: None))
+        bridge = EconomyBridge(server, _SilentLogger())
+        self.assertFalse(bridge.available())
+        self.assertIsNone(bridge.get_balance("X"))
+        self.assertFalse(bridge.set_balance("X", 5))
+
+    def test_ensure_wallet_sets_initial_and_ensure_only_keeps(self):
+        bridge, balances = self.make_bridge()
+        # 首次：设初始额（get-or-create 建行 + 写值）
+        self.assertTrue(bridge.ensure_wallet("XiaoHe", 500))
+        self.assertEqual(balances["fake_xiaohe"], 500.0)
+        # 之后：ensure-only（initial=None）不改余额
+        balances["fake_xiaohe"] = 999
+        bridge.ensure_wallet("XiaoHe", None)
+        self.assertEqual(balances["fake_xiaohe"], 999.0)
+
+    def test_ensure_wallet_migrates_legacy_balance(self):
+        # 换键（合成 xuid）后，旧 fake_<名字> 键的余额要带过来
+        bridge, balances = self.make_bridge()
+        balances["fake_seller"] = 700.0
+        bridge.bind_key_fn(lambda n: "9504154966749693")
+        # 首次设值 100，但旧键有 700 → 取较大
+        self.assertTrue(bridge.ensure_wallet("seller", 100))
+        self.assertEqual(balances["9504154966749693"], 700.0)
+        self.assertEqual(balances["fake_seller"], 700.0)   # 旧键不动
+
+    def test_pay_player_moves_money(self):
+        bridge, balances = self.make_bridge()
+        balances["fake_seller"] = 50.0
+        player = SimpleNamespace(xuid="12345")
+        ok, why = bridge.pay_player("seller", player, 30.0)
+        self.assertTrue(ok, why)
+        self.assertEqual(balances["fake_seller"], 20.0)
+        self.assertEqual(balances["12345"], 30.0)
+
+    def test_pay_player_rejects_insufficient(self):
+        bridge, balances = self.make_bridge()
+        balances["fake_seller"] = 5.0
+        ok, _ = bridge.pay_player("seller", SimpleNamespace(xuid="1"), 30.0)
+        self.assertFalse(ok)
+
+    def test_pay_player_rollback_when_credit_fails(self):
+        bridge, balances = self.make_bridge(fail={"inc"})
+        balances["fake_seller"] = 50.0
+        ok, _ = bridge.pay_player("seller", SimpleNamespace(xuid="1"), 30.0)
+        self.assertFalse(ok)
+        # 加钱失败 → 退回，假人不吃亏
+        self.assertEqual(balances["fake_seller"], 50.0)
+
+    def test_receive_from_player(self):
+        bridge, balances = self.make_bridge()
+        balances["42"] = 10.0
+        ok, _ = bridge.receive_from_player("bot", SimpleNamespace(xuid="42"), 7.5)
+        self.assertTrue(ok)
+        self.assertEqual(balances["fake_bot"], 7.5)
+        self.assertEqual(balances["42"], 2.5)
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "identities.json"
+
+    def registry(self):
+        return IdentityRegistry(self.path, logger=None)
+
+    def test_synthetic_xuid_shape(self):
+        for name in ("Aqing", "TieDan", "测试假人"):
+            x = synthetic_xuid(name)
+            self.assertEqual(len(x), 16, x)
+            self.assertTrue(x.isdigit(), x)
+            self.assertTrue(x.startswith("9"), x)
+        # 同名永远同 xuid，不同名不同 xuid
+        self.assertEqual(synthetic_xuid("Aqing"), synthetic_xuid("Aqing"))
+        self.assertNotEqual(synthetic_xuid("Aqing"), synthetic_xuid("aqing"))
+
+    def test_synthetic_uuid_stable(self):
+        self.assertEqual(synthetic_uuid("Aqing"), synthetic_uuid("Aqing"))
+        self.assertNotEqual(synthetic_uuid("Aqing"), synthetic_uuid("TieDan"))
+
+    def test_looks_synthetic(self):
+        self.assertTrue(looks_synthetic(synthetic_xuid("X")))
+        self.assertFalse(looks_synthetic("2535441234567890"))   # 真人形状
+        self.assertFalse(looks_synthetic(""))
+        self.assertFalse(looks_synthetic("fake_aqing"))
+
+    def test_registry_generates_once_and_persists(self):
+        reg = self.registry()
+        first = reg.of("Aqing")
+        self.assertTrue(looks_synthetic(first["xuid"]))
+        reg.save()
+        # 重开（模拟重启）：同一个身份
+        reborn = self.registry()
+        self.assertEqual(reborn.of("Aqing")["xuid"], first["xuid"])
+        self.assertEqual(reborn.of("Aqing")["uuid"], first["uuid"])
+
+    def test_pin_respects_first_registration(self):
+        reg = self.registry()
+        pinned = reg.pin("Bot7", xuid="9111111111111111", uuid="uuid-7")
+        self.assertEqual(pinned["xuid"], "9111111111111111")
+        # 第二次钉不同值：以先到为准，不改
+        again = reg.pin("Bot7", xuid="9222222222222222")
+        self.assertEqual(again["xuid"], "9111111111111111")
+
+    def test_pin_none_generates_synthetic_not_string_none(self):
+        """pin(xuid=None) 必须生成合成身份，而不是字符串 "None"。
+
+        回归：str(None).strip() == "None" 是真值，曾让所有假人的
+        身份都变成 xuid="None"（又挤回同一行数据）。
+        """
+        reg = self.registry()
+        ident = reg.pin("Bot8")                     # 两个参数都不传
+        self.assertTrue(looks_synthetic(ident["xuid"]), ident["xuid"])
+        self.assertTrue(ident["uuid"] and ident["uuid"] != "None")
+        ident2 = reg.pin("Bot9", xuid=None, uuid=None)
+        self.assertTrue(looks_synthetic(ident2["xuid"]), ident2["xuid"])
+
+    def test_name_of_xuid_roundtrip(self):
+        reg = self.registry()
+        ident = reg.of("MuTou")
+        self.assertEqual(reg.name_of_xuid(ident["xuid"]), "MuTou")
+        self.assertIsNone(reg.name_of_xuid("2535441234567890"))
+
+    def test_card_parses_identity_fields(self):
+        card = CharacterCard.from_dict(
+            {"name": "A", "xuid": "9123456789012345", "uuid": "u-1", "money": 3})
+        self.assertEqual(card.xuid, "9123456789012345")
+        self.assertEqual(card.uuid, "u-1")
+        card2 = CharacterCard.from_dict({"name": "B"})
+        self.assertIsNone(card2.xuid)
+        self.assertIsNone(card2.uuid)
+
+
+class _SilentLogger:
+    def debug(self, *_a):
+        pass
+
+    info = warning = error = debug
+
+
+def main():
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite()
+    for cls in (CardLoadingTests, CrowdSchedulerTests, EconomyBridgeTests, IdentityTests):
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    total = result.testsRun
+    if result.failures or result.errors:
+        print(f"\n❌ {len(result.failures) + len(result.errors)} 项失败（共 {total} 项）")
+        return 1
+    print(f"\n✅ 全部 {total} 项通过")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

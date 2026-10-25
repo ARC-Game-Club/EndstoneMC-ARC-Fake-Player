@@ -1,0 +1,33 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "arc_fake_player 假人桥接",
+    "description": "为 Endstone 的 LLM 虚拟玩家插件提供真实 SimulatedPlayer 身体",
+    "uuid": "7d4c1a90-2f63-4b8e-a5d1-9c0e7b3f6a24",
+    "version": [3, 5, 4],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    {
+      "description": "SimulatedPlayer 桥接脚本",
+      "type": "script",
+      "language": "javascript",
+      "uuid": "c81b5e47-3a92-4d6f-b0e8-5f7a2c9d1e63",
+      "entry": "scripts/main.js",
+      "version": [3, 5, 4]
+    }
+  ],
+  "capabilities": [
+    "script_eval"
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "beta"
+    },
+    {
+      "module_name": "@minecraft/server-gametest",
+      "version": "beta"
+    }
+  ]
+}

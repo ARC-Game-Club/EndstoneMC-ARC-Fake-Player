@@ -1,0 +1,126 @@
+"""配置版本迁移：纯函数，不接触任何游戏 API。
+
+为什么单独一个模块
+------------------
+``plugin.py`` 在 import 期就要 import endstone，测试没法直接导入它。
+而"配置升级"这件事的逻辑并不简单——它要区分"用户改过的键"和
+"用户没动过的键"——所以必须能脱离服务器单测。这里因此零依赖。
+
+要解决的问题
+------------
+配置里选择了"启动时把**全部**键写进 config.json"，好处是服主能一眼
+看到所有可改的东西（尤其是那几段提示词）。代价是：以后代码里改进了
+提示词默认值，会被用户本地那份老副本**静默**盖掉——用户升级了插件，
+却以为提示词没变好。
+
+解法是三方合并，用"键是否存在"和"值是否等于旧版默认值"来区分：
+
+    键缺失                → 新版新增的，补上
+    值 == 旧版默认值       → 用户没动过，安全升到新默认值
+    值 != 任何已知默认值   → 用户改过，原样保留 + 日志警告
+
+第 1 条最关键：没有它，老用户的 config 里永远不会有新加的
+``prompt_surface_hint``，模型会把"看不见"误读成"不存在"。
+
+⚠️ 维护须知
+-----------
+**改动任何 prompt_* 的默认文本，都必须往 ``LEGACY_DEFAULTS`` 登记旧值。**
+不登记的话，老用户手里那份旧副本会被当成"用户改过的"而永久保留，
+新版改进永远送不到——而且不会有任何报错，是纯静默的。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+#: config.json 的 schema 版本。
+#:
+#: 每次改动"默认值与配置项的对应关系"就 +1——新增键、改默认文本、
+#: 改键名都算。插件启动时比对本地版本，落后就走升级路径。
+#:
+#:   1 → 最初的结构（没有这个字段时一律视为 1）
+#:   2 → 提示词拆段（prompt_*）+ 表面感知开关（surface_only 等）
+#:   3 → 社交与轮换：auto_online（自动稳定在线调度）、characters（角色卡）、
+#:       prompt_command_policy（管理员指令权限说明）
+#:   4 → 好感度与恩怨：social（反击/寻仇/好感度数值）、prompt_social
+CONFIG_VERSION = 4
+
+#: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
+#:
+#: 只用来回答一个问题："用户 config 里的这个值，是他自己写的，
+#: 还是我们当初给他的默认值？"——值等于旧默认值就说明他没动过，
+#: 可以安全升级；否则必须原样保留。
+#:
+#: 这里不需要登记"本次新增的键"（v2 新加的键在 v1 里根本不存在，
+#: 走"缺失即补"分支）。
+LEGACY_DEFAULTS: dict[str, dict[int, Any]] = {
+    # v1 时 persona 是硬编码在 agent.py 里的 dataclass 默认值，
+    # v2 把它搬进了 config，文本一字未改，所以 v1 的"默认值"就是它。
+    "prompt_persona": {
+        1: "# 性格\n你务实、谨慎、动手能力强。血量低于 8 时优先脱离战斗并进食；"
+           "天黑前会主动准备掩体；不浪费背包格子装垃圾。",
+    },
+}
+
+
+def migrate(cfg: dict[str, Any], from_version: int, defaults: dict[str, Any],
+            *, to_version: int = CONFIG_VERSION,
+            warn: Callable[[str], None] | None = None) -> list[str]:
+    """把 ``cfg`` 就地升级到 ``to_version``，返回被改动过的键名列表。
+
+    ``defaults`` 是当前版本的完整默认值表。只有出现在它里面的键会被
+    处理——用户自己加的自定义键不在其中，因此天然不会被删。
+
+    ``warn`` 用于报告"你改过的旧文本没有被自动升级"。这不是可有可无的
+    装饰：它是这套机制**能不能被发现**的关键。没有它，用户只会看到
+    "升级了但提示词没变化"，然后怀疑插件没生效。
+
+    幂等：``from_version >= to_version`` 时什么都不做，直接返回空列表。
+    版本比代码新（用户降级了插件）时同样不动——不能把未来格式的配置
+    交给旧代码去猜。
+
+    注意 ``cfg`` 和 ``defaults`` 在调用方那里常常是**同一个字典**
+    （先铺默认值、再被用户值覆盖，"值 != 默认值"恰好等价于"用户改过"）。
+    这是有意支持的用法：缺失的键会被立刻补上，而 `continue` 保证补过的
+    键不会在同一轮里被当成"用户改过"再处理一次。
+    """
+    if from_version >= to_version:
+        return []
+
+    changed: list[str] = []
+    for key, new_value in list(defaults.items()):
+        if key not in cfg:
+            # 新版新增的键。老用户 config 里没有它，必须补——
+            # 否则代码读 self._cfg["prompt_surface_hint"] 会 KeyError，
+            # 或者（如果用 .get 兜底）那段提示词永远不生效。
+            cfg[key] = new_value
+            changed.append(key)
+            continue
+
+        if cfg[key] == new_value:
+            # 已经是新默认值，不用动（也可能默认值本身没变）
+            continue
+
+        known = LEGACY_DEFAULTS.get(key)
+        if not known:
+            # 没有历史登记的键：可能用户改过，也可能只是我们没登记。
+            # 无法判定，一律保留用户的。
+            continue
+
+        old_value = known.get(from_version)
+        if old_value is not None and cfg[key] == old_value:
+            # 值还停在旧版默认值上 → 用户没动过 → 安全升级
+            cfg[key] = new_value
+            changed.append(key)
+        elif old_value is not None:
+            # 用户改过。保留他的版本，但**必须告诉他**，
+            # 否则他会以为插件升级后提示词自己会变好。
+            if warn:
+                # 提示命令时用短名（prompt_persona → persona），
+                # 和 /ai prompt <段落> 的用法对齐。
+                short = key[len("prompt_"):] if key.startswith("prompt_") else key
+                warn(f"配置 {key} 是你改过的旧版文本，未被自动升级"
+                     f"（新版默认值见 README，或 /ai prompt reset {short}）")
+
+    cfg["config_version"] = to_version
+    return changed

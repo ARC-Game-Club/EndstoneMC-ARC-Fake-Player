@@ -1,0 +1,31 @@
+arc_fake_player 3.3.2 validation (2026-10-25 Asia/Shanghai)
+
+Python regression suite: 1107 checks passed across 12 files.
+Command: python -X utf8 tests/run_all.py -q
+
+Partner: endstone_arc_shooter_game 0.4.25 (62 tests passed) provides
+/gs quick, api_quick_join, api_leave, _send_form guard, quick autostart.
+
+In-game verification on MCBETestServer (BDS 1.26.45, Endstone 0.11.10,
+arc_inventory 0.2.0, no real players):
+- /ai cmd <bot> gs quick -> API quick-join: room created, "人齐自动开局"
+  (auto countdown once both teams have players), no Unknown-item errors,
+  both bots teleported to team spawns with loadouts.
+- One bot died to a spawn-height fall (crude test map) and respawned back
+  into the match automatically; the other kept roaming the arena.
+- Perception now lists nearby players as their own line.
+
+Key finding (documented in code): command channels are unreliable for
+SimulatedPlayers — server.dispatch_command(player, cmd) returns success
+but silently does nothing; console "execute as <sim> run <cmd>" delivers
+a non-Player sender to plugin commands. Known ARC gameplay therefore
+goes through plugin APIs (api_quick_join/api_leave); /ai cmd and the
+run_command tool both route through _run_bot_command which intercepts
+"gs quick"/"gs leave".
+
+Test-server data changes: guns BP/RP installed and registered; weapons.json
+items rewritten arc:->blazik:/nova: with 6 fallbacks; arc: armor aliases
+added inside the BP; test map ai_test_arena inserted (spawn heights are
+rough). Dummy LLM credentials cleared afterwards; auto_online left on.
+
+Wheel: endstone_arc_fake_player-3.3.2-py3-none-any.whl
