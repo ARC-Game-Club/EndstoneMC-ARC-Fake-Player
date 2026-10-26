@@ -765,7 +765,9 @@ class ArcFakePlayerPlugin(Plugin):
             # ---- 聊天个性 ----
             # 公屏闲聊（没点名）时 AI 搭话的概率（0~1）。每个 AI 可在
             # 管理表单/角色卡里单独覆盖；@点名永远必回。
-            "chat_reply_chance": 0.15,
+            # 0.15 太冷清了——真人聊天里 AI 多半该接两句。v12 起默认 0.5，
+            # 想要"群里有个话痨"就再往上加，想要安静就单独调低。
+            "chat_reply_chance": 0.5,
             # ---- 进/退服播报 ----
             # 轮换假人上线/下线时广播一条**原版风格**的消息（真玩家进退服
             # 客户端会自己显示，SimulatedPlayer 不会——不补这条，在线人数
@@ -3427,12 +3429,12 @@ class ArcFakePlayerPlugin(Plugin):
             pass
         try:
             cfg = getattr(self, "_cfg", None) or {}
-            raw = cfg.get("chat_reply_chance", 0.15)
+            raw = cfg.get("chat_reply_chance", 0.5)
             if raw is None:
-                raw = 0.15
+                raw = 0.5
             return max(0.0, min(1.0, float(raw)))
         except (TypeError, ValueError, AttributeError):
-            return 0.15
+            return 0.5
 
     def set_chat_reply_chance(self, name: str, chance: float) -> None:
         entry = self._bot_settings.setdefault(name, {})

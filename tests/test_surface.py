@@ -773,18 +773,56 @@ def test_prompt_sections() -> None:
 def test_confmig() -> None:
     section("第六部分：confmig —— 老配置升级不丢用户改动")
 
-    check("CONFIG_VERSION 是 11", CONFIG_VERSION == 11, str(CONFIG_VERSION))
+    check("CONFIG_VERSION 是 12", CONFIG_VERSION == 12, str(CONFIG_VERSION))
     check("登记了 v1 的 persona 默认值",
           "prompt_persona" in confmig.LEGACY_DEFAULTS)
     check("登记的 v1 persona 与当前默认值一致（一字未改）",
           confmig.LEGACY_DEFAULTS["prompt_persona"][1] == DEFAULT_PERSONA)
     from endstone_arc_fake_player.agent import DEFAULT_RULES as _RULES
+    from endstone_arc_fake_player.agent import DEFAULT_SPEECH as _SPEECH
     check("登记了 v6 的 rules 默认值（v7 加了克制发言条款）",
           "prompt_rules" in confmig.LEGACY_DEFAULTS)
     check("登记了 v9 的 speech 默认值（v10 语气词多样化）",
           "prompt_speech" in confmig.LEGACY_DEFAULTS)
     check("v6 rules 默认值与新默认前缀逐字一致（迁移凭据）",
           _RULES.startswith(confmig.LEGACY_DEFAULTS["prompt_rules"][6]))
+
+    # -- v11：禁端着自称 --
+    # 老服手里那份 v10 speech 必须能被认成"用户没动过"，否则新规则送不到。
+    _v10 = confmig.LEGACY_DEFAULTS["prompt_speech"].get(10)
+    check("登记了 v10 的 speech 默认值（v11 加自称禁令）", _v10 is not None)
+    check("v10 speech 是旧文本（不含自称禁令）",
+          _v10 is not None and "自称" not in _v10,
+          repr(_v10)[:120] if _v10 else "")
+    check("当前 speech 含'自称只用我'规则", "自称" in _SPEECH, _SPEECH[-200:])
+    check("当前 speech 禁了'本教授/本座'这类自称",
+          "本教授" in _SPEECH and "本座" in _SPEECH, _SPEECH[-200:])
+    _v11 = confmig.LEGACY_DEFAULTS["prompt_speech"].get(11)
+    check("登记了 v11 的 speech 默认值（v12 往禁令里补了'本座'）",
+          _v11 is not None)
+    check("v11 speech 是旧文本（不含本座）",
+          _v11 is not None and "本座" not in _v11,
+          repr(_v11)[-160:] if _v11 else "")
+
+    # -- v12：chat_reply_chance 全局默认 0.15 → 0.5 --
+    check("登记了 chat_reply_chance 的 v10/v11 旧值 0.15",
+          confmig.LEGACY_DEFAULTS.get("chat_reply_chance", {}).get(10) == 0.15
+          and confmig.LEGACY_DEFAULTS.get("chat_reply_chance", {}).get(11) == 0.15)
+    _d = {"chat_reply_chance": 0.15}
+    confmig.migrate(_d, 10, {"chat_reply_chance": 0.5}, to_version=12)
+    check("老服停在 0.15 → 自动升到 0.5", _d["chat_reply_chance"] == 0.5,
+          str(_d["chat_reply_chance"]))
+    _d11 = {"chat_reply_chance": 0.15}
+    confmig.migrate(_d11, 11, {"chat_reply_chance": 0.5}, to_version=12)
+    check("v11 的服停在 0.15 → 也自动升到 0.5", _d11["chat_reply_chance"] == 0.5,
+          str(_d11["chat_reply_chance"]))
+    _d2 = {"chat_reply_chance": 0.3}
+    _warns: list[str] = []
+    confmig.migrate(_d2, 10, {"chat_reply_chance": 0.5}, to_version=12,
+                    warn=_warns.append)
+    check("自己改过的搭话概率保留原值", _d2["chat_reply_chance"] == 0.3)
+    check("非提示词键的警告不指向不存在的命令",
+          _warns and "prompt reset" not in _warns[0], _warns[0] if _warns else "")
 
     def defaults() -> dict:
         return {
