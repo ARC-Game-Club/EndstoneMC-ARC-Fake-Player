@@ -731,6 +731,13 @@ class ArcFakePlayerPlugin(Plugin):
             # 只对自动在线的群演假人生效；手动 /ai spawn 的有自己的回执。
             "join_message": "§e{name} 加入了游戏",
             "leave_message": "§e{name} 离开了游戏",
+            # ---- 进服签到 ----
+            # 群演假人上线后隔一会儿自发"签到"一条——中文服务器玩家的
+            # 日常仪式感，也顺带营造"服务器活跃玩家很多"的氛围。
+            # 延迟 20~120 秒随机（没人进服 3 秒就签到的）；文案从池子里
+            # 随机挑。设 false 关闭。
+            "join_checkin": True,
+            "join_checkin_messages": ["签到", "签到~", "日常签到", "打卡", "签到打卡", "来了，签到"],
             # ---- QQ 群同步 ----
             # 真人聊天走 PlayerChatEvent 被同步插件转进 QQ 群；假人的
             # broadcast 不触发聊天事件，群里看不到——由插件直调
@@ -3880,6 +3887,37 @@ class ArcFakePlayerPlugin(Plugin):
         if name not in self._stealth:
             return
         self._announce("join_message", name)
+        self._schedule_checkin(name)
+
+    def _schedule_checkin(self, name: str) -> None:
+        """进服后隔一会儿自发"签到"（20~120 秒随机）。
+
+        真人上线不会 3 秒内签到——先溜达一会儿再顺手打一句才是常态。
+        文案从 join_checkin_messages 随机挑；假人在这期间下线了就不发
+        （_broadcast 前检查在线）。"""
+        import random as _random
+        if not bool(self._cfg.get("join_checkin", True)):
+            return
+        pool = self._cfg.get("join_checkin_messages") or []
+        if not pool:
+            return
+        msg = str(_random.choice(pool))
+        delay = _random.uniform(20.0, 120.0)
+
+        def _checkin() -> None:
+            try:
+                if name not in self._agents:
+                    return          # 已经下线了，别诈尸
+                self._broadcast(name, msg)
+                self._record("chat", "进服签到", who=name)
+            except Exception:
+                pass
+
+        try:
+            self.server.scheduler.run_task_later(self, _checkin,
+                                                 int(delay * 20))
+        except Exception:
+            pass
 
     def _announce_leave(self, name: str) -> None:
         self._announce("leave_message", name)
@@ -3922,8 +3960,24 @@ class ArcFakePlayerPlugin(Plugin):
         fn = getattr(plug, "api_send_event", None)
         if not callable(fn):
             return
+        # 合成 xuid 随事件带上：假人在线时同步插件"按名解析"会命中
+        # 在线列表拿到空 xuid，统计永远查空——进服消息就成了"首次
+        # 进入服务器"（arc_core 里次数明明是对的；退服正常是因为那时
+        # 假人已离开在线列表、解析落到数据库兜底）。带 xuid 走直查
+        # 跳过解析。老版同步插件没这个参数，回退不带。
+        xuid = ""
         try:
-            fn(event_type, name, name, message)
+            xuid = str(self._identities.xuid_of(name) or "")
+        except Exception:
+            xuid = ""
+        try:
+            try:
+                if xuid:
+                    fn(event_type, name, name, message, xuid=xuid)
+                else:
+                    fn(event_type, name, name, message)
+            except TypeError:
+                fn(event_type, name, name, message)
         except Exception as exc:
             try:
                 self.logger.debug(f"QQ 同步 {event_type}({name}) 失败: {exc}")

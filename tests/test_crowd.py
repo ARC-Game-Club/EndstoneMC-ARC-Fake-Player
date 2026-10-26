@@ -327,6 +327,8 @@ class JoinLeaveAnnounceTests(unittest.TestCase):
         fake._announce = MethodType(plugin_mod.ArcFakePlayerPlugin._announce,
                                     fake)
         fake._qq_sync = MethodType(plugin_mod.ArcFakePlayerPlugin._qq_sync, fake)
+        fake._schedule_checkin = MethodType(
+            plugin_mod.ArcFakePlayerPlugin._schedule_checkin, fake)
         return fake, plugin_mod.ArcFakePlayerPlugin
 
     def test_join_announced_for_stealth_bot(self):
@@ -389,7 +391,9 @@ class QQSyncTests(unittest.TestCase):
             _cfg=dict(cfg if cfg is not None else {
                 "qq_sync_chat": True, "qq_sync_join_leave": True}),
             server=Server(),
-            logger=SimpleNamespace(debug=lambda *_: None))
+            logger=SimpleNamespace(debug=lambda *_: None),
+            _identities=SimpleNamespace(
+                xuid_of=lambda n: "9123456789012345"))
         fake._qq_sync = MethodType(plugin_mod.ArcFakePlayerPlugin._qq_sync,
                                    fake)
         return fake, plugin_mod.ArcFakePlayerPlugin
@@ -399,14 +403,36 @@ class QQSyncTests(unittest.TestCase):
         calls = []
 
         class QQ:
+            def api_send_event(self, *args, **kwargs):
+                calls.append((args, kwargs))
+                return True
+
+        return QQ(), calls
+
+    @staticmethod
+    def _qq_plugin_legacy():
+        calls = []
+
+        class QQ:
             def api_send_event(self, *args):
                 calls.append(args)
                 return True
 
         return QQ(), calls
 
-    def test_chat_pushed_to_qq(self):
+    def test_chat_pushed_to_qq_with_xuid(self):
+        """事件带合成 xuid：绕开'在线匹配拿到空 xuid'的解析坑。"""
         qq, calls = self._qq_plugin()
+        fake, cls = self._make_fake(qq_plugin=qq)
+        cls._qq_sync(fake, "chat", "BotA", "大家好")
+        self.assertEqual(
+            calls,
+            [(("chat", "BotA", "BotA", "大家好"),
+              {"xuid": "9123456789012345"})])
+
+    def test_legacy_qq_plugin_without_xuid_kwarg(self):
+        """老版同步插件没有 xuid 参数：TypeError 回退为不带参调用。"""
+        qq, calls = self._qq_plugin_legacy()
         fake, cls = self._make_fake(qq_plugin=qq)
         cls._qq_sync(fake, "chat", "BotA", "大家好")
         self.assertEqual(calls, [("chat", "BotA", "BotA", "大家好")])
