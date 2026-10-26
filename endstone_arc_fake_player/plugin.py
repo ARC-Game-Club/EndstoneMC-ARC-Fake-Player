@@ -3889,6 +3889,110 @@ class ArcFakePlayerPlugin(Plugin):
         self._announce("join_message", name)
         self._schedule_checkin(name)
 
+    def _core_checkin(self, name: str) -> dict | None:
+        """用弧光核心的签到体系给假人签到（和真人一个待遇）。
+
+        合成 xuid 直写主库——主服是同步中心，写库会下行广播，各服的
+        "今日第 N 个 / 共 M 人"数的是同一份数据（跨服汇总）。奖励
+        （金钱按 xuid 入账、物品控制台 give）、连续天数、全服排行
+        广播全部复用核心自己的逻辑。核心缺席/内部结构变了返回 None，
+        上层退化为普通聊天签到；今天已签过返回 {"already": True}。
+        """
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return None
+        if core is None:
+            return None
+        xuid = ""
+        try:
+            xuid = str(self._identities.xuid_of(name) or "")
+        except Exception:
+            return None
+        if not xuid:
+            return None
+        try:
+            from datetime import datetime as _dt
+            today = core._today_checkin_date_str()
+            dbm = core.database_manager
+            row = dbm.query_one(
+                "SELECT last_checkin_date, continuous_checkin_days "
+                "FROM player_local_info WHERE xuid = ?", (xuid,))
+            if row and str(row.get("last_checkin_date") or "").strip() == today:
+                return {"already": True}
+            cfg = core.get_checkin_config()
+            cnt = dbm.query_one(
+                "SELECT COUNT(1) AS cnt FROM player_local_info "
+                "WHERE last_checkin_date = ?", (today,))
+            rank = max(1, int((cnt or {}).get("cnt") or 0) + 1)
+            last_days = int((row or {}).get("continuous_checkin_days") or 0)
+            next_days = core._compute_next_continuous_checkin_days(
+                str((row or {}).get("last_checkin_date") or ""),
+                last_days, today)
+            money = float(cfg.get("daily_money") or 0.0)
+            money += float(core._calculate_checkin_top_rank_bonus_money(
+                rank, int(cfg.get("top_rank_limit") or 0),
+                float(cfg.get("top_rank_bonus_money_step") or 0.0)) or 0.0)
+            money += max(0, next_days - 1) * float(
+                cfg.get("continuous_checkin_money_increment") or 0.0)
+            if money > 0:
+                try:
+                    core.increase_player_money_by_xuid(xuid, money, notify=False)
+                except Exception:
+                    pass
+            # 物品奖励：按核心配置加权抽，控制台 give 按名字发
+            reward_list = cfg.get("reward_list") or []
+            pick_min = int(cfg.get("pick_min") or 0)
+            pick_max = int(cfg.get("pick_max") or 0)
+            if reward_list and pick_max >= pick_min:
+                import random as _r
+                picks = core._weighted_sample_checkin_rewards(
+                    reward_list, _r.randint(pick_min, pick_max))
+                if (int(cfg.get("top_rank_limit") or 0) > 0
+                        and rank <= int(cfg.get("top_rank_limit") or 0)
+                        and int(cfg.get("top_rank_bonus_item_count") or 0) > 0):
+                    picks += core._weighted_sample_checkin_rewards(
+                        reward_list,
+                        int(cfg.get("top_rank_bonus_item_count")))
+                for it in picks:
+                    try:
+                        self.server.dispatch_command(
+                            self.server.command_sender,
+                            f"give {name} {it['item_id']} {int(it['item_count'])}")
+                    except Exception:
+                        pass
+            # 记账（与核心的 UPDATE 一致；主库写库由核心同步层下行广播）
+            dbm.execute(
+                "UPDATE player_local_info SET last_checkin_date = ?, "
+                "last_checkin_at = ?, total_checkin_count = "
+                "COALESCE(total_checkin_count, 0) + 1, "
+                "continuous_checkin_days = ? WHERE xuid = ?",
+                (today, _dt.now().replace(microsecond=0).isoformat(),
+                 next_days, xuid))
+            # 全服排行广播（核心自己的文案与格式）
+            display = name
+            try:
+                display = core.get_player_name_by_xuid(
+                    xuid, return_with_title=True) or name
+            except Exception:
+                pass
+            core._broadcast_checkin_rankings(display, today)
+            total = rank
+            try:
+                cnt2 = dbm.query_one(
+                    "SELECT COUNT(1) AS cnt FROM player_local_info "
+                    "WHERE last_checkin_date = ?", (today,))
+                total = int((cnt2 or {}).get("cnt") or rank)
+            except Exception:
+                pass
+            return {"already": False, "rank": rank, "total": total}
+        except Exception as exc:
+            try:
+                self.logger.debug(f"核心签到失败（按普通聊天签到）: {exc}")
+            except Exception:
+                pass
+            return None
+
     def _schedule_checkin(self, name: str) -> None:
         """进服后隔一会儿自发"签到"（20~120 秒随机）。
 
@@ -3908,8 +4012,30 @@ class ArcFakePlayerPlugin(Plugin):
             try:
                 if name not in self._agents:
                     return          # 已经下线了，别诈尸
-                self._broadcast(name, msg)
-                self._record("chat", "进服签到", who=name)
+                info = self._core_checkin(name)
+                if info is None:
+                    # 核心缺席/结构不符：退化为普通聊天签到
+                    self._broadcast(name, msg)
+                    self._record("chat", "进服签到", who=name)
+                elif info.get("already"):
+                    return          # 今天已经签过（角色轮换重进不刷屏）
+                else:
+                    # 自然口吻带排名；全服排行广播由核心发出，
+                    # 群里再补一条今日统计
+                    import random as _r
+                    line = _r.choice([
+                        f"签到，今日第{info['rank']}个",
+                        f"签到！第{info['rank']}个",
+                        "签到"])
+                    self._broadcast(name, line)
+                    self._qq_sync(
+                        "custom", name,
+                        f"{name} 签到成功，今日第 {info['rank']} 位，"
+                        f"今日已签到 {info['total']} 人")
+                    self._record(
+                        "checkin",
+                        f"签到成功：今日第 {info['rank']}，共 {info['total']} 人",
+                        who=name)
             except Exception:
                 pass
 

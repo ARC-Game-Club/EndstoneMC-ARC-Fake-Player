@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # `endstone-<插件名>`，否则加载时直接报 "Invalid name" 拒绝加载。
 # entry point 键名 = 去掉 `endstone-` 前缀的部分（连字符可保留）。
 name = "endstone-arc-fake-player"
-version = "3.9.8"
+version = "3.9.9"
 description = "arc_fake_player：LLM 驱动的 Endstone 模拟玩家插件（角色卡轮换 + 外部身体 API）"
 readme = "README.md"
 requires-python = ">=3.10"

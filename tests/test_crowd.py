@@ -913,3 +913,115 @@ class CraftCoverageTests(unittest.TestCase):
         self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=5), 200)   # 下限
         self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=80), 960)  # 12/格
         self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=500), 1200)  # 上限
+
+
+class CoreCheckinTests(unittest.TestCase):
+    """假人走弧光核心签到体系（合成 xuid 直调）。"""
+
+    def _core(self, already=False, pre_count=2):
+        calls = {"sql": [], "money": [], "broadcast": [], "update": []}
+
+        class DBM:
+            def query_one(self, sql, params=()):
+                calls["sql"].append((sql, params))
+                if "COUNT" in sql:
+                    class R(dict):
+                        pass
+                    r = R()
+                    r["cnt"] = pre_count if "COUNT" in sql and sql.count(
+                        "last_checkin_date") else 0
+                    # 第二次 COUNT（签到后）+1
+                    if calls["sql"].count((sql, params)) > 1:
+                        r["cnt"] = pre_count + 1
+                    return r
+                if "last_checkin_date" in sql and "continuous" in sql:
+                    return ({"last_checkin_date": "2026-10-26",
+                             "continuous_checkin_days": 3}
+                            if already else
+                            {"last_checkin_date": "2026-10-25",
+                             "continuous_checkin_days": 3})
+                return None
+
+            def execute(self, sql, params=()):
+                calls["update"].append((sql, params))
+
+        class Core:
+            database_manager = DBM()
+
+            def _today_checkin_date_str(self):
+                return "2026-10-26"
+
+            def get_checkin_config(self):
+                return {"daily_money": 100.0, "pick_min": 0, "pick_max": 0,
+                        "top_rank_limit": 0, "top_rank_bonus_item_count": 0,
+                        "top_rank_bonus_money_step": 0.0,
+                        "continuous_checkin_money_increment": 10.0,
+                        "reward_list": []}
+
+            def _compute_next_continuous_checkin_days(self, last, days, today):
+                return 4
+
+            def _calculate_checkin_top_rank_bonus_money(self, *a):
+                return 0.0
+
+            def increase_player_money_by_xuid(self, xuid, amount, notify=True):
+                calls["money"].append((xuid, amount, notify))
+                return True
+
+            def _weighted_sample_checkin_rewards(self, lst, n):
+                return []
+
+            def get_player_name_by_xuid(self, xuid, return_with_title=False):
+                return "§6[大佬]Bot"
+
+            def _broadcast_checkin_rankings(self, display, today):
+                calls["broadcast"].append((display, today))
+
+        return Core(), calls
+
+    def _fake(self, core):
+        import endstone_arc_fake_player.plugin as plugin_mod
+        from types import MethodType
+
+        class Manager:
+            def get_plugin(self, name):
+                return core
+
+        class Server:
+            plugin_manager = Manager()
+
+            def dispatch_command(self, *a):
+                pass
+
+            command_sender = object()
+
+        fake = SimpleNamespace(
+            server=Server(), _agents={"Bot": object()},
+            _identities=SimpleNamespace(xuid_of=lambda n: "9123456789012345"),
+            logger=SimpleNamespace(debug=lambda *_: None),
+            _record=lambda *a, **k: None)
+        fake._core_checkin = MethodType(
+            plugin_mod.ArcFakePlayerPlugin._core_checkin, fake)
+        return fake, plugin_mod.ArcFakePlayerPlugin
+
+    def test_checkin_success_with_rank(self):
+        core, calls = self._core(pre_count=2)
+        fake, cls = self._fake(core)
+        info = cls._core_checkin(fake, "Bot")
+        self.assertEqual(info, {"already": False, "rank": 3, "total": 3})
+        self.assertTrue(calls["update"])              # 记账 UPDATE
+        self.assertTrue(calls["broadcast"])           # 全服排行广播
+        self.assertEqual(calls["money"][0][0], "9123456789012345")  # 合成 xuid 入账
+        self.assertFalse(calls["money"][0][2])        # notify=False 不打扰
+
+    def test_checkin_already_today(self):
+        core, calls = self._core(already=True)
+        fake, cls = self._fake(core)
+        info = cls._core_checkin(fake, "Bot")
+        self.assertEqual(info, {"already": True})
+        self.assertFalse(calls["update"])
+        self.assertFalse(calls["broadcast"])
+
+    def test_checkin_core_missing(self):
+        fake, cls = self._fake(None)
+        self.assertIsNone(cls._core_checkin(fake, "Bot"))
