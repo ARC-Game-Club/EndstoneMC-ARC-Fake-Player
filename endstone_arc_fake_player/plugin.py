@@ -4040,8 +4040,12 @@ class ArcFakePlayerPlugin(Plugin):
                 pass
 
         try:
-            self.server.scheduler.run_task_later(self, _checkin,
-                                                 int(delay * 20))
+            # ⚠️ Endstone 调度器没有 run_task_later——只有
+            # run_task(plugin, task, delay=0, period=0)。此前写成
+            # run_task_later 抛 AttributeError 被 pass 吞掉，签到任务
+            # 从未排上（实测零签到）。delay 即一次性延迟。
+            self.server.scheduler.run_task(self, _checkin,
+                                           delay=int(delay * 20))
         except Exception:
             pass
 
@@ -5539,11 +5543,16 @@ class ArcFakePlayerPlugin(Plugin):
         self._qq_sync("chat", name, text)
 
     def _schedule_chat(self, name: str, text: str, seconds: float) -> None:
-        """延迟发一句（模拟打字）。调度不可用就直接发，别吞话。"""
+        """延迟发一句（模拟打字）。调度不可用就直接发，别吞话。
+
+        注意用的是 run_task(..., delay=ticks)——Endstone 调度器没有
+        run_task_later（3.9.2 起误用了它的名字，靠本函数的兜底把分句
+        全部连发，错峰一直没生效）。
+        """
         try:
-            self.server.scheduler.run_task_later(
+            self.server.scheduler.run_task(
                 self, lambda: self._send_chat(name, text),
-                max(1, int(seconds * 20)))
+                delay=max(1, int(seconds * 20)))
         except Exception:
             self._send_chat(name, text)
 

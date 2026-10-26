@@ -796,7 +796,7 @@ class SpeechSplitTests(unittest.TestCase):
         scheduled = []
 
         class Sched:
-            def run_task_later(self, plugin, fn, delay):
+            def run_task(self, plugin, fn, delay=0, period=0):
                 scheduled.append((delay, fn))
 
         class Server:
