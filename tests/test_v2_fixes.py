@@ -440,12 +440,21 @@ def test_js_body_creation() -> None:
           "模块级 spawnSimulatedPlayer" in js)
 
     # 语法真的没问题（上面的断言都是文本匹配，语法错误它看不出来）
+    #
+    # ⚠ 没装 node 的机器上**不能就这么崩掉**——整个文件会在这一项夭折，
+    # 后面几百项全都跑不到（以前就是这样：谁没装 node 谁就只能看到
+    # "项数未知"）。改成：找不到 node 就跳过这一项，并说明原因。
+    import shutil
     import subprocess
-    rc = subprocess.run(["node", "--check",
-                         str(PKG / "behavior_pack" / "scripts" / "main.js")],
-                        capture_output=True)
-    check("main.js 语法通过 node --check", rc.returncode == 0,
-          rc.stderr.decode()[:200])
+    node = shutil.which("node")
+    if node is None:
+        print("SKIP  main.js 语法检查（本机没装 node，跳过）")
+    else:
+        rc = subprocess.run([node, "--check",
+                             str(PKG / "behavior_pack" / "scripts" / "main.js")],
+                            capture_output=True)
+        check("main.js 语法通过 node --check", rc.returncode == 0,
+              rc.stderr.decode()[:200])
 
 
 # ---------------------------------------------------------------------------

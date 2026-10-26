@@ -1414,8 +1414,8 @@ python tests/test_mob_reflex.py    # 10 项：怪物反击不缓存句柄、锁�
 共 **1172 项**，全部通过。
 
 > `test_v2_fixes.py` 里有一项要 `node --check` 校验 JS 语法。**没装 node 的
-> 机器会在那一项夭折**，后面几百项都跑不到（`run_all.py` 会把它标成失败）。
-> 装个 node 就行，或者临时把那一步桩掉。
+> 机器会跳过这一项**（以前是在那一项直接崩掉，后面几百项都跑不到，
+> `run_all.py` 只报"项数未知"）——所以没装 node 时总数是 **1171 项**。
 
 > 每个文件都能**单独跑**。以前不行——只有走 `run_all.py` 才跑得起来，
 > 单独 `python tests/test_xxx.py` 会死在 `ModuleNotFoundError: endstone`。
