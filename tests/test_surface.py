@@ -773,7 +773,7 @@ def test_prompt_sections() -> None:
 def test_confmig() -> None:
     section("第六部分：confmig —— 老配置升级不丢用户改动")
 
-    check("CONFIG_VERSION 是 9", CONFIG_VERSION == 9, str(CONFIG_VERSION))
+    check("CONFIG_VERSION 是 10", CONFIG_VERSION == 10, str(CONFIG_VERSION))
     check("登记了 v1 的 persona 默认值",
           "prompt_persona" in confmig.LEGACY_DEFAULTS)
     check("登记的 v1 persona 与当前默认值一致（一字未改）",
@@ -781,6 +781,8 @@ def test_confmig() -> None:
     from endstone_arc_fake_player.agent import DEFAULT_RULES as _RULES
     check("登记了 v6 的 rules 默认值（v7 加了克制发言条款）",
           "prompt_rules" in confmig.LEGACY_DEFAULTS)
+    check("登记了 v9 的 speech 默认值（v10 语气词多样化）",
+          "prompt_speech" in confmig.LEGACY_DEFAULTS)
     check("v6 rules 默认值与新默认前缀逐字一致（迁移凭据）",
           _RULES.startswith(confmig.LEGACY_DEFAULTS["prompt_rules"][6]))
 
