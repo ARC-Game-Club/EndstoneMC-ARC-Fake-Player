@@ -2425,14 +2425,50 @@ class ArcFakePlayerPlugin(Plugin):
         msg = (event.message or "").strip()
         if not msg:
             return
-        low = msg.lower()
         speaker = str(getattr(event.player, "name", "") or "")
+        is_op = bool(getattr(event.player, "is_op", False))
+        named = self._route_chat(speaker, msg, is_op=is_op, source="game")
+        if named and is_op:
+            # 管理员点名走指令式：取消事件（不留在公屏），并给本人回执
+            event.cancel()
+            try:
+                event.player.send_message(
+                    f"{C.GOLD}已收到指令，正在思考…{C.RESET}")
+            except Exception:
+                pass
+
+    def api_hear_chat(self, speaker: str, text: str) -> None:
+        """外部聊天源入口（主线程调用）：目前由 arc_qq_sync_astrbot 在
+        QQ 群消息转发进游戏时调用。
+
+        群里 @假人（消息里带名字）= 点名必回——回复经 _broadcast 出去，
+        会同步回 QQ 群，形成完整闭环。群昵称记不了游戏内好感度，不记。
+        """
+        try:
+            msg = str(text or "").strip()
+            speaker = str(speaker or "").strip()
+            if not msg or not speaker:
+                return
+            self._route_chat(speaker, msg, is_op=False, source="qq")
+        except Exception as exc:
+            self.logger.debug(f"群消息分诊失败: {exc}")
+
+    def _route_chat(self, speaker: str, msg: str, *, is_op: bool = False,
+                    source: str = "game") -> bool:
+        """聊天分诊的核心（与事件无关）：点名必回，闲聊按概率。
+
+        游戏内 PlayerChatEvent 和 QQ 群消息（api_hear_chat）共用这里。
+        返回是否点到了任何假人的名。source="qq" 时说话人在群里：
+        大脑听到的标签是"(群友)"，好感度不记（群昵称对不上玩家）。
+        """
+        low = msg.lower()
         # 说话的是自己人（我们的假人 / 外部身体如天星）→ 一律不理。
         # 不然假人 A 的话里带上 B 的名字，B 会"必回"，两个 AI 就地
         # 表演一段没人看的尬聊。真人（含离线模式）不受影响。
         if speaker and (speaker in self._agents or speaker in self._external):
-            return
-        is_op = bool(getattr(event.player, "is_op", False))
+            return False
+        label = "(管理员)" if is_op else (
+            "(群友)" if source == "qq" else "(玩家)")
 
         named_any = False
         for name, agent in self._agents.items():
@@ -2440,9 +2476,7 @@ class ArcFakePlayerPlugin(Plugin):
                 continue
             named_any = True
             if is_op:
-                # 管理员：指令式控制。取消事件（不留在公屏），
-                # 立刻唤醒决策。
-                event.cancel()
+                # 管理员：指令式控制，立刻唤醒决策。
                 agent.hear(f"{speaker}(管理员)", msg)
                 agent.wake()
                 if name not in self._stealth:
@@ -2452,27 +2486,27 @@ class ArcFakePlayerPlugin(Plugin):
                     except Exception:
                         pass
                 else:
-                    # 隐身假人被管理员指挥时不广播（穿帮），
-                    # 只给管理员本人一个回执。
-                    event.player.send_message(
-                        f"{C.GOLD}[{name}]{C.RESET} 收到指令，正在思考…")
-            else:
-                # 普通玩家：**对话**而非控制。不取消事件——这句话留在
-                # 公屏上是自然的聊天；大脑以"朋友聊天"的定位听到它。
-                agent.hear(f"{speaker}(玩家)", msg)
-                agent.wake()
-                # 友好对话攒好感（5 分钟冷却，防刷屏刷好感）
-                try:
-                    bonus = float(self._social_cfg().get("chat_bonus", 1.0))
-                    if bonus:
-                        self._favor.chat_bonus(name, speaker, bonus)
-                except Exception:
+                    # 隐身假人被管理员指挥时不广播（穿帮）。
                     pass
+            else:
+                # 普通玩家/群友：**对话**而非控制。大脑以"朋友聊天"
+                # 的定位听到它。
+                agent.hear(f"{speaker}{label}", msg)
+                agent.wake()
+                # 友好对话攒好感（5 分钟冷却，防刷屏刷好感）。
+                # 群昵称对不上游戏玩家，不记。
+                if source == "game":
+                    try:
+                        bonus = float(self._social_cfg().get("chat_bonus", 1.0))
+                        if bonus:
+                            self._favor.chat_bonus(name, speaker, bonus)
+                    except Exception:
+                        pass
 
         if named_any:
-            return
+            return True
         if not speaker or speaker in self._agents:
-            return      # 我们自己的假人说话不触发（防自嗨循环）
+            return False      # 我们自己的假人说话不触发（防自嗨循环）
 
         # ---- 没被任何 AI 点名：公屏闲聊，按**每个 AI 自己的概率**
         # 决定要不要搭话（0 = 永不插嘴；1 = 每句都听）。

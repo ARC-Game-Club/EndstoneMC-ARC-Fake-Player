@@ -797,3 +797,48 @@ class SpeechSplitTests(unittest.TestCase):
         fake._send_chat = MethodType(plugin_mod.ArcFakePlayerPlugin._send_chat, fake)
         plugin_mod.ArcFakePlayerPlugin._broadcast(fake, "Bot", "没标号的一条")
         self.assertEqual(len(sent), 1)
+
+
+class QQChatInboundTests(unittest.TestCase):
+    """QQ 群消息入口 api_hear_chat：群里 @假人 = 点名必回。"""
+
+    def _plugin_with_agents(self, chance=0.0):
+        import endstone_arc_fake_player.plugin as plugin_mod
+        from types import MethodType
+        from unittest.mock import Mock
+
+        plugin = plugin_mod.ArcFakePlayerPlugin()
+        agent = SimpleNamespace(hear=Mock(), wake=Mock(), alive=lambda: True,
+                                state=SimpleNamespace(last_decision=5.0))
+        plugin._agents = {"Bot": agent}
+        plugin._external = {}
+        plugin._stealth = set()
+        plugin._favor = SimpleNamespace(
+            chat_bonus=Mock(return_value=None))
+        plugin._social_cfg = lambda: {"chat_bonus": 1.0}
+        plugin.chat_reply_chance = lambda name: chance
+        plugin.server = SimpleNamespace(broadcast_message=Mock())
+        plugin._record = lambda *a, **k: None
+        plugin._cfg = {}
+        return plugin, agent
+
+    def test_group_mention_reaches_bot(self):
+        plugin, agent = self._plugin_with_agents()
+        plugin.api_hear_chat("群友老哥", "Bot 在吗，跟一把")
+        agent.hear.assert_called_once_with("群友老哥(群友)", "Bot 在吗，跟一把")
+        agent.wake.assert_called_once()
+
+    def test_group_ambient_respects_chance(self):
+        # 概率 0：群里闲聊不搭话
+        plugin, agent = self._plugin_with_agents(chance=0.0)
+        plugin.api_hear_chat("群友老哥", "今天天气不错")
+        agent.hear.assert_not_called()
+        # 概率 1：闲聊也听
+        plugin2, agent2 = self._plugin_with_agents(chance=1.0)
+        plugin2.api_hear_chat("群友老哥", "今天天气不错")
+        agent2.hear.assert_called_once()
+
+    def test_own_bot_name_ignored(self):
+        plugin, agent = self._plugin_with_agents(chance=1.0)
+        plugin.api_hear_chat("Bot", "我自言自语")
+        agent.hear.assert_not_called()
