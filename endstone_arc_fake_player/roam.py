@@ -39,6 +39,11 @@ class RoamState:
     anchor: tuple[float, float, float, str] | None = None
     #: 上一个动作是不是挖（挖/走交替，观感更像在"玩"而不是刷任务）
     last_was_dig: bool = False
+    #: 上一个兴趣点的方位角（弧度）。选下一个点时避开"原路折返"——
+    #: 均匀随机会让假人在两个点之间来回打转，看起来像卡了。
+    last_angle: float | None = None
+    #: 上一个兴趣点坐标（x, z），短期不重复去同一个地方。
+    last_poi: tuple[float, float] | None = None
 
 
 class RoamDriver:
@@ -152,20 +157,37 @@ class RoamDriver:
             return
 
         # 正常闲逛：锚点附近随机一个兴趣点。
-        # 候选要有三个性质：在锚点半径内、离**当前站位**够远（MIN_STEP，
-        # 保证每步肉眼可见）、那一列真的能站（surface）。
+        # 候选要满足：在锚点半径内、离**当前站位**够远（MIN_STEP，
+        # 保证每步肉眼可见）、那一列真的能站（surface）、**不朝反方向
+        # 折返**（last_angle ±90° 内的候选优先跳过——均匀随机会让假人
+        # 在两个点之间来回打转）、离上一个兴趣点也别太近。
+        # 另有 15% 概率"远足"：半径放大一倍，人有时候就是想走远点看看。
         lo, hi = self.POI_RADIUS if anchor is not None else (
             self.POI_RADIUS[0] // 2, self.POI_RADIUS[1] // 2)
+        far_stroll = self._rng.random() < 0.15
+        if far_stroll:
+            hi = hi * 2
         tx = ty = tz = None
-        for _ in range(8):
+        for attempt in range(12):
             ang = self._rng.uniform(0, math.tau)
+            if (st.last_angle is not None and attempt < 8
+                    and abs((ang - st.last_angle + math.pi) % math.tau
+                            - math.pi) < math.pi / 2):
+                # 落在"来时的反方向"±90° 里：前 8 次尝试优先跳过，
+                # 后 4 次放行（地形受限时总得有得走）。
+                continue
             r = self._rng.uniform(lo, hi)
             cx, cz = ax + math.cos(ang) * r, az + math.sin(ang) * r
             if math.dist((cx, cz), (pos[0], pos[2])) < self.MIN_STEP:
                 continue
+            if (st.last_poi is not None
+                    and math.dist((cx, cz), st.last_poi) < 6.0):
+                continue
             cy = self._surface(cx, cz, pos[1])
             if cy is not None:
                 tx, ty, tz = cx, cy, cz
+                st.last_angle = ang
+                st.last_poi = (cx, cz)
                 break
         if tx is None:
             # 一个能站的点都没挑到（地形太陡/未加载）——小退避后重试

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import sys
 import unittest
@@ -187,3 +188,50 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class PoiQualityTests(unittest.TestCase):
+    """兴趣点质量：防折返记忆 + 不重复去同一个点。"""
+
+    def _driver(self, seed=7):
+        import random as _r
+        return RoamDriver(
+            names=lambda: ["B"],
+            busy=lambda n: False,
+            anchor=lambda n: (0.0, 64.0, 0.0, "家"),
+            bot_pos=lambda n: (0.0, 64.0, 0.0),
+            surface=lambda x, z, near_y: 64.0,
+            walk=lambda n, x, y, z: True,
+            dig=lambda n, x, y, z: False,
+            log=lambda m: None,
+            clock=lambda: 0.0,
+            rng=_r.Random(seed))
+
+    def test_poi_memory_tracks_angle_and_avoids_repeat(self):
+        drv = self._driver()
+        st = drv.state_of("B")
+        targets = []
+        for i in range(30):
+            drv._tick_one("B", i * 30.0)
+            if st.last_poi is not None:
+                targets.append(st.last_poi)
+        self.assertGreater(len(targets), 5)
+        # 任何相邻两次目标至少隔 6 格（不重复去同一个点）
+        for a, b in zip(targets, targets[1:]):
+            self.assertGreaterEqual(
+                ((a[0]-b[0])**2 + (a[1]-b[1])**2) ** 0.5, 6.0 - 1e-6)
+        # 方向记忆生效
+        self.assertIsNotNone(st.last_angle)
+
+    def test_far_stroll_occasionally(self):
+        # 15% 远足：种子扫过去总有一两个点出常规半径
+        seen_far = False
+        for seed in range(40):
+            drv = self._driver(seed)
+            st = drv.state_of("B")
+            for i in range(10):
+                drv._tick_one("B", i * 30.0)
+            if st.last_poi and math.hypot(*st.last_poi) > 18.0 + 1e-6:
+                seen_far = True
+                break
+        self.assertTrue(seen_far)

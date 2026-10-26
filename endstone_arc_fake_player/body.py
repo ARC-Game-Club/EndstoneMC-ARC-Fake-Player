@@ -297,16 +297,26 @@ class BodyController:
     # 移动
     # ------------------------------------------------------------------
 
-    def start_walk(self, x: int, y: int, z: int, timeout_ticks: int = 200) -> bool:
+    def start_walk(self, x: int, y: int, z: int,
+                   timeout_ticks: int = 0) -> bool:
         """让假人真的走过去。
 
-        timeout_ticks 是 JS 侧寻路轮询的超时（200 tick = 10 秒）。
-        原版走速约 4.3 格/秒，10 秒能走 40+ 格；再往上就该走
-        teleport 而不是寻路了。此前默认 100（5 秒），长距离寻路
-        会频繁"超时 → 重试"，白白多跑冤枉路。
+        timeout_ticks 是 JS 侧寻路轮询的超时；**0 = 按距离自适应**：
+        每格给 12 tick（约 0.6 秒，含绕路余量），夹在 [200, 1200]
+        （10~60 秒）。此前一律 200 tick（10 秒 ≈ 40 格），再远的目标
+        必然"超时→重试→放弃"——表现就是"走不远"。
         """
         if self.busy:
             return False
+
+        if timeout_ticks <= 0:
+            try:
+                loc = getattr(self.actor, "location", None)
+                dist = ((loc.x - x) ** 2 + (loc.y - y) ** 2
+                        + (loc.z - z) ** 2) ** 0.5 if loc else None
+            except Exception:
+                dist = None
+            timeout_ticks = self.auto_walk_timeout(x, y, z, dist=dist)
 
         task = WalkTask(x=int(x), y=int(y), z=int(z), started_at=time.monotonic())
         self._walk = task
@@ -321,6 +331,14 @@ class BodyController:
             self.last_error = task.error
             return False
         return True
+
+    @staticmethod
+    def auto_walk_timeout(x: float, y: float, z: float, *,
+                          dist: float | None = None) -> int:
+        """按目标距离估算寻路超时（tick）：每格 12 tick，夹 [200, 1200]。"""
+        if dist is None:
+            dist = abs(x) + abs(y) + abs(z)   # 兜底：没有站位时按坐标幅度估
+        return int(max(200, min(1200, 12 * max(1.0, dist))))
 
     def _on_walk_done(self, task: WalkTask, ok: bool, err: str) -> None:
         if task is not self._walk:

@@ -842,3 +842,28 @@ class QQChatInboundTests(unittest.TestCase):
         plugin, agent = self._plugin_with_agents(chance=1.0)
         plugin.api_hear_chat("Bot", "我自言自语")
         agent.hear.assert_not_called()
+
+
+class CraftCoverageTests(unittest.TestCase):
+    """配方覆盖：护甲/铜具/杂项不再是"不知道配方"。"""
+
+    def test_gear_recipes_known(self):
+        import endstone_arc_fake_player.actions as actions_mod
+        recipes = actions_mod.ActionCompiler.CRAFT_RECIPES
+        for want in ("iron_chestplate", "copper_sword", "diamond_helmet",
+                     "leather_boots", "stone_shovel", "diamond_hoe",
+                     "bucket", "bow", "arrow", "bed", "ladder"):
+            self.assertIn(want, recipes, want)
+        # 每个配方的 shape/mats 都能转成槽位
+        comp = actions_mod.ActionCompiler.__new__(actions_mod.ActionCompiler)
+        for name, r in recipes.items():
+            slots = (comp._recipe_slots_2x2(r) if max(
+                len(row) for row in r["shape"]) <= 2
+                and len(r["shape"]) <= 2 else comp._recipe_slots(r))
+            self.assertTrue(slots, name)
+
+    def test_walk_timeout_scales_with_distance(self):
+        from endstone_arc_fake_player.body import BodyController as BC
+        self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=5), 200)   # 下限
+        self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=80), 960)  # 12/格
+        self.assertEqual(BC.auto_walk_timeout(0, 0, 0, dist=500), 1200)  # 上限
