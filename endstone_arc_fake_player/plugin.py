@@ -2505,6 +2505,11 @@ class ArcFakePlayerPlugin(Plugin):
 
         if named_any:
             return True
+        if source != "game":
+            # 外部消息源（QQ 群 / 跨服转发）**只认点名**：跨群跨服的闲聊
+            # 不掺和——一个服的假人对着另一个服的家长里短随机接话，
+            # 除了吵没有任何观感。
+            return False
         if not speaker or speaker in self._agents:
             return False      # 我们自己的假人说话不触发（防自嗨循环）
 

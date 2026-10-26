@@ -844,15 +844,19 @@ class QQChatInboundTests(unittest.TestCase):
         agent.hear.assert_called_once_with("群友老哥(群友)", "Bot 在吗，跟一把")
         agent.wake.assert_called_once()
 
-    def test_group_ambient_respects_chance(self):
-        # 概率 0：群里闲聊不搭话
-        plugin, agent = self._plugin_with_agents(chance=0.0)
+    def test_group_ambient_never_triggers(self):
+        """外部消息（QQ 群/跨服）只认点名——概率拉满也不搭闲话。"""
+        plugin, agent = self._plugin_with_agents(chance=1.0)
         plugin.api_hear_chat("群友老哥", "今天天气不错")
         agent.hear.assert_not_called()
-        # 概率 1：闲聊也听
-        plugin2, agent2 = self._plugin_with_agents(chance=1.0)
-        plugin2.api_hear_chat("群友老哥", "今天天气不错")
-        agent2.hear.assert_called_once()
+        # 游戏内闲聊概率 1 照样听（对比：门控只对外部源收紧）
+        import endstone_arc_fake_player.plugin as plugin_mod
+        ev = SimpleNamespace(
+            message="今天天气不错",
+            player=SimpleNamespace(name="Steve", is_op=False),
+            cancel=lambda: None)
+        plugin.on_player_chat(ev)
+        agent.hear.assert_called_once()
 
     def test_own_bot_name_ignored(self):
         plugin, agent = self._plugin_with_agents(chance=1.0)
