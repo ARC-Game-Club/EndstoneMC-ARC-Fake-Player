@@ -58,6 +58,7 @@ import math
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +221,46 @@ def _kind_of(text: str) -> str:
     return "think"
 
 
+#: 怪物坐标刷新间隔（秒）。怪物一直在动，1 秒刷一次足够追击，
+#: 又不至于每个 tick 都去世界里翻一遍实体。
+MOB_REFRESH_SECONDS = 1.0
+
+#: 怪物反击目标的最长跟踪时间（秒）。超过就算"目标消失"，反射脱战。
+MOB_TARGET_TTL_SECONDS = 120.0
+
+
+@dataclass
+class _MobTarget:
+    """一次怪物反击的目标状态。
+
+    ⚠ 这里**只存标量**——实体句柄（Actor）绝不进这里。
+
+    为什么这么严（2026-10-26 无规则服崩服根因）
+    -------------------------------------------
+    伤害事件回调拿到的 attacker 是引擎给的**借用指针**：实体一旦被
+    回收（怪物死了/箭落地了/区块卸载了），那块 C++ 内存立刻释放。
+    之后再去读它的 `is_valid`——Endstone 里那是个**虚函数**——等于
+    在已释放内存上取虚表 → ``0xC0000005 (EXCEPTION_ACCESS_VIOLATION)``。
+    Python 的 try/except 对访问违规**完全无效**，所以这曾经把整个服
+    连带崩掉（连崩 5 次，栈都是 ``Actor::vcall{296}``）。
+
+    所以规矩是：**句柄只在当场用完就丢**，跨 tick 传递的只有数字和
+    字符串。坐标靠 runtime id 重新解析——重新解析出来的 Actor 也是
+    当场用完就丢。
+    """
+
+    #: 怪物的 runtime id（世界里唯一，用它重新找到这个实体）。
+    runtime_id: int
+    #: 怪物的显示名（"Zombie"/"Skeleton"…）——给 JS 侧认目标用。
+    name: str
+    #: 最后已知坐标。
+    pos: tuple[float, float, float] | None = None
+    #: 过期时刻（time.monotonic 基准）。
+    expire_at: float = 0.0
+    #: 上次重新解析坐标的时刻。
+    resolved_at: float = 0.0
+
+
 class ArcFakePlayerPlugin(Plugin):
     api_version = "0.11"
 
@@ -345,7 +386,7 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception:
             pass
         self._reflex = CombatReflex(
-            attack=lambda b, t: self._bridge.attack(b, t) >= 0,
+            attack=lambda b, t: self._reflex_attack(b, t),
             walk=lambda b, x, y, z: self._bridge.walk(
                 b, x, y, z, timeout=100) >= 0,
             bot_pos=self._bot_pos,
@@ -355,10 +396,11 @@ class ArcFakePlayerPlugin(Plugin):
             bot_health=self._bot_health,
             on_event=self._reflex_event,
             logger=self.logger)
-        #: 怪物反击目标注册表：str(runtime_id) → (Actor 引用, 过期时刻)。
-        #: Actor 句柄约一分钟会过期，所以带 TTL 惰性清理；过期/失效后
-        #: 反射按"目标消失"正常脱战。
-        self._mob_targets: dict[str, tuple[Any, float]] = {}
+        #: 怪物反击目标注册表：str(runtime_id) → 目标状态。
+        #:
+        #: ⚠ 这里**只存标量，绝不存 Actor 句柄**——理由见 `_MobTarget`
+        #: 的说明（2026-10-26 无规则服崩服根因）。
+        self._mob_targets: dict[str, _MobTarget] = {}
         #: (假人, 玩家) → 寻仇冷却到期时刻。engage 时预记，防止脱战后
         #: 立刻被复仇扫描重新拉起、无限缠斗。
         self._vengeance_cd: dict[tuple[str, str], float] = {}
@@ -2145,7 +2187,12 @@ class ArcFakePlayerPlugin(Plugin):
 
         和真人路径的差别：不记好感度、不进仇人名单（怪物没有"关系"
         可言）、没有管理员豁免（怪物不存在 OP）。目标用 runtime id
-        定位——JS 侧 doAttack 支持按实体 id 精确匹配。
+        定位，坐标每 1 秒按 runtime id 重新解析一次。
+
+        ⚠ attacker 是引擎给的**借用指针**，怪物随时可能死（箭落地、
+        怪物被烧死、区块卸载）。所以这里**只取它的标量**——runtime id、
+        名字、坐标——**绝不把它存下来**：存下来就是一颗定时炸弹，
+        见 `_MobTarget` 的说明（那曾经把整服崩掉）。
         """
         cfg = self._social_cfg()
         if not cfg.get("enabled", True):
@@ -2153,12 +2200,22 @@ class ArcFakePlayerPlugin(Plugin):
         if not cfg.get("mob_reflex_enabled", True):
             return          # 想让大脑自己决定怎么应付怪物时关掉
         try:
-            key = str(int(getattr(attacker, "runtime_id", -1)))
+            rid = int(getattr(attacker, "runtime_id", -1))
         except (TypeError, ValueError):
             return
-        if key == "-1":
+        if rid < 0:
             return
-        self._mob_targets[key] = (attacker, time.monotonic() + 120.0)
+        key = str(rid)
+        now = time.monotonic()
+        # 此刻怪物还活着，先记一次坐标当"最后已知位置"；之后由
+        # _mob_pos 每 MOB_REFRESH_SECONDS 秒重新解析刷新。
+        self._mob_targets[key] = _MobTarget(
+            runtime_id=rid,
+            name=str(mob_name or ""),
+            pos=self._actor_pos(attacker),
+            expire_at=now + MOB_TARGET_TTL_SECONDS,
+            resolved_at=now,
+        )
         duration = float(cfg.get("reflex_duration_seconds", 90.0))
         self._reflex.engage(bot, key, reason="怪物来袭",
                             duration=duration, label=mob_name,
@@ -2172,24 +2229,93 @@ class ArcFakePlayerPlugin(Plugin):
             bot, f"你被 {mob_name} 攻击了（伤害 {damage:.0f}），"
                  f"身体已自动反击。")
 
-    def _mob_pos(self, key: str) -> tuple[float, float, float] | None:
-        """怪物目标坐标（反射追击用）。句柄过期/实体死亡返回 None。"""
-        entry = self._mob_targets.get(key)
-        if entry is None:
+    @staticmethod
+    def _actor_pos(actor: Any) -> tuple[float, float, float] | None:
+        """取一个 Actor 的坐标。取不到就返回 None，绝不往外抛。
+
+        读坐标本身是安全的（实体还活着的时候），但**读完之后这个
+        Actor 就不许再碰了**——它随时可能被引擎回收。
+        """
+        try:
+            loc = actor.location
+            return (float(loc.x), float(loc.y), float(loc.z))
+        except Exception:
             return None
-        actor, expire_at = entry
-        if time.monotonic() > expire_at:
+
+    def _mob_pos(self, key: str) -> tuple[float, float, float] | None:
+        """怪物目标坐标（反射追击用）。
+
+        坐标每 `MOB_REFRESH_SECONDS` 秒**重新解析一次**：按 runtime id
+        在 `level.actors` 里找到那个怪物，当场取坐标，Actor 用完就丢。
+        解析不到（死了/卸载了）= 目标消失，反射按老规矩脱战。
+
+        ⚠ 旧版在这里读缓存 Actor 的 `is_valid`——那是个虚函数，读它
+        就是在已释放内存上取虚表 → 整服崩。现在句柄根本不存在，
+        这个崩溃类别被从根上消掉了。
+        """
+        st = self._mob_targets.get(key)
+        if st is None:
+            return None
+        now = time.monotonic()
+        if now > st.expire_at:
             self._mob_targets.pop(key, None)
             return None
-        try:
-            if not bool(getattr(actor, "is_valid", False)):
+        if now - st.resolved_at >= MOB_REFRESH_SECONDS:
+            st.resolved_at = now
+            fresh = self._resolve_mob_pos(st.runtime_id)
+            if fresh is None:
                 self._mob_targets.pop(key, None)
                 return None
-            loc = actor.location
-            return (loc.x, loc.y, loc.z)
+            st.pos = fresh
+        return st.pos
+
+    def _resolve_mob_pos(self, runtime_id: int) -> tuple[float, float, float] | None:
+        """按 runtime id 在世界里重新找到这个怪物并取坐标。
+
+        ⚠ 解析出来的 Actor **当场用完就丢**——不存、不缓存、不留引用。
+        实体被引擎回收后句柄就是野指针，而 `is_valid` 在 Endstone 里
+        是个虚函数，读它会访问已释放内存 → 0xC0000005（整服崩）。
+        """
+        try:
+            for actor in self.server.level.actors:
+                if int(getattr(actor, "runtime_id", -1)) != runtime_id:
+                    continue
+                return self._actor_pos(actor)
         except Exception:
-            self._mob_targets.pop(key, None)
             return None
+        return None
+
+    def _attack_target(self, target: str) -> str:
+        """给 JS 侧的攻击目标串。
+
+        怪物用**显示名**（"Zombie"/"Skeleton"）：JS 侧 doAttack 按
+        `ent.name` / `ent.nameTag` / 类型名认目标，名字在两边是对得上的。
+        真人目标原样传名字。
+
+        ⚠ 为什么不用 id：Endstone 的 `runtime_id` 和 JS 的 `ent.id`
+        （唯一 id）是**两个不同的数**，发过去 JS 根本认不出来——
+        2026-10-26 实测：假人反击怪物 **0 次命中**，而日志里连失败
+        原因都没有（攻击不挂回调，失败是静默的）。
+        """
+        st = self._mob_targets.get(target)
+        if st is not None and st.name:
+            return st.name
+        return target
+
+    def _reflex_attack(self, bot: str, target: str) -> bool:
+        """反射攻击：发一条 bot:attack，并把失败原因记下来。
+
+        旧版这里不挂回调，失败是**静默**的——所以"反击打不中"这种
+        问题在日志里一点痕迹都没有，排查时只能靠猜。现在失败会打一行
+        `反击 X 失败：<原因>`。
+        """
+        at = self._attack_target(target)
+
+        def _done(ok: bool, err: str, _data: dict) -> None:
+            if not ok and err:
+                self.logger.info(f"[{bot}] 反击 {at} 失败：{err}")
+
+        return self._bridge.attack(bot, at, callback=_done) >= 0
 
     # ------------------------------------------------------------------
     # 护甲自穿 / 领地守卫
@@ -2318,8 +2444,16 @@ class ArcFakePlayerPlugin(Plugin):
             if str(getattr(victim, "xuid", "x") or "").strip():
                 return
             src = getattr(event, "damage_source", None)
-            attacker = (getattr(src, "damaging_actor", None)
-                        or getattr(src, "actor", None))
+            # 反击的对象要**射手**，不是那支箭。
+            #   src.actor         = 造成伤害的（怪物；投射物时是**射手**）
+            #   src.damaging_actor = 直接致伤的（箭/蛋这种投射物本体）
+            # 追着箭打是追不上的——箭落地就没了；而且它一消失，留在
+            # Python 侧的句柄立刻成了野指针（见 _MobTarget）。
+            # 2026-10-26 实测：旧版追的是 Arrow/Egg，命中 0 次。
+            damaging = getattr(src, "damaging_actor", None)
+            cause = getattr(src, "actor", None)
+            attacker = (cause if (cause is not None and cause is not damaging)
+                        else (damaging or cause))
             if attacker is None:
                 return
             aname = str(getattr(attacker, "name", "") or "")

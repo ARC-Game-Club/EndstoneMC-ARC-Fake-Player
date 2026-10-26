@@ -138,6 +138,35 @@
 
 # 版本历史
 
+## 3.9.11：怪物反击不再崩服（悬空句柄）+ 反击终于打得到
+
+**崩服根因**：伤害事件回调拿到的 `attacker` 是引擎给的**借用指针**。旧版把它
+缓存 120 秒在 `_mob_targets` 里；怪物一死（或箭落地、区块卸载），引擎就释放
+了那块 C++ 内存。反射层下一个 tick 去读缓存句柄的 `is_valid`——那在 Endstone
+里是个**虚函数**，等于在已释放内存上取虚表 → `0xC0000005 (ACCESS_VIOLATION)`。
+Python 的 try/except 对访问违规完全无效，所以这直接把整个 BDS 进程带走。
+
+实测（弧光无规则生存服）：2026-10-26 连崩 5 次，崩溃报告的栈全是
+`endstone::Actor::vcall{296}` ← `EndstoneScheduler::mainThreadHeartbeat`。
+**只有生存服崩**：枪战服是竞技场没有骷髅，创世神服压根没装假人插件。
+
+修法的原则一句话：**句柄只在当场用完就丢，跨 tick 传递的只有标量。**
+
+- `_mob_targets` 改成只存 `runtime_id` / 名字 / 坐标，**再也不存 Actor**；
+- 坐标每 1 秒按 runtime id 在 `level.actors` 里**重新解析**一次，解析出来的
+  Actor 当场取完坐标就丢；解析不到（怪物死了）= 目标消失，反射正常脱战；
+- 顺带把"追箭"改成"追射手"：旧版取 `damage_source.damaging_actor`（箭/蛋
+  本体），箭落地就没了根本追不上；现在取 `damage_source.actor`（射手）。
+
+**顺带修好一个静默失效**：反击的攻击目标原来发的是 `runtime_id`，而 JS 侧
+`doAttack` 认的是 `ent.id`（唯一 id）——两个不同的数，所以**反击从来没打中过**
+（实测假人击杀怪物 0 次，而日志里连失败原因都没有）。现在怪物目标改发
+**显示名**（"Zombie"/"Skeleton"），JS 侧按 `ent.name`/`ent.nameTag` 认得出来；
+另外给攻击挂上回调，失败会打一行 `反击 X 失败：<原因>`，不再静默。
+
+新增 `tests/test_mob_reflex.py`（10 项），把这三条规矩钉住：注册表里不许出现
+Actor、坐标按 runtime id 重解析、投射物伤害要锁定射手。
+
 ## 3.9.10：修复签到从未执行（调度器 API 误用）
 
 Endstone 调度器**没有** `run_task_later`（只有 `run_task(plugin, task,
@@ -1372,15 +1401,21 @@ python tests/run_all.py hybrid     # 只跑文件名里带 hybrid 的
 
 ```bash
 python tests/test_pure_agent.py    # 38 项：感知压缩、A*、批量展开、分片
-python tests/test_agent_loop.py    # 13 项：决策循环、token 效率
+python tests/test_agent_loop.py    # 28 项：决策循环、token 效率
 python tests/test_hybrid.py        # 172 项：桥接、异步状态机、行为包安装、不降级契约
 python tests/test_context.py       # 72 项：上下文预算、总结继承、失败回落
-python tests/test_activity.py      # 108 项：活动日志轮转、配置契约、entry point
-python tests/test_surface.py       # 186 项：表面剔除、提示词拆段、配置迁移、身体生命周期
-python tests/test_v2_fixes.py      # 370 项：日志刷屏、假人身份、崩溃防护、常加载区域、游戏模式、审计修复、重试语义
+python tests/test_activity.py      # 142 项：活动日志轮转、配置契约、entry point
+python tests/test_surface.py       # 189 项：表面剔除、提示词拆段、配置迁移、身体生命周期
+python tests/test_v2_fixes.py      # 415 项：日志刷屏、假人身份、崩溃防护、常加载区域、游戏模式、审计修复、重试语义
+python tests/test_social.py        # 19 项：好感度仓库、反击条件反射、怪物反击不记仇
+python tests/test_mob_reflex.py    # 10 项：怪物反击不缓存句柄、锁定射手、失败留日志
 ```
 
-共 **959 项**，全部通过。
+共 **1172 项**，全部通过。
+
+> `test_v2_fixes.py` 里有一项要 `node --check` 校验 JS 语法。**没装 node 的
+> 机器会在那一项夭折**，后面几百项都跑不到（`run_all.py` 会把它标成失败）。
+> 装个 node 就行，或者临时把那一步桩掉。
 
 > 每个文件都能**单独跑**。以前不行——只有走 `run_all.py` 才跑得起来，
 > 单独 `python tests/test_xxx.py` 会死在 `ModuleNotFoundError: endstone`。

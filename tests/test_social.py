@@ -213,7 +213,7 @@ class CombatReflexTests(unittest.TestCase):
 def main():
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
-    for cls in (FavorStoreTests, CombatReflexTests):
+    for cls in (FavorStoreTests, CombatReflexTests, MobEngagementTests):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     total = result.testsRun
@@ -222,10 +222,6 @@ def main():
         return 1
     print(f"\n✅ 全部 {total} 项通过")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 class MobEngagementTests(unittest.TestCase):
@@ -267,3 +263,12 @@ class MobEngagementTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertNotIn("682", store._data["Bot"])
             self.assertIn("Steve", store._data["Bot"])
+
+
+# ⚠ 这个守卫必须在**文件末尾**。
+#
+# 之前它夹在中间（MobEngagementTests 类定义之前），于是单独跑这个文件时
+# `raise SystemExit(main())` 先触发，后面那个类根本没被定义——那 3 个
+# 怪物反击用例从来没跑过（run_all.py 报 16 项，少的就是它们）。
+if __name__ == "__main__":
+    raise SystemExit(main())
