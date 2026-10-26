@@ -334,10 +334,26 @@ class JoinLeaveAnnounceTests(unittest.TestCase):
         cls._announce_join(fake, "BotA")
         self.assertEqual(fake.server.sent, ["§eBotA 加入了游戏"])
 
-    def test_leave_announced(self):
+    def test_leave_announced_in_game_only(self):
+        """退服只播游戏内：QQ 由 qq_sync 的 PlayerQuitEvent 处理
+        （统计准确），我们再推会变成"离开游戏×2"。"""
         fake, cls = self._make_fake()
         cls._announce_leave(fake, "BotA")
         self.assertEqual(fake.server.sent, ["§eBotA 离开了游戏"])
+
+    def test_join_still_pushes_qq(self):
+        fake, cls = self._make_fake()
+        pushed = []
+        fake._qq_sync = lambda et, n, m="": pushed.append(et)
+        cls._announce_join(fake, "BotA")
+        self.assertEqual(pushed, ["join"])
+
+    def test_leave_does_not_push_qq(self):
+        fake, cls = self._make_fake()
+        pushed = []
+        fake._qq_sync = lambda et, n, m="": pushed.append(et)
+        cls._announce_leave(fake, "BotA")
+        self.assertEqual(pushed, [])
 
     def test_manual_spawn_not_announced(self):
         """不在 _stealth 里的手动假人不播报（它有自己的回执）。"""

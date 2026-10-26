@@ -3886,8 +3886,13 @@ class ArcFakePlayerPlugin(Plugin):
                 self.server.broadcast_message(tpl.replace("{name}", name))
             except Exception:
                 pass
-        # 进退服也同步 QQ 群（真人进退服在群里是有消息的）。
-        self._qq_sync("join" if key == "join_message" else "quit", name)
+        # QQ 同步只推**进服**：SimulatedPlayer 不触发 PlayerJoinEvent，
+        # 群里看不到，由这里补。退服**不要**推——PlayerQuitEvent 对假人
+        # 会触发，qq_sync 自己会发（还延迟 40 tick 等统计同步，时长准确）；
+        # 我们再推一条就成了"离开游戏×2"，且从服本地统计滞后会显示
+        # "总游戏时长 0 分钟"穿帮。
+        if key == "join_message":
+            self._qq_sync("join", name)
 
     def _qq_sync(self, event_type: str, name: str, message: str = "") -> None:
         """把假人的聊天/进退服推给 QQ 同步插件。
