@@ -3229,6 +3229,8 @@ class ArcFakePlayerPlugin(Plugin):
     _arena_next: dict[str, float] = {}
     #: arena：名字 → 连续看到它在等待室的刷新次数（滞留检测）
     _arena_waiting: dict[str, int] = {}
+    #: arena 刷新周期（秒）——_arena_refresh 的心跳间隔
+    _arena_refresh_seconds: float = 15.0
 
     def _shooter_plugin(self) -> Any:
         try:
@@ -3304,6 +3306,27 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception as exc:
             self.logger.warning(f"[{name}] 弧光核心数据初始化失败: {exc}")
 
+    def _arena_waiting_max_cycles(self) -> int:
+        """等待室最多容忍几个刷新周期还没等到同伴。
+
+        ⚠ 这个窗口必须 **大于** 假人的上线间隔，否则第一个进房的人
+        永远等不到第二个——那是 2026-10-27 枪战服「开不出枪」的根因：
+        等待窗口 60 秒 < 上线间隔 1~5 分钟，于是每个假人进房后都落单，
+        房间凑不齐「两队都有人」→ 自动开不了局 → 永远发不到枪。
+
+        所以窗口跟着 auto_online.rejoin_gap_max_minutes 走：上线间隔上限
+        是多少，就至少等那么久（再留 2 个周期余量）。最少 4 个周期。
+        """
+        gap = 0.0
+        try:
+            auto = self._cfg.get("auto_online")
+            if isinstance(auto, dict):
+                gap = float(auto.get("rejoin_gap_max_minutes") or 0)
+        except Exception:
+            gap = 0.0
+        cycles = int(gap * 60.0 / self._arena_refresh_seconds) + 2
+        return max(4, cycles)
+
     def _arena_refresh(self) -> None:
         """每 15 秒刷新一次敌我名单；不在对局里了就停。
 
@@ -3326,25 +3349,32 @@ class ArcFakePlayerPlugin(Plugin):
                 self._bridge.arena_off(name)
                 self.logger.info(f"[{name}] 已不在枪战房间，arena 战斗 AI 停止")
                 continue
-            # 等待室滞留检测：对局结束后回到 LOBBY 干等（真人早走了）。
-            # 连续 4 个刷新周期（约 60 秒）还在等待室 → 自动离开，别把
-            # 空房间占着、也别让假人在大厅里罚站。
+            # 等待室滞留检测。
+            #
+            # · 房里有同伴（enemies 非空 = 房里还有别队的人）→ 继续等，
+            #   不算滞留，计数清零。有人陪着等就不该被踢走。
+            # · 孤身一人时才计时，窗口见 _arena_waiting_max_cycles
+            #   （必须覆盖上线间隔，否则永远等不到同伴）。
             if str(info.get("state", "")) == "lobby":
-                waits = self._arena_waiting.get(name, 0) + 1
-                self._arena_waiting[name] = waits
-                if waits >= 4:
+                if info.get("enemies"):
                     self._arena_waiting.pop(name, None)
-                    self._arena_disable(name)
-                    self._run_bot_command(name, self._live_actor(name) or name,
-                                          "gs leave")
-                    self.logger.info(f"[{name}] 在枪战等待室滞留超时，已自动离开")
-                    continue
+                else:
+                    waits = self._arena_waiting.get(name, 0) + 1
+                    self._arena_waiting[name] = waits
+                    if waits >= self._arena_waiting_max_cycles():
+                        self._arena_waiting.pop(name, None)
+                        self._arena_disable(name)
+                        self._run_bot_command(name, self._live_actor(name) or name,
+                                              "gs leave")
+                        self.logger.info(
+                            f"[{name}] 在枪战等待室滞留超时，已自动离开")
+                        continue
             else:
                 self._arena_waiting.pop(name, None)
             enemies = [str(e) for e in (info.get("enemies") or [])]
             minutes = max(2.0, (info.get("match_seconds") or 300) / 60.0 + 2.0)
             self._bridge.arena(name, enemies, minutes)
-            self._arena_next[name] = now + 15.0
+            self._arena_next[name] = now + self._arena_refresh_seconds
 
     # ------------------------------------------------------------------
     # 常驻地与锚点闲逛（家 > 自己领地 > 公共传送点）+ OP 管理表单
