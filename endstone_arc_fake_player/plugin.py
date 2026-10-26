@@ -128,6 +128,44 @@ def _clean_name(raw: str) -> str:
     return cleaned or "bot"
 
 
+#: 聊天分句：句末标点留在分片尾部（"这波我的！"），停顿标点拆开时
+#: 丢掉（"刚过来，谁在边上" → "刚过来" + "谁在边上"，行尾挂逗号很怪）。
+#: 真人聊天是一句一句蹦的，模型憋出的一整段按这个拆开、错开时间发。
+_SENTENCE_END_MARKS = "！？!?…。"
+_PAUSE_MARKS = "，,、；;：\n"
+_SPEECH_MAX_FRAGMENTS = 4
+
+
+def _split_speech(message: str) -> list[str]:
+    """把一句（段）话按标点拆成若干条聊天消息。无标点返回单元素。"""
+    parts: list[str] = []
+    buf: list[str] = []
+    for ch in (message or ""):
+        buf.append(ch)
+        if ch in _SENTENCE_END_MARKS:
+            parts.append("".join(buf))
+            buf = []
+        elif ch in _PAUSE_MARKS:
+            buf.pop()                  # 停顿标点本身不带走
+            parts.append("".join(buf))
+            buf = []
+    if buf:
+        parts.append("".join(buf))
+    frags = [p.strip() for p in parts]
+    frags = [f for f in frags if f]
+    if len(frags) > _SPEECH_MAX_FRAGMENTS:
+        frags = frags[:_SPEECH_MAX_FRAGMENTS - 1] + [
+            "".join(frags[_SPEECH_MAX_FRAGMENTS - 1:])]
+    return frags
+
+
+def _typing_delay(frag: str) -> float:
+    """下一条的"打字耗时"（秒）：字越多越慢，带点抖动。"""
+    import random as _random
+    base = 0.7 + 0.05 * len(frag)
+    return min(3.0, base) * _random.uniform(0.8, 1.25)
+
+
 def _mentions(low_message: str, name: str) -> bool:
     """消息（已小写）里是否"点名"提到这个 AI。
 
@@ -5255,11 +5293,35 @@ class ArcFakePlayerPlugin(Plugin):
         self.server.scheduler.run_task(self, guarded, delay=0)
 
     def _broadcast(self, name: str, message: str) -> None:
-        self.server.broadcast_message(f"{C.AQUA}<{name}>{C.RESET} {message}")
+        """假人说话的唯一出口：游戏内广播 + QQ 同步，按标点分句错开发。
+
+        真人聊天是一句一句发的；模型一口气憋出的"这波我的！跟上"
+        拆成两条、中间隔一个打字耗时，观感立刻就不一样。
+        """
+        frags = _split_speech(message)
+        if not frags:
+            return
+        self._send_chat(name, frags[0])
+        delay = 0.0
+        for frag in frags[1:]:
+            delay += _typing_delay(frag)
+            self._schedule_chat(name, frag, delay)
+
+    def _send_chat(self, name: str, text: str) -> None:
+        self.server.broadcast_message(f"{C.AQUA}<{name}>{C.RESET} {text}")
         # 真人聊天会触发 PlayerChatEvent、被 QQ 同步插件转进群；假人的
         # broadcast 不触发任何事件——群里"看不到这个人说话"就穿帮了。
         # 这里直调同步插件的 api_send_event 补一条，格式与真人完全一致。
-        self._qq_sync("chat", name, message)
+        self._qq_sync("chat", name, text)
+
+    def _schedule_chat(self, name: str, text: str, seconds: float) -> None:
+        """延迟发一句（模拟打字）。调度不可用就直接发，别吞话。"""
+        try:
+            self.server.scheduler.run_task_later(
+                self, lambda: self._send_chat(name, text),
+                max(1, int(seconds * 20)))
+        except Exception:
+            self._send_chat(name, text)
 
     def _record(self, kind: str, message: str, *, who: str = "") -> None:
         """往活动日志里记一条。记录失败不影响任何逻辑。"""

@@ -720,3 +720,80 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class SpeechSplitTests(unittest.TestCase):
+    """聊天按标点分句发送（"这波我的！跟上" → 两条）。"""
+
+    def test_examples_from_user(self):
+        from endstone_arc_fake_player.plugin import _split_speech
+        self.assertEqual(_split_speech("这波我的！跟上"),
+                         ["这波我的！", "跟上"])
+        self.assertEqual(_split_speech("刚过来，谁在边上"),
+                         ["刚过来", "谁在边上"])
+
+    def test_no_punct_single_fragment(self):
+        from endstone_arc_fake_player.plugin import _split_speech
+        self.assertEqual(_split_speech("没标号的一条"), ["没标号的一条"])
+
+    def test_trailing_punct_no_empty_tail(self):
+        from endstone_arc_fake_player.plugin import _split_speech
+        self.assertEqual(_split_speech("尾标点。"), ["尾标点。"])
+
+    def test_fragment_cap(self):
+        from endstone_arc_fake_player.plugin import _split_speech
+        frags = _split_speech("嗯。好。行。走。冲。")
+        self.assertEqual(len(frags), 4)
+        self.assertEqual(frags[-1], "走。冲。")
+
+    def test_broadcast_splits_and_staggers(self):
+        from types import MethodType
+        import endstone_arc_fake_player.plugin as plugin_mod
+
+        sent = []
+        scheduled = []
+
+        class Sched:
+            def run_task_later(self, plugin, fn, delay):
+                scheduled.append((delay, fn))
+
+        class Server:
+            scheduler = Sched()
+
+            def broadcast_message(self, text):
+                sent.append(text)
+
+        fake = SimpleNamespace(
+            server=Server(), _cfg={"qq_sync_chat": True},
+            logger=SimpleNamespace(debug=lambda *_: None))
+        fake._qq_sync = lambda *a, **k: None
+        fake._send_chat = MethodType(plugin_mod.ArcFakePlayerPlugin._send_chat, fake)
+        fake._schedule_chat = MethodType(
+            plugin_mod.ArcFakePlayerPlugin._schedule_chat, fake)
+        plugin_mod.ArcFakePlayerPlugin._broadcast(fake, "Bot", "这波我的！跟上")
+        # 第一句立刻发，第二句进了延迟队列（ticks ≥ 1）
+        self.assertEqual(len(sent), 1)
+        self.assertIn("这波我的！", sent[0])
+        self.assertEqual(len(scheduled), 1)
+        delay, fn = scheduled[0]
+        self.assertGreaterEqual(delay, 1)
+        fn()
+        self.assertEqual(len(sent), 2)
+        self.assertIn("跟上", sent[1])
+
+    def test_broadcast_single_fragment_no_schedule(self):
+        from types import MethodType
+        import endstone_arc_fake_player.plugin as plugin_mod
+
+        sent = []
+
+        class Server:
+            def broadcast_message(self, text):
+                sent.append(text)
+
+        fake = SimpleNamespace(server=Server(), _cfg={},
+                               logger=SimpleNamespace(debug=lambda *_: None))
+        fake._qq_sync = lambda *a, **k: None
+        fake._send_chat = MethodType(plugin_mod.ArcFakePlayerPlugin._send_chat, fake)
+        plugin_mod.ArcFakePlayerPlugin._broadcast(fake, "Bot", "没标号的一条")
+        self.assertEqual(len(sent), 1)
