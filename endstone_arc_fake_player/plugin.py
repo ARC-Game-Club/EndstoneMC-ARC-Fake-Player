@@ -440,6 +440,8 @@ class ArcFakePlayerPlugin(Plugin):
             walk=self._roam_walk, dig=self._roam_dig,
             log=lambda m: self.logger.debug(m))
         self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
+        # 假人名 → 上次传送时刻（tp_warp/tp_spawn 共用 60 秒冷却）
+        self._tp_cooldown: dict[str, float] = {}
 
         # 编译前先决定用哪种模式（真身体 / 直连）
         self._use_real_body = False
@@ -1432,6 +1434,115 @@ class ArcFakePlayerPlugin(Plugin):
                 self._exec_plan.note_failed(f"pay_money 失败：{why}")
             return True
 
+        def h_tp_player(step: Step) -> bool:
+            # tpa 申请：走弧光核心的同意流——对方玩家弹接受/拒绝表单，
+            # 接受后才传送并按服务器配置扣互传费用。申请本身不保证成功。
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            target = self.server.get_player(str(step.note or ""))
+            if target is None or not str(getattr(target, "xuid", "") or "").strip():
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"tpa 失败：玩家 {step.note} 不在线（只能申请传给真人）")
+                return True
+            try:
+                core = self.server.plugin_manager.get_plugin("arc_core")
+                if (core is None
+                        or not callable(getattr(core, "send_tpa_request", None))):
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("tpa 失败：传送系统不可用")
+                    return True
+                bot = self._live_actor(owner)
+                if bot is None:
+                    return False
+                core.send_tpa_request(bot, target)
+                # 申请已发出：成败由对方玩家的接受/拒绝决定，计划到此
+                # 算完成（标签"向 X 申请传送"即结果），不用额外反馈。
+            except Exception as exc:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(f"tpa 失败: {exc}")
+            return True
+
+        def h_tp_warp(step: Step) -> bool:
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            try:
+                core = self.server.plugin_manager.get_plugin("arc_core")
+                if (core is None
+                        or not callable(getattr(core, "api_teleport_player_to_warp", None))):
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("传送失败：传送系统不可用")
+                    return True
+                # 冷却：传送很强力（可以脱离战斗/跨越地图），一分钟一次
+                now = time.monotonic()
+                if now - self._tp_cooldown.get(owner, 0.0) < 60.0:
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("传送冷却中（60 秒一次），稍后再试")
+                    return True
+                warp = str(step.note or "").strip()
+                res = core.api_teleport_player_to_warp(
+                    warp, player_name=owner) or {}
+                if not res.get("ok"):
+                    names = ""
+                    try:
+                        warps = core.api_list_public_warps() or []
+                        names = "、".join(str(w.get("warp_name"))
+                                          for w in warps[:12])
+                    except Exception:
+                        pass
+                    why = {"WARP_NOT_FOUND": "没有这个传送点"}.get(
+                        str(res.get("error")), str(res.get("error")))
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed(
+                            f"传送到 {warp} 失败：{why}"
+                            + (f"。可用：{names}" if names else ""))
+                    return True
+                self._tp_cooldown[owner] = now
+            except Exception as exc:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(f"传送失败: {exc}")
+            return True
+
+        def h_tp_spawn(step: Step) -> bool:
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            try:
+                core = self.server.plugin_manager.get_plugin("arc_core")
+                if (core is None
+                        or not callable(getattr(core, "api_teleport_player_to", None))):
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("传送失败：传送系统不可用")
+                    return True
+                now = time.monotonic()
+                if now - self._tp_cooldown.get(owner, 0.0) < 60.0:
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("传送冷却中（60 秒一次）")
+                    return True
+                xz = self._world_spawn_xz()
+                if xz is None:
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed("找不到出生点")
+                    return True
+                y = self._roam_surface(xz[0], xz[1], 64.0)
+                if y is None:
+                    y = 320.0        # 兜底高空，让引擎自己落地
+                res = core.api_teleport_player_to(
+                    "overworld", float(xz[0]), float(y), float(xz[1]),
+                    player_name=owner) or {}
+                if not res.get("ok"):
+                    if self._exec_plan is not None:
+                        self._exec_plan.note_failed(
+                            f"传送到出生点失败: {res.get('error')}")
+                    return True
+                self._tp_cooldown[owner] = now
+            except Exception as exc:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(f"传送失败: {exc}")
+            return True
+
         def h_bot_command(step: Step) -> bool:
             # 以假人自己的玩家身份执行服务器命令（参与小游戏等）。
             #
@@ -1550,6 +1661,9 @@ class ArcFakePlayerPlugin(Plugin):
         e.register("drop_item", h_drop_item)
         e.register("pay_money", h_pay_money)
         e.register("bot_command", h_bot_command)
+        e.register("tp_player", h_tp_player)
+        e.register("tp_warp", h_tp_warp)
+        e.register("tp_spawn", h_tp_spawn)
 
     def _teleport_step(self, step: Step) -> bool:
         """把一个格子换算成传送坐标。

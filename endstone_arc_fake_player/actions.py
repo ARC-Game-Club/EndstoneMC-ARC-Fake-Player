@@ -818,6 +818,38 @@ class ActionCompiler:
     # 社交与交易
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 传送系统（tpa 申请 / 地标 / 出生点）
+    # ------------------------------------------------------------------
+
+    def _do_tp_player(self, actor: Any, a: dict[str, Any],
+                      ctx: dict[str, Any]) -> CompileResult:
+        """向玩家申请传送（tpa 同意流）：编译成主线程步骤，由插件调
+        arc_core 的 send_tpa_request——对方接受后才真的传送并扣费。"""
+        player = str(a.get("player", "")).strip()
+        if not player:
+            return CompileResult(ok=False, immediate="tp_player 需要 player")
+        return CompileResult(plan=Plan(
+            label=f"向 {player} 申请传送",
+            steps=[Step("tp_player", 0, 0, 0, note=player[:32])]))
+
+    def _do_tp_warp(self, actor: Any, a: dict[str, Any],
+                    ctx: dict[str, Any]) -> CompileResult:
+        """传送到公共传送点（地标）。名字不匹配时执行器会把可用列表
+        作为失败原因喂回大脑，模型下一轮自己改对。"""
+        name = str(a.get("name", "")).strip()
+        if not name:
+            return CompileResult(ok=False, immediate="tp_warp 需要 name")
+        return CompileResult(plan=Plan(
+            label=f"传送到地标 {name}",
+            steps=[Step("tp_warp", 0, 0, 0, note=name[:64])]))
+
+    def _do_tp_spawn(self, actor: Any, a: dict[str, Any],
+                     ctx: dict[str, Any]) -> CompileResult:
+        return CompileResult(plan=Plan(
+            label="传送到出生点",
+            steps=[Step("tp_spawn", 0, 0, 0)]))
+
     def _do_give_item(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         """把背包里的物品丢给玩家（交易交付）。
 

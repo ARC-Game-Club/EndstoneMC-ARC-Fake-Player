@@ -1025,3 +1025,46 @@ class CoreCheckinTests(unittest.TestCase):
     def test_checkin_core_missing(self):
         fake, cls = self._fake(None)
         self.assertIsNone(cls._core_checkin(fake, "Bot"))
+
+
+class TeleportToolTests(unittest.TestCase):
+    """传送工具的编译（tp_player/tp_warp/tp_spawn → 主线程步骤）。"""
+
+    def _compiler(self):
+        import endstone_arc_fake_player.actions as actions_mod
+        comp = actions_mod.ActionCompiler.__new__(actions_mod.ActionCompiler)
+        return comp
+
+    def test_spec_contains_tp_tools(self):
+        from endstone_arc_fake_player.llm import LLMClient, SPEC
+        for name in ("tp_player", "tp_warp", "tp_spawn"):
+            self.assertIn(name, SPEC)
+        names = [it["function"]["name"] for it in LLMClient.tool_spec()]
+        for name in ("tp_player", "tp_warp", "tp_spawn"):
+            self.assertIn(name, names)
+
+    def test_compile_tp_tools_to_steps(self):
+        comp = self._compiler()
+
+        class Actor:
+            location = type("L", (), {"x": 0, "y": 64, "z": 0})()
+            dimension = "overworld"
+
+        r1 = comp.compile(Actor(), type("C", (), {"name": "tp_player",
+                                                  "args": {"player": "Steve"}})(), {})
+        self.assertIsNotNone(r1.plan)
+        self.assertEqual(r1.plan.steps[0].op, "tp_player")
+        self.assertEqual(r1.plan.steps[0].note, "Steve")
+
+        r2 = comp.compile(Actor(), type("C", (), {"name": "tp_warp",
+                                                  "args": {"name": "主城"}})(), {})
+        self.assertEqual(r2.plan.steps[0].op, "tp_warp")
+        self.assertEqual(r2.plan.steps[0].note, "主城")
+
+        r3 = comp.compile(Actor(), type("C", (), {"name": "tp_spawn",
+                                                  "args": {}})(), {})
+        self.assertEqual(r3.plan.steps[0].op, "tp_spawn")
+
+        r4 = comp.compile(Actor(), type("C", (), {"name": "tp_warp",
+                                                  "args": {}})(), {})
+        self.assertFalse(r4.ok)

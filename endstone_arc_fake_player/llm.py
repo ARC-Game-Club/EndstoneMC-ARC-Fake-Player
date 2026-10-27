@@ -53,6 +53,9 @@ SPEC: dict[str, dict[str, str]] = {
     "goto":        {"x": "int", "y": "int", "z": "int"},
     "come_to":     {"player": "str"},
     "wander":      {"radius": "int"},
+    "tp_player":   {"player": "str"},
+    "tp_warp":     {"name": "str"},
+    "tp_spawn":    {},
     "jump":        {},
     "stop":        {},
 
@@ -419,6 +422,15 @@ class LLMClient:
             f("goto", "走到指定世界坐标。内部会自动寻路绕开障碍与岩浆，你只需给出目的地。",
               {"x": I, "y": I, "z": I}, ["x", "y", "z"]),
             f("come_to", "走到某个在线玩家身边。", {"player": S}, ["player"]),
+            f("tp_player",
+              "向某个在线玩家**申请**传送（tpa）：对方会收到接受/拒绝表单，"
+              "接受后你才传送过去并扣互传费用。想立刻去某地标用 tp_warp。",
+              {"player": S}, ["player"]),
+            f("tp_warp",
+              "传送到公共传送点/地标（服务器传送系统里的名字，比如主城、"
+              "出生点附近的地标）。名字不对会返回可用列表。",
+              {"name": S}, ["name"]),
+            f("tp_spawn", "传送到世界出生点。", {}, []),
             f("wander", "在当前区域随机走动探索。", {"radius": I}, []),
             f("jump", "原地跳一下。卡住时可用。", {}, []),
             f("stop", "立刻停止一切正在进行的动作。", {}, []),
