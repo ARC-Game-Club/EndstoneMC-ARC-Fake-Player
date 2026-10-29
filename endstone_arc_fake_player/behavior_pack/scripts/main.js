@@ -662,7 +662,7 @@ function doDrop(req, id) {
         let note = "";
         const toName = String(req.to || "");
         if (toName) {
-            const target = world.getAllPlayers().find((p) => p.name === toName);
+            const target = world.getAllPlayers().find((p) => p && p.name === toName);
             if (!target) {
                 note = `（没找到玩家 ${toName}，丢在自己脚下）`;
             } else {
@@ -1651,6 +1651,7 @@ function pumpArena() {
         let best = null, bestD = Infinity;
         try {
             for (const p of world.getAllPlayers()) {
+                if (!p) continue;
                 if (!st.enemies.has(p.name)) continue;
                 const d = Math.hypot(
                     p.location.x - sim.location.x,
