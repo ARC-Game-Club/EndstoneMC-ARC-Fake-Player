@@ -138,6 +138,38 @@
 
 # 版本历史
 
+## 3.9.18：假人能开枪了 + 真人打假人有伤害 + 复活落点明确
+
+三个问题一起修，根因是同一个：**脚本 API 看不见 SimulatedPlayer**。
+
+本机 BDS 1.26.52.3 实测：
+
+```
+world.getAllPlayers()  → [UNDEF, DEVILENMO, UNDEF, UNDEF, UNDEF, UNDEF]
+afterEvents.playerSpawn → e.player 是 undefined
+```
+
+假人在 `getAllPlayers()` 里是 `undefined`，`playerSpawn` 事件里也拿不到
+`e.player`。也就是说**枪械包（失落枪械档案馆弧光重制版 BP）的主循环遍历
+`getAllPlayers()` 时，根本看不到假人**。
+
+- **假人开不了枪**：原来桥接包是"瞄准 + `sim.useItemInHand()`，射击由枪械包
+  结算"，而枪械包看不见假人 → 扣了扳机没人管。（而且枪物品带
+  `minecraft:food`，`useItemInHand` 还会把枪当食物吃掉。）
+  现在新增 `behavior_pack/scripts/arena_combat.js`：**射击由桥接包自己结算**
+  ——射线、遮挡判定、命中部位（头×1.5 / 腿×0.7）、扣血、弹药、枪声动画。
+- **真人打假人没伤害**：枪械包射线命中的是"无名实体"（`entity.name` 为 null），
+  拿不到可用的 `minecraft:health` 组件，`applyDamage()` 静默失效。
+  现在枪械包在扣不动血时会广播 `arc_gun:simhit` 事件，由**手握真身**的
+  桥接包把伤害补到假人身上（引擎不结算时还有血量组件兜底）。
+- **假人对枪打不起来**：敌人查找只扫 `getAllPlayers()`，只能找到真人，
+  另一个假人永远找不到。现在敌人查找同时扫自己的 `sims` 表，真人和假人都算。
+- **死了不知道复活到哪**：以前没设过重生点，假人死后会被引擎丢回**世界
+  出生点**（ARCShooterGame 的 level.dat 是 0,53,0）。现在生成时就
+  `setSpawnPoint` 记下出生点，并每秒盯着位置突变，把"谁在哪儿重生了"打进日志。
+
+新增文件：`endstone_arc_fake_player/behavior_pack/scripts/arena_combat.js`
+
 ## 3.9.17：行为真人化大版本（配置 v14）
 
 基于主服 5 天 / 4101 行活动日志的分析，一次修掉全部主要"机器人穿帮点"：

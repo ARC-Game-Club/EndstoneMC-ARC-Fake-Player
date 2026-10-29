@@ -66,6 +66,13 @@
 
 import * as gametest from "@minecraft/server-gametest";
 import { system, world, ItemStack, EquipmentSlot } from "@minecraft/server";
+import {
+    initArenaCombat,
+    rememberSpawnPoint,
+    findNearestEnemy,
+    fireSimShot,
+    watchRespawn,
+} from "./arena_combat.js";
 
 // ---------------------------------------------------------------------------
 // 状态
@@ -436,6 +443,10 @@ function doSpawn(req) {
 
     tagName(out.sim, name, !!req.st);
     sims.set(name, out.sim);
+    initArenaCombat(sims);
+    // 记下出生点并设成引擎的重生点：不然假人死后会被丢回**世界出生点**，
+    // 表现就是"死了以后不知道复活到哪里去了"。
+    rememberSpawnPoint(name, out.sim, loc);
     reply("bot:spawned", { n: name, ok: true, existed: false, i: req.i });
 }
 
@@ -1647,19 +1658,13 @@ function pumpArena() {
         const sim = sims.get(name);
         if (!sim || !sim.isValid) { arenaModes.delete(name); continue; }
 
-        // 最近的在线敌人
-        let best = null, bestD = Infinity;
-        try {
-            for (const p of world.getAllPlayers()) {
-                if (!p) continue;
-                if (!st.enemies.has(p.name)) continue;
-                const d = Math.hypot(
-                    p.location.x - sim.location.x,
-                    p.location.y - sim.location.y,
-                    p.location.z - sim.location.z);
-                if (d < bestD) { bestD = d; best = p; }
-            }
-        } catch (e) { /* 列举失败本轮跳过 */ }
+        // 最近的在线敌人。真人从 world.getAllPlayers() 拿，假人从 sims 表拿
+        // ——脚本 API 里假人是 undefined，光靠 getAllPlayers() 永远找不到
+        // 另一个假人，枪战服里就变成"假人只打真人、假人对枪永远不开火"。
+        const found = findNearestEnemy(sim, st.enemies, sims);
+        const best = found ? found.entity : null;
+        const bestD = found ? found.dist : Infinity;
+        const bestName = found ? found.name : "";
         if (!best) {
             // 敌人全都不见了（对局结束/全下线）——30 秒后自动退场
             if (now - st.seenAt > 600) arenaModes.delete(name);
@@ -1686,19 +1691,18 @@ function pumpArena() {
             st.lastNav = now;
         }
 
-        // 视线内开枪：从自己眼睛向敌人胸口发一条射线，没被方块挡住才扣扳机
+        // 开火。
+        //
+        // ⚠️ 这里**不能**再用 `sim.useItemInHand()`：枪械包的主循环遍历的是
+        // `world.getAllPlayers()`，而假人在那个数组里是 undefined，枪械包
+        // 根本看不见它——扣了扳机也没有人结算子弹（而且枪物品带
+        // minecraft:food，useItemInHand 还会把枪当食物吃掉）。
+        //
+        // 所以射击由桥接包自己结算：射线、扣血、弹药、表现全在这边做。
         if (now - st.lastShot >= 4) {
             st.lastShot = now;
             try {
-                const eye = { x: sim.location.x, y: sim.location.y + 1.6, z: sim.location.z };
-                const tx = best.location.x, ty = best.location.y + 1.2, tz = best.location.z;
-                const dx = tx - eye.x, dy = ty - eye.y, dz = tz - eye.z;
-                const len = Math.hypot(dx, dy, dz) || 1;
-                const hit = sim.dimension.getBlockFromRay(
-                    eye,
-                    { x: dx / len, y: dy / len, z: dz / len },
-                    { maxDistance: Math.min(len, 40) });
-                if (!hit) sim.useItemInHand();
+                fireSimShot(sim, best, bestName);
             } catch (e) { /* 开火失败就算了这一轮 */ }
         }
     }
@@ -1797,6 +1801,24 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
 system.runInterval(pumpDigging, 1);
 // arena 战斗 AI：0.25 秒一拍（追击刷新 0.75s、开火节流 0.2s 都由内部计时）
 system.runInterval(pumpArena, 5);
+
+// 复活落点监控：每秒看一眼假人的位置。
+//
+// 假人死后引擎会把它放回**重生点**。以前我们没设过重生点，它就落回
+// 世界出生点（ARCShooterGame 的 level.dat 里是 0,53,0），于是"死了以后
+// 不知道复活到哪里去了"。现在生成时就 setSpawnPoint 记住了，这里再盯
+// 一次位置突变，把"谁在哪儿重生了"打进日志。
+system.runInterval(() => {
+    if (sims.size === 0) return;
+    try {
+        for (const [name, sim] of Array.from(sims.entries())) {
+            try {
+                if (!sim || sim.isValid === false) continue;
+                watchRespawn(name, sim);
+            } catch (e) { /* 单个失败不影响别的 */ }
+        }
+    } catch (e) { /* ignore */ }
+}, 20);
 
 // 心跳：每 5 秒无条件 pong。Python 用它判断行为包是否真的活着。
 //
