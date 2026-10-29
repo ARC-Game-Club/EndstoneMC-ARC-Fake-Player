@@ -191,10 +191,16 @@ def main() -> int:
           r4.plan and r4.plan.total >= 15,
           f"实际 {r4.plan.total if r4.plan else 0} 个实心方块")
 
-    # 空方向应当被识别出来而不是生成空计划
+    # 垂直方向（up/down）被禁：直上直下挖是最经典的机器特征，且危险。
+    # 空方向要"明确提示而不是空执行"——垂直方向的提示就是禁令+替代方案。
     r4b = compiler.compile(actor, ToolCall("dig_tunnel", {"direction": "up", "length": 5}), {})
-    check("朝空气方向挖会明确提示而不是空执行",
-          r4b.plan is None and "没有任何方块" in r4b.immediate, r4b.immediate)
+    check("垂直挖隧道被拒绝并指引 descend",
+          r4b.plan is None and "垂直" in r4b.immediate and "descend" in r4b.immediate,
+          r4b.immediate)
+    r4c = compiler.compile(actor, ToolCall("descend", {"depth": 6}), {})
+    check("descend 阶梯下探生成计划（相邻层共格去重后=2d+2 步）",
+          r4c.plan is not None and r4c.plan.total == 6 * 2 + 2,
+          f"实际 {r4c.plan.total if r4c.plan else 0} 步")
 
     # --- 砍树（一棵 7x7 的树 = 98 格）---
     r5 = compiler.compile(actor, ToolCall("chop_tree", {"x": 8, "y": 64, "z": 8}), {})

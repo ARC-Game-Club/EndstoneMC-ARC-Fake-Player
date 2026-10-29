@@ -56,6 +56,7 @@ Endstone 的 Python API 造不出 SimulatedPlayer，那个接口只在
 import json
 import math
 import random
+import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -91,7 +92,7 @@ from .crowd import CrowdScheduler, load_cards
 from .economy import EconomyBridge
 from .executor import BatchExecutor, Plan, PlanState, Step
 from .identity import IdentityRegistry, looks_synthetic
-from .llm import LLMClient
+from .llm import LLMClient, set_shooter_available
 from .pathfinder import make_probe, walkable_surface
 from .realbody import RealBodyActions
 from .roam import RoamDriver
@@ -348,6 +349,31 @@ class ArcFakePlayerPlugin(Plugin):
         self._world.bind_players(lambda: [
             p for p in self.server.online_players
             if str(getattr(p, "name", "") or "") not in self._reserved_names()])
+        # 昼夜感知：把世界 tick 喂给快照（"白天/夜晚"标签）。
+        # level 在 on_enable 阶段还不可用，所以包一层运行时兜底。
+        def _world_time() -> int | None:
+            try:
+                return int(self.server.level.time)
+            except Exception:
+                return None
+        self._world.bind_time(_world_time)
+        # 本服有没有枪战插件（gs 命令门控）。晚于本插件的加载也要能
+        # 追认，所以这里只测一次做初值，执行器处理器每次现查。
+        try:
+            _pm = self.server.plugin_manager
+            self._shooter_available = (
+                _pm is not None and _pm.get_plugin("arc_shooter_game") is not None)
+        except Exception:
+            self._shooter_available = False
+        set_shooter_available(self._shooter_available)
+        # 交易申请：玩家名 → 待决定的 offer（bot/item/count/price/mode/到期）。
+        # 每个玩家同时只留一份——重复申请顶掉旧的，别刷屏。
+        self._trade_offers: dict[str, dict[str, Any]] = {}
+        # 收购单（mode=buy 已被接受）：假人名 → {item/baseline/need/price/player/expire}。
+        # 玩家把货丢过来、假人捡到背包里多出 need 个就自动付款。
+        self._trade_pickups: dict[str, dict[str, Any]] = {}
+        # 正在睡觉的假人：名字 → {"pos": 床边坐标, "since": monotonic}
+        self._sleeping: dict[str, dict[str, Any]] = {}
         self._executor = BatchExecutor(
             self.logger, max_steps_per_tick=int(self._cfg["steps_per_tick"]))
 
@@ -480,6 +506,8 @@ class ArcFakePlayerPlugin(Plugin):
         # 每 1 秒：扫玩家发给假人的 tpa 申请，到随机延迟后代为"点同意"。
         # 弧光核心不在或没开玩家互传时，这一秒就是空转，常开没有副作用。
         self._guard(self._tpa_tick, "tpa自动同意", delay=40, period=20)
+        # 每 2 秒：看守睡觉的假人——天亮叫醒、离床太远算睡醒。
+        self._guard(self._sleep_tick, "睡觉看守", delay=60, period=40)
 
         self.logger.info(f"{C.GREEN}LLM 虚拟玩家插件已启用{C.RESET}")
         self.logger.info("配置模型：/ai set <base_url> <api_key> <model>")
@@ -860,6 +888,11 @@ class ArcFakePlayerPlugin(Plugin):
             "auto_online": {
                 "enabled": False,
                 "target_count": 3,
+                # 夜间档（本机 1:00~7:59）：凌晨在线人数目标。真服务器
+                # 的在线曲线凌晨会塌下去，24 小时恒定满员一眼假。0 =
+                # 凌晨不补新角色（在场的人玩到自然下线）。设成和
+                # target_count 一样 = 不做作息曲线。
+                "night_target_count": 1,
                 # 单次游玩时长（分钟），每次上线在这区间里随机
                 "play_minutes_min": 10,
                 "play_minutes_max": 300,
@@ -1462,7 +1495,7 @@ class ArcFakePlayerPlugin(Plugin):
             owner = self._exec_owner
             if owner is None:
                 return False
-            target = self.server.get_player(str(step.note or ""))
+            target = self._resolve_online_player(str(step.note or ""))
             if target is None or not str(getattr(target, "xuid", "") or "").strip():
                 if self._exec_plan is not None:
                     self._exec_plan.note_failed(
@@ -1507,13 +1540,40 @@ class ArcFakePlayerPlugin(Plugin):
                 res = core.api_teleport_player_to_warp(
                     warp, player_name=owner) or {}
                 if not res.get("ok"):
-                    names = ""
+                    warps: list[dict] = []
                     try:
                         warps = core.api_list_public_warps() or []
-                        names = "、".join(str(w.get("warp_name"))
-                                          for w in warps[:12])
                     except Exception:
-                        pass
+                        warps = []
+                    names = "、".join(str(w.get("warp_name"))
+                                      for w in warps[:12])
+                    # 名字写得糊（大小写/前后缀/个别字错）：从可用列表里
+                    # 找最近的直接改送，一次救回。日志里见过把提示词里的
+                    # "list" 当地标名传的——纯捏造的名字编辑距离都很远，
+                    # 不会误中。
+                    if str(res.get("error")) == "WARP_NOT_FOUND" and warps:
+                        want = warp.strip().lower()
+                        best_name, best_d = None, 99
+                        for w in warps:
+                            cand = str(w.get("warp_name") or "").strip()
+                            low = cand.lower()
+                            if not low:
+                                continue
+                            if low == want or low.startswith(want) or want.startswith(low):
+                                best_name, best_d = cand, 0
+                                break
+                            d = self._edit_distance(want, low)
+                            if d < best_d:
+                                best_name, best_d = cand, d
+                        if best_name is not None and best_d <= 2:
+                            res = core.api_teleport_player_to_warp(
+                                best_name, player_name=owner) or {}
+                            if res.get("ok"):
+                                self._tp_cooldown[owner] = now
+                                self._notify_agent_event(
+                                    owner, f"传送到地标 {best_name}（你写的"
+                                           f"「{warp}」没有，已按最接近的名字修正）")
+                                return True
                     why = {"WARP_NOT_FOUND": "没有这个传送点"}.get(
                         str(res.get("error")), str(res.get("error")))
                     if self._exec_plan is not None:
@@ -1586,9 +1646,96 @@ class ArcFakePlayerPlugin(Plugin):
                     self._exec_plan.note_failed("run_command 失败：身体不在线")
                 return True
             command = str(step.note or "").strip()
+            # gs 门控（第二道闸，编译器那道是提示词层）：这服没装枪战
+            # 插件时无论重试多少次都必然失败。没装还要试的，一次都别放。
+            if command.split()[:1] == ["gs"] and not self._shooter_now():
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        "本服没有装枪战插件，gs 命令不可用。别再尝试，干点别的")
+                return True
             text = self._run_bot_command(owner, actor, command)
             if text and self._exec_plan is not None:
                 self._exec_plan.note_failed(f"run_command：{text}")
+            return True
+
+        def h_offer_trade(step: Step) -> bool:
+            """向玩家发起交易申请：弹接受/拒绝表单，发出即算完成。
+
+            成败由对方决定（和 tpa 一个模式）；结果会作为事件喂回大脑。
+            检查顺序：参数 → 玩家在线（模糊匹配）→ 距离 ≤ 8 格 →
+            卖方有货 / 买方有钱 → 弹窗。
+            """
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            actor = self._live_actor(owner)
+            if actor is None:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed("交易失败：身体不在线")
+                return True
+            try:
+                spec = json.loads(str(step.note or "{}"))
+            except (ValueError, TypeError):
+                spec = None
+            if not isinstance(spec, dict):
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed("交易参数无效")
+                return True
+            player_name = str(spec.get("player", ""))
+            target = self._resolve_online_player(player_name)
+            if target is None:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"交易失败：玩家 {player_name} 不在线")
+                return True
+            real_name = str(getattr(target, "name", "") or player_name)
+            dist = math.dist(
+                (actor.location.x, actor.location.y, actor.location.z),
+                (target.location.x, target.location.y, target.location.z))
+            if dist > 8.0:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"交易失败：{real_name} 在 {dist:.0f} 格外，"
+                        f"先 come_to 走到对方 8 格内")
+                return True
+            mode = str(spec.get("mode", ""))
+            item = str(spec.get("item", ""))
+            count = int(spec.get("count", 1))
+            price = float(spec.get("price", 0))
+            # 货与钱的"申请时"预检：让对方看到的 offer 是真能成交的。
+            have = sum((c for n, c in self._world.scan_inventory(actor)
+                        if item in n), 0)
+            balance = self._economy.get_balance(owner)
+            if mode == "sell" and have < count:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"交易失败：背包里只有 {have} 个 {item}，凑够 {count} 个再谈")
+                return True
+            if mode == "buy" and (balance is None or balance < price):
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"交易失败：钱包余额不足（{balance if balance is not None else 0:.0f}）")
+                return True
+            ok, why = self._show_trade_form(owner, target, spec)
+            if not ok and self._exec_plan is not None:
+                self._exec_plan.note_failed(f"交易失败：{why}")
+            return True
+
+        def h_sleep(step: Step) -> bool:
+            """走到床边后挂机到天亮。真正的"睡"由 _sleep_tick 看守。"""
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            actor = self._live_actor(owner)
+            if actor is None:
+                return True
+            loc = actor.location
+            self._sleeping[owner] = {
+                "pos": (loc.x, loc.y, loc.z),
+                "since": time.monotonic(),
+            }
+            self._record("admin", f"{owner} 上床睡觉（{loc.x:.0f},{loc.y:.0f},{loc.z:.0f}）",
+                         who=owner)
             return True
 
         # --- 下面这些两种情况通用 ---------------------------------------
@@ -1686,6 +1833,8 @@ class ArcFakePlayerPlugin(Plugin):
         e.register("tp_player", h_tp_player)
         e.register("tp_warp", h_tp_warp)
         e.register("tp_spawn", h_tp_spawn)
+        e.register("offer_trade", h_offer_trade)
+        e.register("sleep", h_sleep)
 
     def _teleport_step(self, step: Step) -> bool:
         """把一个格子换算成传送坐标。
@@ -3171,7 +3320,10 @@ class ArcFakePlayerPlugin(Plugin):
             # 挖掘工具是否也只找表面方块。与感知那个开关是两件事，
             # 但只关一个就会留下"看不见却能挖到"的矿透后门。
             compiler.surface_only = bool(self._cfg["dig_surface_only"])
-            compiler.bind_player_lookup(lambda p: self.server.get_player(p))
+            # 这服有没有枪战插件——决定 gs 命令在编译期放不放行
+            # （没装的服上 run_command 说明也不会再宣传 gs）。
+            compiler.shooter_available = self._shooter_available
+            compiler.bind_player_lookup(self._resolve_online_player)
 
             # 真实身体的动作处理器
             ctl = self._bodies.add(name)
@@ -3192,6 +3344,8 @@ class ArcFakePlayerPlugin(Plugin):
                 # "actor is not valid"。这里挡掉，Agent 就能干净地停下。
                 get_actor=lambda n=name: self._live_actor(n),
             )
+            # 失败熔断的出口：同一件事连败时让闲逛层把人带走。
+            agent._on_stuck = lambda sig, n=name: self._on_agent_stuck(n, sig)
         except Exception:
             self.logger.exception(f"创建智能体 {name} 失败")
             return None
@@ -3637,11 +3791,13 @@ class ArcFakePlayerPlugin(Plugin):
 
     def _roam_busy(self, name: str) -> bool:
         """闲逛让路条件：打架 / 枪战对局 / 有执行计划 / 等真身 /
-        身体控制器正在执行动作（挖掘的走近/挖掘中）。
+        身体控制器正在执行动作（挖掘的走近/挖掘中）/ 正在睡觉。
 
         最后一条是关键：上一版闲逛的 walk 会打断 bot:dig 的走近，
         dig 的轮询又把人拽回去——来回抵消，假人"走一步然后罚站"。
         """
+        if name in self._sleeping:
+            return True
         agent = self._agents.get(name)
         if (self._reflex.is_engaged(name)
                 or name in self._arena_next
@@ -3650,6 +3806,346 @@ class ArcFakePlayerPlugin(Plugin):
             return True
         ctl = self._bodies.get(name)
         return ctl is not None and bool(getattr(ctl, "busy", False))
+
+    # ------------------------------------------------------------------
+    # 模糊玩家名解析 / 枪战门控 / 熔断出口 / 睡觉看守
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _edit_distance(a: str, b: str) -> int:
+        """两个名字的编辑距离（Levenshtein，容量小的双行实现）。"""
+        if abs(len(a) - len(b)) > 4:
+            return 99
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                               prev[j - 1] + (ca != cb)))
+            prev = cur
+        return prev[-1]
+
+    def _resolve_online_player(self, name: str) -> Any:
+        """按名字找在线玩家：精确 → 剥§码 → 前后缀/包含 → 最近编辑距离。
+
+        模型经常把玩家名写糊（5 天日志里 9 次把字面 "player" 当名字传，
+        还有大小写随手的）。严格相等就报"不在线"会让大脑原地反复重试；
+        一次模糊匹配就能救回。占位名（player/玩家/xxx…）不猜，直接拒。
+        """
+        raw = str(name or "").strip()
+        if not raw:
+            return None
+        try:
+            exact = self.server.get_player(raw)
+        except Exception:
+            return None
+        if exact is not None:
+            return exact
+        plain = re.sub(r"§.", "", raw).strip().lower()
+        # 模型犯懒时的占位名——猜谁都是错，直接让它重看在线列表。
+        if plain in ("player", "玩家", "xxx", "test", "someone", "target"):
+            return None
+        best: tuple[int, int, Any] | None = None
+        try:
+            online = list(self.server.online_players)
+        except Exception:
+            return None
+        for p in online:
+            pname = str(getattr(p, "name", "") or "")
+            if not pname:
+                continue
+            low = pname.lower()
+            if low == plain:
+                return p
+            if plain and (low.startswith(plain) or plain.startswith(low)):
+                score = (0, self._edit_distance(plain, low), p)
+            elif plain in low or low in plain:
+                score = (1, self._edit_distance(plain, low), p)
+            else:
+                d = self._edit_distance(plain, low)
+                if d > 3:
+                    continue
+                score = (2, d, p)
+            if best is None or score[:2] < best[:2]:
+                best = score
+        if best is not None and best[0] <= 1 and best[1] <= 3:
+            return best[2]
+        if best is not None and best[0] == 2 and best[1] <= 2:
+            return best[2]
+        return None
+
+    def _shooter_now(self) -> bool:
+        """这服现在有没有枪战插件。每次现查（插件加载顺序不保证）。"""
+        try:
+            pm = self.server.plugin_manager
+            return pm is not None and pm.get_plugin("arc_shooter_game") is not None
+        except Exception:
+            return False
+
+    def _is_night(self) -> bool:
+        now = None
+        try:
+            now = int(self.server.level.time)
+        except Exception:
+            return False
+        return self._world.daynight_label(now) == "夜晚"
+
+    def _on_agent_stuck(self, name: str, sig: str) -> None:
+        """大脑连续失败熔断的出口：让闲逛层把人带离这片区域。
+
+        编译期失败（collect 没找到、goto 不可达）走不到执行计划，只有
+        这里能把"人"物理挪走。kick_far 让闲逛层下一个兴趣点取远处
+        （40~120 格），相当于真人"这没有，换个地方"。
+        """
+        try:
+            self._roam.kick_far(name)
+            self._record("admin", f"{name} 连续失败熔断，带离现场（{sig}）", who=name)
+        except Exception:
+            pass
+
+    def _sleep_tick(self) -> None:
+        """看守睡觉的假人：天亮叫醒；离床太远算自己醒了。
+
+        顺手带上交易的两个后处理：卖方交付的"等捡货"轮询也在这个
+        2 秒节拍里做（都是"玩家侧异步等待"性质的看门活，合用一个
+        周期任务省一个调度器槽位）。
+        """
+        if not self._sleeping and not self._trade_pickups:
+            return
+        day = not self._is_night()
+        for name in list(self._sleeping):
+            info = self._sleeping.get(name)
+            if not info:
+                continue
+            actor = self._live_actor(name)
+            if actor is None:
+                self._sleeping.pop(name, None)
+                continue
+            loc = actor.location
+            if math.dist((loc.x, loc.y, loc.z), info["pos"]) > 4.0:
+                # 人走了 = 醒了（被打跑/大脑另有安排），静默收摊
+                self._sleeping.pop(name, None)
+                continue
+            if not day:
+                continue
+            self._sleeping.pop(name, None)
+            agent = self._agents.get(name)
+            if agent is not None:
+                agent.note_events([{"op": "sleep", "ok": True,
+                                    "msg": "天亮了，你睡了一觉，起床了"}])
+            self._record("admin", f"{name} 睡到天亮起床", who=name)
+        self._trade_pickup_tick()
+
+    # ------------------------------------------------------------------
+    # 假人发起的交易（offer_trade 的表单与结算）
+    # ------------------------------------------------------------------
+
+    #: 玩家多久不决定就算放弃（秒）
+    TRADE_OFFER_TTL = 60.0
+    #: 玩家"接受收购"后多久内要把货丢过来（秒）
+    TRADE_PICKUP_TTL = 90.0
+
+    def _show_trade_form(self, bot_name: str, player: Any,
+                         spec: dict[str, Any]) -> tuple[bool, str]:
+        """给玩家弹交易申请表单。返回 (ok, 失败原因)。"""
+        try:
+            from endstone.form import ActionForm
+        except Exception:
+            return False, "本客户端不支持表单"
+        real_name = str(getattr(player, "name", "") or "")
+        if not real_name:
+            return False, "拿不到玩家名字"
+        mode = str(spec.get("mode", ""))
+        item = str(spec.get("item", ""))
+        count = int(spec.get("count", 1))
+        price = float(spec.get("price", 0))
+        offer = {
+            "bot": bot_name, "player": real_name, "mode": mode,
+            "item": item, "count": count, "price": price,
+            "expire": time.monotonic() + self.TRADE_OFFER_TTL,
+        }
+        # 每个玩家同时只留一份申请：新申请顶掉旧的，别连环弹窗刷人。
+        self._trade_offers[real_name] = offer
+        if mode == "sell":
+            content = (f"假人 {bot_name} 向你发起交易请求：\n\n"
+                       f"出售 {count}×{item}，价格 {price:g} 金币\n\n"
+                       f"接受后你支付 {price:g} 金币，{bot_name} 会把货交给你；"
+                       f"钱包余额不足时交易失败。")
+        else:
+            content = (f"假人 {bot_name} 向你发起交易请求：\n\n"
+                       f"用 {price:g} 金币收购 {count}×{item}\n\n"
+                       f"接受后请把 {count} 个 {item} 丢在 {bot_name} 脚下"
+                       f"（{self.TRADE_PICKUP_TTL:.0f} 秒内），它捡到货自动付款。")
+        form = ActionForm(title=f"交易请求 · {bot_name}", content=content)
+        form.add_button(
+            "接受", on_click=lambda _s, p=real_name: self._trade_decide(p, True))
+        form.add_button(
+            "拒绝", on_click=lambda _s, p=real_name: self._trade_decide(p, False))
+        player.send_form(form)
+        # 到期自动撤销。任务里会核对"还是同一份申请"，旧到期不会误伤新申请。
+        def _expire() -> None:
+            self._trade_expire(real_name, offer)
+        self.server.scheduler.run_task(
+            self, self._make_task(_expire),
+            delay=int(self.TRADE_OFFER_TTL * 20) + 40)
+        self._record("admin",
+                     f"{bot_name} 向 {real_name} 发起交易（"
+                     f"{'出售' if mode == 'sell' else '收购'} {count}×{item} @ {price:g}）",
+                     who=bot_name)
+        return True, ""
+
+    def _trade_expire(self, player_name: str, offer: dict[str, Any]) -> None:
+        """申请超时：还挂着同一份才撤，别误伤后发的另一份。"""
+        if self._trade_offers.get(player_name) is not offer:
+            return
+        self._trade_offers.pop(player_name, None)
+        self._notify_agent_event(
+            offer["bot"], f"{player_name} 没有回应你的交易申请，超时取消了")
+
+    def _trade_decide(self, player_name: str, accepted: bool) -> None:
+        """玩家点了接受/拒绝。接受后按买卖方向分别结算。"""
+        offer = self._trade_offers.pop(player_name, None)
+        if offer is None:
+            return  # 已过期/已处理
+        bot_name = str(offer.get("bot", ""))
+        player = self.server.get_player(player_name)
+        if not accepted:
+            self._notify_agent_event(
+                bot_name, f"{player_name} 拒绝了你的交易申请")
+            self._record("admin", f"{player_name} 拒绝了 {bot_name} 的交易", who=bot_name)
+            return
+        if player is None:
+            self._notify_agent_event(bot_name, f"{player_name} 下线了，交易取消")
+            return
+        bot = self._live_actor(bot_name)
+        if bot is None:
+            player.send_message(f"§c{bot_name} 已下线，交易取消§r")
+            return
+        mode = str(offer.get("mode", ""))
+        item = str(offer.get("item", ""))
+        count = int(offer.get("count", 1))
+        price = float(offer.get("price", 0))
+        if mode == "sell":
+            self._trade_settle_sell(bot_name, bot, player, offer)
+        else:
+            self._trade_settle_buy(bot_name, bot, player, offer)
+
+    def _trade_settle_sell(self, bot_name: str, bot: Any, player: Any,
+                           offer: dict[str, Any]) -> None:
+        """玩家买假人的货：先收钱进假人钱包，再给假人排交付计划。
+
+        扣款发生在接受的一瞬（申请时已预检过玩家余额和假人存货），
+        交付走执行器的 drop_item（会真的从假人背包扣货丢出来）。
+        """
+        item = str(offer.get("item", ""))
+        count = int(offer.get("count", 1))
+        price = float(offer.get("price", 0))
+        ok, why = self._economy.receive_from_player(bot_name, player, price)
+        if not ok:
+            player.send_message(f"§c交易失败：{why}§r")
+            self._notify_agent_event(
+                bot_name, f"和 {player.name} 的交易没成：{why}")
+            return
+        plan = Plan(
+            label=f"{bot_name}: 交付 {count}×{item} 给 {player.name}",
+            steps=[Step("drop_item", 0, 0, 0, async_op=True,
+                        note=json.dumps({"item": item, "count": count,
+                                         "to": player.name},
+                                        ensure_ascii=False))])
+        self._executor.submit(plan)
+        player.send_message(
+            f"§a已支付 {price:g} 金币，{bot_name} 正在把 {count}×{item} 交给你§r")
+        self._notify_agent_event(
+            bot_name, f"{player.name} 接受了交易并支付了 {price:g} 金币，"
+                      f"交付 {count}×{item} 的任务已经排上，照常执行即可")
+        self._record("admin",
+                     f"{player.name} 买下 {bot_name} 的 {count}×{item}（{price:g} 金币），待交付",
+                     who=bot_name)
+
+    def _trade_settle_buy(self, bot_name: str, bot: Any, player: Any,
+                          offer: dict[str, Any]) -> None:
+        """玩家卖货给假人：先让玩家丢货，假人捡到再付款。
+
+        顺序刻意是"货先钱后"——玩家丢货没有损失（假人没捡到就取消），
+        假人捡到才扣钱，两边都吃不了亏。捡货检测在 _trade_pickup_tick。
+        """
+        item = str(offer.get("item", ""))
+        count = int(offer.get("count", 1))
+        price = float(offer.get("price", 0))
+        baseline = sum((c for n, c in self._world.scan_inventory(bot)
+                        if item in n), 0)
+        self._trade_pickups[bot_name] = {
+            "item": item, "baseline": baseline, "need": count,
+            "price": price, "player": str(player.name),
+            "expire": time.monotonic() + self.TRADE_PICKUP_TTL,
+        }
+        player.send_message(
+            f"§a已接受。请在 {self.TRADE_PICKUP_TTL:.0f} 秒内把 "
+            f"{count}×{item} 丢给 {bot_name}（走过去按 Q），"
+            f"它捡到后自动支付 {price:g} 金币§r")
+        self._notify_agent_event(
+            bot_name, f"{player.name} 接受了你的收购申请：它会往你脚边丢 "
+                      f"{count}×{item}，你捡到就够了，别走远")
+        self._record("admin",
+                     f"{bot_name} 收购 {player.name} 的 {count}×{item}（{price:g}），等对方丢货",
+                     who=bot_name)
+
+    def _trade_pickup_tick(self) -> None:
+        """收购单的捡货检测：背包里 item 多够了就付款，超时就取消。"""
+        if not self._trade_pickups:
+            return
+        now = time.monotonic()
+        for bot_name in list(self._trade_pickups):
+            deal = self._trade_pickups.get(bot_name)
+            if not deal:
+                continue
+            bot = self._live_actor(bot_name)
+            if bot is None:
+                self._trade_pickups.pop(bot_name, None)
+                continue
+            have = sum((c for n, c in self._world.scan_inventory(bot)
+                        if deal["item"] in n), 0)
+            if now > deal["expire"]:
+                self._trade_pickups.pop(bot_name, None)
+                self._notify_agent_event(
+                    bot_name, f"{deal['player']} 超时没把 "
+                              f"{deal['need']}×{deal['item']} 丢过来，收购取消了")
+                player = self.server.get_player(deal["player"])
+                if player is not None:
+                    player.send_message(
+                        f"§c收购超时：{bot_name} 没收到货，本次交易取消（未扣款）§r")
+                continue
+            if have - deal["baseline"] >= deal["need"]:
+                self._trade_pickups.pop(bot_name, None)
+                player = self.server.get_player(deal["player"])
+                if player is None:
+                    self._notify_agent_event(
+                        bot_name, f"捡到了 {deal['need']}×{deal['item']}，"
+                                  f"但 {deal['player']} 下线了，钱没付出去，货算你的")
+                    continue
+                ok, why = self._economy.pay_player(
+                    bot_name, player, deal["price"])
+                if ok:
+                    player.send_message(
+                        f"§a{bot_name} 已收到货并支付 {deal['price']:g} 金币§r")
+                    self._notify_agent_event(
+                        bot_name, f"收购完成：你用 {deal['price']:g} 金币买进了 "
+                                  f"{deal['need']}×{deal['item']}（来自 {deal['player']}）")
+                    self._record("admin",
+                                 f"{bot_name} 向 {deal['player']} 收购 "
+                                 f"{deal['need']}×{deal['item']} 成交（{deal['price']:g} 金币）",
+                                 who=bot_name)
+                else:
+                    player.send_message(f"§c付款失败：{why}§r")
+                    self._notify_agent_event(
+                        bot_name, f"捡到了货但付款失败：{why}")
+
+    def _notify_agent_event(self, bot_name: str, text: str) -> None:
+        """把一条结果事件塞进假人大脑的下一轮感知（线程安全：主线程调用）。"""
+        agent = self._agents.get(bot_name)
+        if agent is not None:
+            agent.note_events([{"op": "trade", "ok": True, "msg": text}])
+
 
     def _roam_anchor(self, name: str) -> tuple[float, float, float, str] | None:
         """闲逛锚点：家 > 自己领地传送点 > 随机公共传送点。"""

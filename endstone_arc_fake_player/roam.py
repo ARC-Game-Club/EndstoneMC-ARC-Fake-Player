@@ -44,6 +44,8 @@ class RoamState:
     last_angle: float | None = None
     #: 上一个兴趣点坐标（x, z），短期不重复去同一个地方。
     last_poi: tuple[float, float] | None = None
+    #: 熔断带离标志：下一个兴趣点取远处，取完即清。
+    forced_far: bool = False
 
 
 class RoamDriver:
@@ -109,6 +111,18 @@ class RoamDriver:
         if why:
             self._log(f"[{name}] 闲逛动作失败，3 秒后重试: {why}")
 
+    def kick_far(self, name: str) -> None:
+        """把一个人"带离现场"：下一个兴趣点取远处（40~120 格）。
+
+        大脑在同一片区域连续失败（collect 找不到、goto 不可达…）时由
+        插件的熔断钩子调用——真人遇到"这里没有"的反应就是换个地方，
+        而不是原地重试。置标志后由 `_tick_one` 消费，一次有效。
+        """
+        st = self.state_of(name)
+        st.forced_far = True
+        st.next_at = 0.0
+        self._log(f"[{name}] 熔断带离：下个兴趣点取远处")
+
     # ------------------------------------------------------------------
 
     def tick(self) -> None:
@@ -165,7 +179,14 @@ class RoamDriver:
         lo, hi = self.POI_RADIUS if anchor is not None else (
             self.POI_RADIUS[0] // 2, self.POI_RADIUS[1] // 2)
         far_stroll = self._rng.random() < 0.15
-        if far_stroll:
+        if st.forced_far:
+            # 熔断带离：这次必须走得远（40~120 格），且挖的动作先免了——
+            # 人是"换地方"状态，不是"到新地方接着挖"。
+            st.forced_far = False
+            far_stroll = True
+            lo, hi = 40, 120
+            st.last_was_dig = True
+        elif far_stroll:
             hi = hi * 2
         tx = ty = tz = None
         for attempt in range(12):

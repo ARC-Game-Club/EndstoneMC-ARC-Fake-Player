@@ -36,7 +36,7 @@ from .nbt import (
 
 
 #: 行为包标识。必须和 behavior_pack/manifest.json 里的 header.uuid 一致。
-PACK_VERSION = [3, 9, 15]
+PACK_VERSION = [3, 9, 17]
 PACK_UUID = "7d4c1a90-2f63-4b8e-a5d1-9c0e7b3f6a24"
 
 

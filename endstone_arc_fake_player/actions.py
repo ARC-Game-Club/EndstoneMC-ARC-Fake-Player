@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -165,6 +166,12 @@ class ActionCompiler:
         return CompileResult(
             plan=Plan(label=f"挖掉方块({x},{y},{z})", steps=steps))
 
+    #: 单次挖掘计划的最大格数。一次排 296 格的"工程"本身就是机器行为
+    #: （真人挖一段看一段），而且 5 天日志里出现过 296/316 格的计划
+    #: 全军覆没（0/296）。限到 48 格：挖完计划结束，模型看到结果后
+    #: 自然会决定"接着挖"还是"换个地方"——更像人，也控得住失败半径。
+    MAX_DIG_PLAN = 48
+
     def _do_mine_area(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         cells = list(iter_box(a["x1"], a["y1"], a["z1"], a["x2"], a["y2"], a["z2"],
                               order="bottom", max_steps=self.MAX_AREA))
@@ -175,8 +182,15 @@ class ActionCompiler:
         ]
         if not solid:
             return CompileResult(immediate="该区域已经是空的，没有可挖的方块")
+        note = ""
+        if len(solid) > self.MAX_DIG_PLAN:
+            note = (f"区域共有 {len(solid)} 格，这次先挖最近的 {self.MAX_DIG_PLAN} 格，"
+                    f"挖完再看要不要继续。")
+            solid = solid[: self.MAX_DIG_PLAN]
         steps = self.dig_steps(solid)
-        return CompileResult(plan=Plan(label=f"挖区域({len(steps)}格)", steps=steps))
+        return CompileResult(
+            plan=Plan(label=f"挖区域({len(steps)}格)", steps=steps),
+            immediate=note)
 
     def _do_clear_area(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         cells = list(iter_box(a["x1"], a["y1"], a["z1"], a["x2"], a["y2"], a["z2"],
@@ -187,8 +201,15 @@ class ActionCompiler:
         ]
         if not solid:
             return CompileResult(immediate="该区域已经是空的")
+        note = ""
+        if len(solid) > self.MAX_DIG_PLAN:
+            note = (f"区域共有 {len(solid)} 格，这次先清最近的 {self.MAX_DIG_PLAN} 格，"
+                    f"挖完再看要不要继续。")
+            solid = solid[: self.MAX_DIG_PLAN]
         steps = self.dig_steps(solid)
-        return CompileResult(plan=Plan(label=f"清空区域({len(steps)}格)", steps=steps))
+        return CompileResult(
+            plan=Plan(label=f"清空区域({len(steps)}格)", steps=steps),
+            immediate=note)
 
     def _do_dig_tunnel(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         """挖隧道。
@@ -196,29 +217,33 @@ class ActionCompiler:
         语义上这是"开凿"而不是"清扫"——即使前面是空气，也要往下/往侧面
         扩展，否则挖出来的是个悬空的洞。所以这里对空气格不会跳过，
         但会先做一个"如果整条路径都是空气就报错"的检查，避免无意义执行。
+
+        ⚠️ 垂直方向（up/down）被**刻意禁掉**。直上直下挖是最经典的
+        机器行为（真人知道会摔死/被岩浆浇），5 天日志里 down 隧道挖了
+        62 次。下矿用 `descend`（阶梯式下探）替代——模型会从失败反馈
+        里得到指引。
         """
         direction = a.get("direction", "north")
+        if direction in ("up", "down"):
+            return CompileResult(
+                ok=False,
+                immediate="不要垂直挖（会摔死/被岩浆浇）。往下走用 descend（阶梯式下探），"
+                          "水平隧道用 north/south/east/west。")
         length = int(a.get("length", 8))
         height = int(a.get("height", 2))
         ox, oy, oz = self._floor(actor.location)
 
         dx, dy, dz = {"north": (0, 0, -1), "south": (0, 0, 1),
-                      "east": (1, 0, 0), "west": (-1, 0, 0),
-                      "up": (0, 1, 0), "down": (0, -1, 0)}.get(direction, (0, 0, -1))
+                      "east": (1, 0, 0), "west": (-1, 0, 0)}.get(direction, (0, 0, -1))
 
         cells: list[tuple[int, int, int]] = []
         for i in range(1, length + 1):
             bx, by, bz = ox + dx * i, oy + dy * i, oz + dz * i
             for h in range(height):
-                if dy > 0:
-                    cells.append((bx, by + h, bz))
-                elif dy < 0:
-                    cells.append((bx, by - h, bz))
-                else:
-                    cells.append((bx, by + h, bz))
-                    # 水平隧道：把脚下那层也带上，隧道才有地板
-                    if h == 0:
-                        cells.append((bx, by - 1, bz))
+                cells.append((bx, by + h, bz))
+                # 水平隧道：把脚下那层也带上，隧道才有地板
+                if h == 0:
+                    cells.append((bx, by - 1, bz))
         cells = list(dict.fromkeys(cells))
 
         dim = actor.dimension
@@ -233,6 +258,34 @@ class ActionCompiler:
         solid.sort(key=lambda c: (abs(c[0] - ox) + abs(c[2] - oz), abs(c[1] - oy)))
         steps = self.dig_steps(solid)
         return CompileResult(plan=Plan(label=f"挖隧道 {direction} {length}格", steps=steps))
+
+    def _do_descend(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
+        """阶梯式下探：像真人挖楼梯一样，"前进一格、下一层"地往下走。
+
+        每层展开成三步挖掘（脚下 + 前方列的高低两格），最后走到底部。
+        全程都是水平邻格与脚下格，不会挖出垂直深井——不会摔伤，
+        碰到岩浆也有反应空间。模型要下矿时用它替代被禁掉的 down 隧道。
+        """
+        depth = max(1, min(12, int(a.get("depth", 8) or 8)))
+        ox, oy, oz = self._floor(actor.location)
+        # 方向随机取水平一支：拿不到"面朝方向"，随机还能避免每只假人
+        # 都朝同一个方向挖出一条一模一样的走廊。
+        dx, dz = random.choice(((0, -1), (0, 1), (1, 0), (-1, 0)))
+
+        cells: list[tuple[int, int, int]] = []
+        cx, cy, cz = ox, oy, oz
+        for _ in range(depth):
+            # 本层脚下 + 前方一列（新层的高低两格）
+            cells += [(cx, cy - 1, cz),
+                      (cx + dx, cy - 1, cz + dz),
+                      (cx + dx, cy - 2, cz + dz)]
+            cx, cy, cz = cx + dx, cy - 1, cz + dz
+        cells = list(dict.fromkeys(cells))
+        steps = self.dig_steps(cells)
+        steps.append(Step("walk_to", cx, cy, cz, async_op=self.use_real_dig))
+        return CompileResult(plan=Plan(
+            label=f"阶梯下探{depth}层", steps=steps, steps_per_tick=2),
+            immediate=f"开始阶梯式下探 {depth} 层（每层下一格，安全下矿）")
 
     def _do_mine_vein(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         """找附近的矿石并挖掉。插件负责搜索，模型只说要什么。
@@ -249,8 +302,8 @@ class ActionCompiler:
 
         # 给模型一条可行的下一步，而不是一句"没找到"
         hints = {
-            "diamond_ore": "钻石通常在 y=-59 到 y=12 之间，建议先 dig_tunnel 朝 down 挖下去",
-            "iron_ore": "铁矿石常见于 y=0 到 y=64，建议往地下挖",
+            "diamond_ore": "钻石通常在 y=-59 到 y=12 之间，建议先 descend 阶梯式下探",
+            "iron_ore": "铁矿石常见于 y=0 到 y=64，建议往地下走（descend 阶梯下探）",
             "gold_ore": "金矿石常见于 y=-48 以下，建议深度挖掘",
             "coal_ore": "煤炭从地表到深处都有，可以换个方向探索",
             "copper_ore": "铜矿常见于 y=0 到 y=96",
@@ -258,7 +311,7 @@ class ActionCompiler:
             "lapis_ore": "青金石常见于 y=-64 到 y=30",
             "emerald_ore": "绿宝石只在山地生物群系生成",
         }
-        hint = hints.get(target, "可以换个方向探索，或先用 dig_tunnel 往地下挖")
+        hint = hints.get(target, "可以换个方向探索，或先用 descend 阶梯式下探")
         return CompileResult(
             ok=False,
             immediate=f"20 格内没发现 {target}。{hint}",
@@ -578,6 +631,59 @@ class ActionCompiler:
     def _do_jump(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         return CompileResult(plan=Plan(label="跳跃", steps=[Step("hop", 0, 0, 0)], steps_per_tick=1))
 
+    def _do_hunt(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
+        """猎杀动物：找最近的被动生物 → 走过去 → 连续攻击。
+
+        5 天日志里假人从没主动打过动物（attack 只在被打/点名僵尸时出现），
+        食物全靠"捡到什么吃什么"——不像真人。 hunt 让"饿了→打猎→生肉
+        →熔炉烤熟"成为一条完整的生存链。掉落物是掉在地上的 item 实体，
+        假人走过去会自动拾取（和真人一样）。
+        """
+        target_name = short_id(str(a.get("target", "") or "")).lower()
+        count = max(1, min(20, int(a.get("count", 6) or 6)))
+        hits = [e for e in self.world.scan_entities(actor, radius=24)
+                if e.passive and (e.name == target_name if target_name else True)]
+        if not hits:
+            want = target_name or "动物"
+            return CompileResult(
+                ok=False,
+                immediate=f"24 格内没有可猎取的{want}。动物多在草地/树林开阔处，"
+                          f"可以先 wander 换片区域再找。")
+        nearest = min(hits, key=lambda e: e.dist)
+        steps: list[Step] = []
+        if nearest.dist > self.ATTACK_REACH and nearest.pos is not None:
+            # 动物会动，走到它**扫描时**的位置附近即可；攻击步骤执行时
+            # 会现场再找同名目标。
+            steps.append(Step("walk_to", nearest.pos[0], nearest.pos[1], nearest.pos[2],
+                              async_op=self.use_real_dig))
+        steps += [Step("attack", 0, 0, 0, note=nearest.name, async_op=True)
+                  for _ in range(count)]
+        return CompileResult(
+            plan=Plan(label=f"猎杀{nearest.name}", steps=steps, steps_per_tick=1),
+            immediate=f"开始猎杀 {nearest.name}（距离 {nearest.dist:.0f} 格）")
+
+    def _do_sleep(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
+        """睡觉：走到附近的床边，挂机到天亮（由插件的 sleep 处理器看守）。
+
+        假人睡不了真觉（没有客户端、引擎的"睡觉"交互不可用），但行为上
+        可以一模一样：天黑→回床边→不动→天亮起床。5 天日志里 186 次幻翼
+        骚扰的根因就是"从不睡觉"——夜里窝在床边至少让"夜生活"消失。
+        """
+        beds = self._find_blocks(actor, "bed", 1, radius=16)
+        if not beds:
+            return CompileResult(
+                ok=False,
+                immediate="附近 16 格内没有床。先合成一张：需要 3 个羊毛（猎杀 sheep 掉落）"
+                          "+ 3 个木板，在**工作台**上合成；然后用 build_floor 放下，再 sleep。"
+                          "没时间准备的话，至少躲进有屋顶的地方过夜。")
+        bx, by, bz = beds[0]
+        steps = [Step("walk_to", bx, by, bz, async_op=self.use_real_dig),
+                 Step("sleep", 0, 0, 0, async_op=True, note=f"{bx},{by},{bz}")]
+        return CompileResult(
+            plan=Plan(label="睡觉到天亮", steps=steps, steps_per_tick=1),
+            immediate="走到床边过夜，天亮自动起床")
+
+
     def _do_stop(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         ctx["cancel_all"] = True
         return CompileResult(immediate="已停止所有动作")
@@ -895,18 +1001,68 @@ class ActionCompiler:
         return CompileResult(
             plan=Plan(label=f"付给 {player} {amount:g} 金币", steps=[step]))
 
+    def _do_offer_trade(self, actor: Any, a: dict[str, Any],
+                        ctx: dict[str, Any]) -> CompileResult:
+        """向玩家发起交易申请（弹窗接受/拒绝）。
+
+        编译期只做参数闸；在线/距离/背包/钱包检查在插件的步骤处理器里
+        （那里才有 actor 和经济桥）。申请发出后计划即结束——成败由对方
+        玩家的决定决定，和 tpa 一个模式；结果会作为事件喂回大脑。
+        """
+        player = str(a.get("player", "")).strip()
+        mode = str(a.get("mode", "")).strip().lower()
+        item = short_id(str(a.get("item", "")).strip())
+        try:
+            count = int(a.get("count", 1) or 1)
+        except (TypeError, ValueError):
+            count = 0
+        try:
+            price = round(float(a.get("price", 0) or 0), 2)
+        except (TypeError, ValueError):
+            price = 0.0
+        if not player:
+            return CompileResult(ok=False, immediate="offer_trade 需要 player")
+        if mode not in ("sell", "buy"):
+            return CompileResult(
+                ok=False, immediate="mode 必须是 sell（你出货收钱）或 buy（你出钱收货）")
+        if not item:
+            return CompileResult(ok=False, immediate="offer_trade 需要 item（英文代码名）")
+        count = max(1, min(64, count))
+        if price <= 0:
+            return CompileResult(ok=False, immediate="price 必须大于 0")
+        if self._goto_player is not None and self._goto_player(player) is None:
+            return CompileResult(ok=False, immediate=f"玩家 {player} 不在线")
+        spec = {"player": player, "mode": mode, "item": item,
+                "count": count, "price": price}
+        verb = "出售" if mode == "sell" else "收购"
+        step = Step("offer_trade", 0, 0, 0, note=json.dumps(spec, ensure_ascii=False))
+        return CompileResult(
+            plan=Plan(label=f"向 {player} 发起交易（{verb} {count}×{item}）",
+                      steps=[step]),
+            immediate=f"已向 {player} 发出交易申请，等对方决定")
+
     def _do_run_command(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         """以假人自己的玩家身份执行一条服务器命令。
 
         执行在插件侧的步骤处理器里做（那才有 server 和身体引用）。
         这里只做最便宜的闸：非空、去掉可能的斜杠前缀、长度限制。
         权限由服务器自己裁——假人不是 OP，能跑的命令和普通玩家一样。
+
+        gs 命令（枪战小游戏）在**编译期**就按服务器能力拦截：没装枪战
+        插件的服上，模型无论重试多少次都必然失败（实测一只假人 51 连败）。
+        在闸这里拒绝并告诉它"这服没有"，循环根本不会开始。
         """
         command = str(a.get("command", "")).strip().lstrip("/").strip()
         if not command:
             return CompileResult(ok=False, immediate="run_command 需要 command")
         if len(command) > 120:
             return CompileResult(ok=False, immediate="命令太长")
+        first = command.split()[0].lower() if command.split() else ""
+        if first == "gs" and not getattr(self, "shooter_available", True):
+            return CompileResult(
+                ok=False,
+                immediate="本服没有装枪战插件，gs 命令不可用。别再尝试了，"
+                          "去干点别的（挖矿/打猎/交易都行）。")
         step = Step("bot_command", 0, 0, 0, note=command[:120])
         return CompileResult(
             plan=Plan(label=f"执行命令 {command[:40]}", steps=[step]))

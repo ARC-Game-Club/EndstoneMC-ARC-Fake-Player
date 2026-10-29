@@ -104,9 +104,16 @@ SPEC: dict[str, dict[str, str]] = {
     "note_here":   {"label": "str"},
     "task_done":   {"summary": "str"},
 
+    # ---- 生存进阶（狩猎 / 下探 / 睡觉） ----
+    "hunt":        {"target": "str", "count": "int"},
+    "descend":     {"depth": "int"},
+    "sleep":       {},
+
             # ---- 社交与交易 ----
             "give_item":   {"player": "str", "item": "str", "count": "int"},
             "pay_money":   {"player": "str", "amount": "float"},
+            "offer_trade": {"player": "str", "mode": "str", "item": "str",
+                            "count": "int", "price": "float"},
             # ---- 服务器命令（参与小游戏等插件玩法） ----
             "run_command": {"command": "str"},
 }
@@ -127,8 +134,19 @@ ALLOWED_BLOCKS = {
     "cobblestone", "stone", "dirt", "grass_block", "sand", "stone_bricks",
     "glass", "torch", "oak_log", "log", "cobbled_deepslate", "deepslate",
     "sandstone", "bricks", "wool", "white_wool", "oak_fence", "oak_door",
-    "ladder", "scaffolding", "chest", "crafting_table", "furnace",
+    "ladder", "scaffolding", "chest", "crafting_table", "furnace", "bed",
 }
+
+#: 本服有没有枪战插件（arc_shooter_game）。插件启动时探测一次并写进来；
+#: 它决定两件事：run_command 的说明里要不要宣传 gs 命令、以及执行器
+#: 要不要直接拦下 gs 命令（防止在没装的服上 51 连败刷日志烧 token）。
+SHOOTER_AVAILABLE = True
+
+
+def set_shooter_available(value: bool) -> None:
+    global SHOOTER_AVAILABLE
+    SHOOTER_AVAILABLE = bool(value)
+
 
 _DIRECTIONS = {"north", "south", "east", "west", "up", "down"}
 
@@ -145,6 +163,24 @@ def _norm_block(value: str) -> str | None:
     if name not in ALLOWED_BLOCKS:
         return None
     return f"minecraft:{name}"
+
+
+#: 物品名里被模型顺手写进去的数量后缀："采集iron_ore×3" → item 写成了
+#: "iron_orex3/iron_ore×3"。5 天日志里这一种粘连失败 66 次（iron_orex3
+#: 独占 44 次），全是必败调用。这里把后缀剥出来，数量还能救回 count。
+_ITEM_COUNT_SUFFIX = re.compile(r"^(.{2,}?)[xX×](\d{1,2})$")
+
+#: 哪些动作的哪个参数是"物品/方块名"。剥后缀后若动作本来没有数量参数，
+#: 就把剥出来的数补进去——模型的意图本来就是"要 N 个"。
+_ITEM_ARG_AND_COUNT = {
+    "collect":   ("block", "count"),
+    "mine_vein": ("block", "max"),
+    "craft":     ("item", "count"),
+    "smelt":     ("item", "count"),
+    "store":     ("item", "count"),
+    "take":      ("item", "count"),
+    "give_item": ("item", "count"),
+}
 
 
 def clean_args(name: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -179,6 +215,17 @@ def clean_args(name: str, raw: dict[str, Any]) -> dict[str, Any]:
             if not text:
                 continue
             out[key] = text[:200]
+
+    # 物品名粘连修复：iron_orex3 → item=iron_ore, count=3（原 count 缺失时）
+    pair = _ITEM_ARG_AND_COUNT.get(name)
+    if pair is not None:
+        item_key, count_key = pair
+        item_value = str(out.get(item_key, ""))
+        m = _ITEM_COUNT_SUFFIX.match(item_value)
+        if m:
+            out[item_key] = m.group(1)
+            if count_key not in out:
+                out[count_key] = int(m.group(2))
 
     # 特殊语义校验
     if name in ("build_box", "build_wall", "build_floor", "place_line", "clear_area"):
@@ -247,6 +294,10 @@ def missing_required(name: str, args: dict[str, Any]) -> bool:
         "smelt": {"count"},
         "store": {"count"},
         "take": {"count"},
+        # 狩猎：target/count 都有缺省（打最近动物、默认攻击次数）。
+        "hunt": {"target", "count"},
+        # 阶梯下探：depth 缺省 8 层。
+        "descend": {"depth"},
     }
     skip = optional.get(name, set())
     for key in spec:
@@ -416,6 +467,14 @@ class LLMClient:
 
         I = {"type": "integer"}
         S = {"type": "string"}
+        gs_hint = (
+            "常用于参与服务器小游戏："
+            "gs quick=快速加入枪战游戏（没房自动建房随机地图模式，"
+            "有房立刻加入；进对局后身体会**自动战斗**——找最近敌人、"
+            "追击、视线内开枪，你负责走位决策之外的喊话和退出），"
+            "gs leave=离开枪战对局。"
+            if SHOOTER_AVAILABLE else
+            "**本服没有装枪战插件，gs 开头的命令不可用**，不要尝试。")
 
         return [
             # --- 移动 ---
@@ -530,12 +589,33 @@ class LLMClient:
             # --- 服务器命令（小游戏等） ---
             f("run_command",
               "以你自己的玩家身份执行一条服务器命令（不带斜杠）。"
-              "你只有普通玩家权限。常用于参与服务器小游戏："
-              "gs quick=快速加入枪战游戏（没房自动建房随机地图模式，"
-              "有房立刻加入；进对局后身体会**自动战斗**——找最近敌人、"
-              "追击、视线内开枪，你负责走位决策之外的喊话和退出），"
-              "gs leave=离开枪战对局。",
+              f"你只有普通玩家权限。{gs_hint}",
               {"command": S}, ["command"]),
+
+            # --- 生存进阶（狩猎 / 睡觉 / 交易） ---
+            f("hunt",
+              "猎杀附近的动物获取食物和材料（cow/pig/sheep/chicken/rabbit 等，"
+              "不填 target 就打最近的动物）。会自己走过去再动手；"
+              "掉落物走到附近自动捡。饿了就 hunt，生肉可以 smelt 熟。",
+              {"target": S, "count": I}, []),
+            f("sleep",
+              "天黑了就回家睡觉：附近有床会走过去一直睡到天亮；"
+              "没有床会提醒你先合成一张（3 羊毛+3 木板，要工作台）并放置。"
+              "睡到天亮前你不再行动。",
+              {}, []),
+            f("descend",
+              "阶梯式下探 depth 层（1-12）。比垂直下挖安全——垂直挖会摔死"
+              "也会被岩浆浇，真人从来不用。想下矿时用它代替 dig_tunnel down。",
+              {"depth": I}, ["depth"]),
+
+            # --- 社交与交易 ---
+            f("offer_trade",
+              "向身边的玩家发起交易申请（对方 8 格内）。mode=sell 表示"
+              "**你出售**：对方接受后你交付 item×count、收进 price 金币；"
+              "mode=buy 表示**你收购**：对方接受后把 item×count 丢给你、"
+              "你付 price 金币。对方会弹窗决定；要确保背包里真的有货/钱包够。",
+              {"player": S, "mode": S, "item": S, "count": I, "price": {"type": "number"}},
+              ["player", "mode", "item", "count", "price"]),
         ]
 
     # -- 调用 -------------------------------------------------------------

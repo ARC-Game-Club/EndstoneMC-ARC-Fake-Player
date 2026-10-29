@@ -773,7 +773,7 @@ def test_prompt_sections() -> None:
 def test_confmig() -> None:
     section("第六部分：confmig —— 老配置升级不丢用户改动")
 
-    check("CONFIG_VERSION 是 13", CONFIG_VERSION == 13, str(CONFIG_VERSION))
+    check("CONFIG_VERSION 是 14", CONFIG_VERSION == 14, str(CONFIG_VERSION))
     check("登记了 v1 的 persona 默认值",
           "prompt_persona" in confmig.LEGACY_DEFAULTS)
     check("登记的 v1 persona 与当前默认值一致（一字未改）",
@@ -784,8 +784,18 @@ def test_confmig() -> None:
           "prompt_rules" in confmig.LEGACY_DEFAULTS)
     check("登记了 v9 的 speech 默认值（v10 语气词多样化）",
           "prompt_speech" in confmig.LEGACY_DEFAULTS)
-    check("v6 rules 默认值与新默认前缀逐字一致（迁移凭据）",
-          _RULES.startswith(confmig.LEGACY_DEFAULTS["prompt_rules"][6]))
+    check("v6 rules 默认值已登记（前缀关系到 v14 重写为止）",
+          confmig.LEGACY_DEFAULTS["prompt_rules"].get(6) is not None)
+    check("v12/v13 的 rules 旧默认值已登记（现役老服所在版本档）",
+          confmig.LEGACY_DEFAULTS["prompt_rules"].get(12) is not None
+          and confmig.LEGACY_DEFAULTS["prompt_rules"].get(13) is not None)
+    check("v12/13 的 rules 旧文本没有 descend（旧文本未失真）",
+          "descend" not in confmig.LEGACY_DEFAULTS["prompt_rules"][13])
+    check("v12/13 的 game_knowledge 旧文本已登记且无床配方",
+          "床" not in confmig.LEGACY_DEFAULTS["prompt_game_knowledge"][13]
+          and "熔炼" not in confmig.LEGACY_DEFAULTS["prompt_game_knowledge"][13])
+    check("新 rules 明确禁止垂直挖矿并给出 descend",
+          "禁止 dig_tunnel 朝 up/down" in _RULES and "descend" in _RULES)
 
     # -- v11：禁端着自称 --
     # 老服手里那份 v10 speech 必须能被认成"用户没动过"，否则新规则送不到。

@@ -118,6 +118,9 @@ class EntityHit:
     #: 这是一个**玩家**（真人或别的假人）——感知里单独成行，
     #: 让模型知道"附近有谁"（聊天/交易/对枪都靠它）。
     player: bool = False
+    #: 实体的世界坐标（整数格）。hunt 之类的"走过去再动手"工具需要它；
+    #: 感知行不用（只报距离，省 token）。拿不到（实体已消失）为 None。
+    pos: tuple[int, int, int] | None = None
 
 
 @dataclass
@@ -140,6 +143,9 @@ class Snapshot:
     #: 必须把这个区分告诉模型：不然它会以为自己站在一片虚空里，
     #: 然后做出"往脚下猛挖"之类完全错误的决定。
     terrain_loaded: bool = True
+    #: 环境时间标签："白天"/"夜晚"/None（拿不到世界时间时不显示）。
+    #: 模型靠它决定天黑回家睡觉（Rules 第 7 条）。
+    daynight: str | None = None
 
     def __post_init__(self) -> None:
         self.blocks = self.blocks or []
@@ -156,7 +162,8 @@ class Snapshot:
         """
         x, y, z = self.pos
         bx, by, bz = int(x), int(y), int(z)
-        lines = [f"位置 ({bx},{by},{bz})  维度 {self.dimension}"]
+        env = f"  {self.daynight}" if self.daynight else ""
+        lines = [f"位置 ({bx},{by},{bz})  维度 {self.dimension}{env}"]
 
         status = []
         if self.health is not None:
@@ -246,10 +253,32 @@ class WorldAdapter:
         #: dimension.actors 拿不拿得到玩家因版本而异，玩家列表以
         #: server 为准；None 时感知里就没有"附近玩家"这一行。
         self._players_fn: Any = None
+        #: 世界时间注入点：() -> 当前 tick（0~24000 一天）。插件用
+        #: server.level.time 实现；None 时感知里没有昼夜标签。
+        self._time_fn: Any = None
 
     def bind_players(self, fn: Any) -> None:
         """注入"取在线玩家列表"的回调（返回可迭代的 Player）。"""
         self._players_fn = fn
+
+    def bind_time(self, fn: Any) -> None:
+        """注入"取世界时间 tick"的回调。"""
+        self._time_fn = fn
+
+    @staticmethod
+    def daynight_label(tick: int | None) -> str | None:
+        """世界 tick → "白天"/"夜晚"。
+
+        基岩版昼夜：0 是清晨，~12000 黄昏，12542 起可以睡觉，
+        23459 天亮。粗分成 夜晚 [12542, 23460)，其余白天。
+        """
+        if tick is None:
+            return None
+        try:
+            tick = int(tick) % 24000
+        except (TypeError, ValueError):
+            return None
+        return "夜晚" if 12542 <= tick < 23460 else "白天"
 
     # -- 方块读写 ---------------------------------------------------------
 
@@ -508,8 +537,15 @@ class WorldAdapter:
                 if d > radius:
                     continue
                 name = short_id(ent.type.id if hasattr(ent.type, "id") else str(ent.type))
+                try:
+                    epos = (int(math.floor(ent.location.x)),
+                            int(math.floor(ent.location.y)),
+                            int(math.floor(ent.location.z)))
+                except Exception:
+                    epos = None
                 out.append(EntityHit(name=name, dist=d,
-                                     hostile=name in HOSTILE, passive=name in PASSIVE))
+                                     hostile=name in HOSTILE, passive=name in PASSIVE,
+                                     pos=epos))
         except Exception as exc:
             self._logger.debug(f"scan_entities 失败: {exc}")
         # 玩家列表走 server（dimension.actors 是否包含玩家随版本漂移，
@@ -567,6 +603,12 @@ class WorldAdapter:
         if not blocks:
             loaded = self.is_chunk_loaded(
                 actor.dimension, int(loc.x), int(loc.y) - 1, int(loc.z))
+        tick = None
+        if self._time_fn is not None:
+            try:
+                tick = self._time_fn()
+            except Exception:
+                tick = None
         return Snapshot(
             pos=(loc.x, loc.y, loc.z),
             dimension=short_id(getattr(actor.dimension, "name", "overworld")),
@@ -579,6 +621,7 @@ class WorldAdapter:
             entities=self.scan_entities(actor),
             inventory=self.scan_inventory(actor),
             terrain_loaded=loaded,
+            daynight=self.daynight_label(tick),
         )
 
     # -- 移动 -------------------------------------------------------------

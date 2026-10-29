@@ -224,6 +224,25 @@ class CrowdScheduler:
     def target_count(self) -> int:
         return max(0, self._cfg_int("target_count", 3))
 
+    #: 夜间时段（本机小时）。真服务器的在线人数曲线凌晨会塌下去，
+    #: 24 小时恒定满员一眼假。这个时段里目标人数用 night_target_count。
+    NIGHT_HOURS = range(1, 8)
+
+    @property
+    def effective_target(self) -> int:
+        """当前时刻应该维持的在线人数：白天 target_count，凌晨用夜间档。
+
+        夜间档默认 1（`night_target_count`），0 = 凌晨不补新角色。
+        超出目标的人不会瞬间消失——靠游玩时长自然到期退场、退了不补，
+        曲线平滑过渡。
+        """
+        import datetime
+        want = self.target_count
+        night = max(0, self._cfg_int("night_target_count", 1))
+        if night < want and datetime.datetime.now().hour in self.NIGHT_HOURS:
+            return night
+        return want
+
     def _random_minutes(self, low_key: str, high_key: str,
                         default_low: int, default_high: int) -> float:
         low = self._cfg_int(low_key, default_low)
@@ -272,7 +291,7 @@ class CrowdScheduler:
 
         # 4) 补位：在线数 + 待上线数 < 目标 → 新增空位。
         #    启动期（从未有会话）直接到点就上，之后的新空位走正常间隔。
-        want = self.target_count
+        want = self.effective_target
         shortage = want - (len(self.sessions) + len(self.pending))
         for _ in range(max(0, shortage)):
             due = now if not self._bootstrapped else self._rejoin_due(now)

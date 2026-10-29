@@ -89,7 +89,9 @@ DEFAULT_SPEECH = """# 怎么说话
 
 DEFAULT_RULES = """1. **优先使用批量工具。** 这是你和普通脚本最大的区别：
    - 要挖一片区域 → 用 mine_area 一次给两个对角坐标，不要逐格 mine
-   - 要挖矿 → 用 dig_tunnel 或 mine_vein 一次挖一条隧道/一堆矿
+   - 要挖矿 → 用 dig_tunnel（水平方向）或 mine_vein 一次挖一条隧道/一堆矿
+   - 要下到地下 → 用 descend 阶梯式下探，**禁止 dig_tunnel 朝 up/down 挖**
+     （垂直挖会摔死、会被岩浆浇，真人从来不这么干）
    - 要收集材料 → 用 collect 说"要 16 个 log"，插件自己找自己挖
    - 要建造 → 用 build_box / build_wall / build_floor 一次给整个区域
    **每次调用最多 3 个工具。批量工具用好了，一次调用能干几分钟的活。**
@@ -101,15 +103,28 @@ DEFAULT_RULES = """1. **优先使用批量工具。** 这是你和普通脚本�
 
 4. 血量低于 8 或有敌对生物靠得很近 → 先 flee 或 attack，别继续干活。
 
-5. 饥饿/缺食物 → 用 attack 打 passive 里列出的动物，再 eat。
+5. 饥饿/缺食物 → 用 hunt 猎杀动物（牛猪羊鸡），掉落物走过去自动捡。
+   生肉能用 smelt 烤熟再吃——吃生肉可能中毒。没有熔炉就先合成一个
+   （8 圆石），没有燃料就把原木烧成木炭。
 
-6. 同一个动作连续两次报错就不要重复了，换个思路。
+6. 挖到铁矿/金矿/铜矿要 smelt 成锭才有用（做工具、护甲、盾牌都靠锭）。
+   熔炼要附近有熔炉+燃料（煤/木炭）。
 
-7. 目标达成或真的无计可施时调用 task_done，不要空转刷调用。
+7. 天黑了（观测里"环境"显示夜晚）→ 回家睡觉：附近有床就 sleep，
+   一觉睡到天亮；没有床就先做一张（3 羊毛+3 木板，在工作台上合成，
+   羊毛靠猎杀 sheep）用 build_floor 放下再睡。夜里别在外面晃。
 
-8. **说话要克制。** 大多数决策轮次你应该行动而不是说话：只在被点名/
-   被搭话、有真正值得分享的发现、被打、达成目标这类时刻才开口；
-   平时安静干活，不要每轮都在公屏上自言自语刷存在感。"""
+8. 同一个动作连续两次报错就不要重复了，换个思路（换地方、换活动、
+   换工具）。插件提示"这服没有 XX"就别再试。
+
+9. 攒了富余物资可以 offer_trade 找玩家做买卖：sell 是你出货换钱，
+   buy 是你出钱收货。要面对面的谈，价钱按东西的价值讲。
+
+10. 目标达成或真的无计可施时调用 task_done，不要空转刷调用。
+
+11. **说话要克制。** 大多数决策轮次你应该行动而不是说话：只在被点名/
+    被搭话、有真正值得分享的发现、被打、达成目标这类时刻才开口；
+    平时安静干活，不要每轮都在公屏上自言自语刷存在感。"""
 
 #: 这段是"感知被裁剪"的**必要说明**。
 #:
@@ -152,6 +167,17 @@ DEFAULT_GAME_KNOWLEDGE = """# 生存玩法速查
 - 木镐 = 3 木板顶行 + 2 木棍中列；木剑 = 2 木板 + 1 木棍；木斧 = 3 木板 + 2 木棍
 - 盾牌 = 1 铁锭 + 6 木板；打火石 = 铁锭 + 燧石
 - 面包 = 3 小麦横排；熔炉烧圆石→石头、烧沙→玻璃、烧原木→木炭
+- **床** = 3 羊毛 + 3 木板（要 3×3 工作台）。羊毛猎杀 sheep 掉落（1~3 个）。
+  有了床天黑才能睡；睡不着的话 Phantom（幻翼）会一直骚扰你。
+
+## 熔炼（要附近有熔炉 + 燃料：煤或木炭）
+- 铁矿石/粗铁 → 铁锭；金矿石/粗金 → 金锭；铜矿石/粗铜 → 铜锭
+- 圆石 → 石头；沙子 → 玻璃；原木 → 木炭（没煤时烧原木自制燃料）
+- 生牛肉→牛排、生猪排→熟猪排、生鸡肉→熟鸡肉（熟食回复高，生肉可能中毒）
+
+## 狩猎（hunt）
+- 牛=牛肉+皮革、猪=猪排、羊=羊毛+羊肉（mutton）、鸡=鸡肉+羽毛
+- 掉落物掉在地上，走过去自动捡；动物白天在草地/树林开阔处活动
 
 ## 食物（饥饿回复）
 - 牛排/熟猪排 8、兔肉煲 10、金胡萝卜 6（饱和度最高，可堆叠）、面包 5、苹果 4。
@@ -312,6 +338,14 @@ class AgentState:
     tool_calls_total: int = 0
     steps_executed: int = 0
     created_at: float = field(default_factory=time.monotonic)
+    #: 连续"只说话不动作"的轮数。≥2 时把下一次决策间隔拉长一档——
+    #: 5 天日志里 18% 的决策轮是"（没有返回动作）"，原样按间隔重试
+    #: 等于按频率给一个暂时没用的接口烧 token。
+    empty_turns: int = 0
+    #: 失败熔断计数：动作签名 → 最近失败时刻列表（monotonic）。
+    #: 同一签名 10 分钟内失败 3 次 → 注入"换个思路"的纠正 + 触发
+    #: 闲逛层的"走远点"反射（见 plugin._on_agent_stuck）。
+    fail_streaks: dict = field(default_factory=dict)
 
     @property
     def efficiency(self) -> float:
@@ -950,6 +984,15 @@ class Agent:
 
             if not reply.calls:
                 self._log("（没有返回动作）")
+                # 空转治理：连着空 → 把下一次决策间隔拉长一档（上限 30 分钟）。
+                # 5 天日志里 18% 的决策轮空转；按原频率重试等于给一个暂时
+                # 给不出动作的接口按频率烧 token。间隔在下一次 think 重掷，
+                # 所以这里拉长的只是一档，不是永久。
+                s.empty_turns += 1
+                if s.empty_turns >= 2 and self.config.decision_interval_max > 0:
+                    s.decision_gap = min(
+                        s.decision_gap * 2.0 if s.decision_gap else 300.0,
+                        1800.0)
                 # "只说不做"是最常见的卡住形态（接口忽略 tools 时尤甚）。
                 # 往历史里塞一条**纠正**，让下一轮把动作补上。刻意**不**在
                 # 这里加速重试：真发不出动作的接口往往同时在限流，提速只会
@@ -961,6 +1004,9 @@ class Agent:
                 if not (s.history and s.history[-1].get("content") == nudge):
                     s.history.append({"role": "system", "content": nudge})
                 return
+
+            # 有动作了：空转计数复位
+            s.empty_turns = 0
 
             ctx: dict[str, Any] = {}
             feedback: list[dict] = []
@@ -986,6 +1032,7 @@ class Agent:
                                      "msg": result.immediate[:80]})
                     if result.immediate and not result.ok:
                         self._log(f"⚠ {call.name}: {result.immediate}")
+                        self._note_failure(result.immediate)
 
             # 认知类副产物——**必须在循环外结算一次**。ctx 是整轮共享的：
             # 放在循环里，模型"先说一句话再调两个工具"时，同一条 say
@@ -1073,6 +1120,51 @@ class Agent:
             except Exception:
                 pass
 
+    # -- 失败熔断 ---------------------------------------------------------
+
+    #: 同一失败签名 10 分钟内出现 ≥3 次，就认定"卡在同一个坑里"。
+    _STREAK_WINDOW = 600.0
+    _STREAK_LIMIT = 3
+
+    @staticmethod
+    def _failure_sig(text: str) -> str:
+        """把一条失败文本归并成签名：去掉数字/坐标/物品名细节，
+        只留"动作+失败原因"的骨架（collect 没找到、goto 不可达…）。"""
+        import re as _re
+        skeleton = _re.sub(r"-?\d+", "N", str(text or ""))
+        skeleton = _re.sub(r"\s+", " ", skeleton).strip().lower()
+        return skeleton[:32]
+
+    def _note_failure(self, text: str) -> None:
+        """记一次失败。达到熔断阈值时往历史里塞纠正、并通知插件走开。
+
+        5 天日志的头号机器特征就是死循环：collect 没找到 oak_log 就
+        再 collect，gs quick 51 连败。纠正进历史（下一轮决策就能看到），
+        插件侧的 `_on_stuck` 钩子会让闲逛层把假人带离这片区域——
+        双管齐下打断循环。
+        """
+        now = time.monotonic()
+        sig = self._failure_sig(text)
+        times = [t for t in self.state.fail_streaks.get(sig, [])
+                 if now - t < self._STREAK_WINDOW]
+        times.append(now)
+        self.state.fail_streaks[sig] = times
+        if len(times) < self._STREAK_LIMIT:
+            return
+        # 到阈值：清零这个签名，注入一次纠正。
+        self.state.fail_streaks.pop(sig, None)
+        advice = (f"你在同一件事上已经连续失败 {len(times)} 次（{text[:60]}）。"
+                  "别再重复同样的动作了：换个地方（走远一点）、换个活动，"
+                  "或者干脆 task_done 换个目标。")
+        self.state.history.append({"role": "system", "content": advice})
+        self._log(f"🔁 连续失败熔断：{text[:50]}")
+        hook = getattr(self, "_on_stuck", None)
+        if callable(hook):
+            try:
+                hook(sig)
+            except Exception:
+                pass
+
     # -- 计划结算：在主循环里调用 -------------------------------------------
 
     def reap_finished(self, finished: list[Plan]) -> None:
@@ -1096,6 +1188,10 @@ class Agent:
             self._log(f"{mark} {detail}")
             if plan.skipped:
                 self.state.notes.append(f"{label} 有 {len(plan.skipped)} 处失败")
+            # 计划全军覆没（或败多成少）也算一次失败——运行期失败的
+            # 熔断入口（编译期失败的在 _note_failure，同一个计数器）。
+            if plan.fail_count > 0 and plan.done_count == 0:
+                self._note_failure(f"{label} 全部失败")
 
     def sweep_inflight(self) -> int:
         """把**已经不在执行器里**的计划从 `_inflight` 摘掉。返回摘掉了几个。
