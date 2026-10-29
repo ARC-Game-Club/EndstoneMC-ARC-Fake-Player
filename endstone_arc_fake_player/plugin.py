@@ -55,6 +55,7 @@ Endstone 的 Python API 造不出 SimulatedPlayer，那个接口只在
 
 import json
 import math
+import random
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -442,6 +443,9 @@ class ArcFakePlayerPlugin(Plugin):
         self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
         # 假人名 → 上次传送时刻（tp_warp/tp_spawn 共用 60 秒冷却）
         self._tp_cooldown: dict[str, float] = {}
+        # 待代同意的 tpa：(假人名, 发起者名) → 到点时刻（monotonic 基准）。
+        # _tpa_tick 每秒扫一轮弧光核心的待处理申请，到点就代为"点同意"。
+        self._tpa_pending: dict[tuple[str, str], float] = {}
 
         # 编译前先决定用哪种模式（真身体 / 直连）
         self._use_real_body = False
@@ -473,6 +477,9 @@ class ArcFakePlayerPlugin(Plugin):
         # 每 15 秒：护甲自穿——管理员 /give 的装备进背包后自动上身。
         # JS 侧对"已穿最好"是空操作，所以常开没有副作用。
         self._guard(self._equip_tick, "护甲自穿", delay=300, period=300)
+        # 每 1 秒：扫玩家发给假人的 tpa 申请，到随机延迟后代为"点同意"。
+        # 弧光核心不在或没开玩家互传时，这一秒就是空转，常开没有副作用。
+        self._guard(self._tpa_tick, "tpa自动同意", delay=40, period=20)
 
         self.logger.info(f"{C.GREEN}LLM 虚拟玩家插件已启用{C.RESET}")
         self.logger.info("配置模型：/ai set <base_url> <api_key> <model>")
@@ -797,6 +804,21 @@ class ArcFakePlayerPlugin(Plugin):
             # （QQ 群消息、核心面板一眼穿帮）。开着他就在进/退服时用
             # 合成 xuid 走核心同一套记账函数。
             "playtime_sync": True,
+            # ---- 玩家传送到假人（tpa 自动同意）----
+            # 真人玩家在弧光核心的传送菜单里向假人发 tpa（假人是
+            # SimulatedPlayer，本来就会出现在目标下拉框里），只是从来
+            # 没人点"同意"，申请只能干等到过期。开着这个开关，假人隔
+            # 几秒"像人一样"点同意——之后走核心的标准链路：按服务器
+            # 配置扣发起者的互传费用，45 秒倒计时后把玩家传到假人脚下。
+            # 注意这只影响"玩家→假人"方向；tphere（把假人拉到玩家那
+            # 里）不代同意，让它自然过期——假人的位置由常驻地逻辑管。
+            "tpa_auto_accept": {
+                "enabled": True,
+                # 检测到申请后隔多久"点同意"（秒，区间内随机）。
+                # 0 秒秒同意太机器；几秒的迟疑更像真人掏手机确认。
+                "accept_delay_min_seconds": 2.0,
+                "accept_delay_max_seconds": 6.0,
+            },
             # ---- 锚点闲逛（日常生活）----
             # 开着时，闲着的 AI 会在常驻地（家 > 领地 > 公共传送点）附近
             # 随机找兴趣点走动，偶尔挖一块方块；离常驻地远了会分段走回去
@@ -5758,6 +5780,103 @@ class ArcFakePlayerPlugin(Plugin):
             sender.send_message(f"{C.GREEN}已传送{C.RESET}")
         except Exception as exc:
             sender.send_message(f"{C.RED}失败: {exc}{C.RESET}")
+
+    # ---- 玩家 → 假人 tpa 自动同意 ----
+
+    def _tpa_tick(self) -> None:
+        """每秒扫一轮：真人发给假人的 tpa 申请，到点代为"点同意"。
+
+        流程是弧光核心的标准 tpa 链路：玩家在核心传送菜单里选假人发
+        申请 → 这里隔几秒（像真人确认一样）调核心的 accept → 核心按
+        服务器配置扣发起者的互传费用 → 45 秒倒计时后把玩家传过去。
+        假人自己不会"看到"表单，所以同意动作由本插件代做。
+
+        ⚠ 全程只动核心的公开 API 和名字字符串，不缓存任何实体句柄
+        （见 _MobTarget 的注释——句柄只能当场用完就丢）。
+        """
+        cfg = self._cfg.get("tpa_auto_accept") or {}
+        if not cfg.get("enabled", True):
+            self._tpa_pending.clear()
+            return
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return
+        if (core is None
+                or not callable(getattr(core, "accept_teleport_request", None))
+                or not callable(getattr(core, "get_pending_requests_for_player", None))):
+            return
+        now = time.monotonic()
+        for bot_name in list(self._agents):
+            bot = self._live_actor(bot_name)
+            if bot is None:
+                continue
+            try:
+                reqs = core.get_pending_requests_for_player(bot) or []
+            except Exception:
+                continue
+            for req in reqs:
+                # 只代同意 tpa（玩家过来）；tphere 是"把假人拉走"，
+                # 位置归常驻地逻辑管，不代同意，让它自然过期。
+                if str(req.get("type") or "") != "tpa":
+                    continue
+                sender_name = str(req.get("sender") or "").strip()
+                if not sender_name:
+                    continue
+                # 发起者必须是**在线真人**（有 xuid）才值得排程。没有
+                # xuid 的"玩家"是假人/合成对象——替它们同意没有意义。
+                # 到点接受时还会复核一次（等待期间状态可能变）。
+                try:
+                    sender = self.server.get_player(sender_name)
+                except Exception:
+                    continue
+                if sender is None or not str(
+                        getattr(sender, "xuid", "") or "").strip():
+                    continue
+                key = (bot_name, sender_name)
+                if key in self._tpa_pending:
+                    continue
+                lo = max(0.0, float(cfg.get("accept_delay_min_seconds", 2.0)))
+                hi = max(lo, float(cfg.get("accept_delay_max_seconds", 6.0)))
+                self._tpa_pending[key] = now + random.uniform(lo, hi)
+        for key, accept_at in list(self._tpa_pending.items()):
+            if now < accept_at:
+                continue
+            self._tpa_pending.pop(key, None)
+            self._tpa_accept(key[0], key[1])
+
+    def _tpa_accept(self, bot_name: str, sender_name: str) -> None:
+        """到点真的去点同意。每一步都可能"情况变了"，所以逐条确认。"""
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return
+        if core is None:
+            return
+        # 发起者必须还是在线真人（有 xuid）。没有 xuid 的"玩家"
+        # 不是假人就是合成对象——替它们同意没有意义，还有风险。
+        try:
+            sender = self.server.get_player(sender_name)
+        except Exception:
+            return
+        if sender is None or not str(getattr(sender, "xuid", "") or "").strip():
+            return
+        bot = self._live_actor(bot_name)
+        if bot is None:
+            return
+        # 等待的几秒里申请可能已被拒/过期——还在才点。
+        try:
+            reqs = core.get_pending_requests_for_player(bot) or []
+        except Exception:
+            return
+        if not any(str(r.get("sender") or "").strip() == sender_name
+                   and str(r.get("type") or "") == "tpa" for r in reqs):
+            return
+        try:
+            core.accept_teleport_request(bot)
+            self._record("admin", f"{sender_name} 申请传送到 {bot_name} 身边，已代为同意", who=bot_name)
+        except Exception as exc:
+            self.logger.debug(f"代同意 tpa 失败（{bot_name} <- {sender_name}）: {exc}")
 
     # ------------------------------------------------------------------
     # 输出辅助

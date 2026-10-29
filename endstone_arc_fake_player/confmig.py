@@ -51,7 +51,8 @@ from typing import Any, Callable
 #:   10 → 语气词多样化：prompt_speech 改写——语气词跟性格走、冷角色可不用
 #:   11 → 自称规范：prompt_speech 增加禁用"本教授/本高手"类自称条款
 #:  12 → 搭话概率：chat_reply_chance 全局默认 0.15 → 0.5（公屏太冷清）
-CONFIG_VERSION = 12
+#:  13 → 玩家传送到假人：tpa_auto_accept（真人向假人发 tpa，假人隔几秒代同意）
+CONFIG_VERSION = 13
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:
