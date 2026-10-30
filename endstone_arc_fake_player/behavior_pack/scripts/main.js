@@ -72,6 +72,7 @@ import {
     findNearestEnemy,
     fireSimShot,
     watchRespawn,
+    isAlive,
 } from "./arena_combat.js";
 
 // ---------------------------------------------------------------------------
@@ -1657,6 +1658,9 @@ function pumpArena() {
         if (now > st.until) { arenaModes.delete(name); continue; }
         const sim = sims.get(name);
         if (!sim || !sim.isValid) { arenaModes.delete(name); continue; }
+        // 自己已经倒了就先停火，等重生回来再继续打。
+        // 不检查的话会一直对着尸体扣扳机，日志被"实际扣血 0.0"刷爆。
+        if (!isAlive(sim)) continue;
 
         // 最近的在线敌人。真人从 world.getAllPlayers() 拿，假人从 sims 表拿
         // ——脚本 API 里假人是 undefined，光靠 getAllPlayers() 永远找不到

@@ -89,6 +89,18 @@ const lastPositions = new Map();
 /** 上一次广播 simhit 的时间，避免刷屏。 */
 let lastSimHitLog = 0;
 
+/** 射击日志限流：key = "射手|目标"，同一对每 N 毫秒最多记一条。 */
+const shotLogAt = new Map();
+const SHOT_LOG_INTERVAL_MS = 2000;
+
+function logShotThrottled(key, message) {
+    const now = Date.now();
+    const last = shotLogAt.get(key) || 0;
+    if (now - last < SHOT_LOG_INTERVAL_MS) return;
+    shotLogAt.set(key, now);
+    console.log(message);
+}
+
 export function initArenaCombat(sims) {
     if (sims) simsRef = sims;
 }
@@ -100,13 +112,12 @@ export function rememberSpawnPoint(name, sim, loc) {
     lastPositions.set(name, null);
     try {
         if (typeof sim.setSpawnPoint === "function") {
-            // 新版签名要带 dimension，老的只要坐标。先带 dimension，
-            // 抛了就退回只给坐标。
-            try {
-                sim.setSpawnPoint({ x: point.x, y: point.y, z: point.z }, sim.dimension);
-            } catch (_) {
-                sim.setSpawnPoint({ x: point.x, y: point.y, z: point.z });
-            }
+            // ⚠️ 假人的 `sim.dimension` 是 **undefined**（脚本 API 对 SimulatedPlayer
+            // 不暴露 dimension），所以必须自己拿维度对象，否则
+            // setSpawnPoint 会报 "Interface property ['dimension'] expected type: Dimension"
+            // 而**静默失败**——假人死后就会被丢到随机位置。
+            const dim = safe(() => world.getDimension("overworld"));
+            sim.setSpawnPoint({ x: point.x, y: point.y, z: point.z }, dim);
         }
     } catch (e) {
         console.warn(`${TAG} 设置 ${name} 的重生点失败: ${e}`);
@@ -293,6 +304,7 @@ export function findNearestEnemy(sim, enemies, sims) {
         for (const p of world.getAllPlayers()) {
             if (!p) continue;
             if (!want.has(p.name)) continue;
+            if (!isAlive(p)) continue;          // 已经倒下的不用再打
             const d = dist(p.location, sim.location);
             if (d < bestD) {
                 bestD = d;
@@ -306,6 +318,7 @@ export function findNearestEnemy(sim, enemies, sims) {
             if (!other || name === sim.name) continue;
             if (other.isValid === false) continue;
             if (!want.has(name)) continue;
+            if (!isAlive(other)) continue;      // 同上
             const d = dist(other.location, sim.location);
             if (d < bestD) {
                 bestD = d;
@@ -321,6 +334,14 @@ export function findNearestEnemy(sim, enemies, sims) {
 // 开火
 // ---------------------------------------------------------------------------
 
+/** 实体是不是还活着（血量 > 0）。 */
+export function isAlive(entity) {
+    if (!entity) return false;
+    const hp = safe(() => entity.getComponent("minecraft:health")?.currentValue);
+    if (hp === undefined) return true;      // 拿不到血量就不拦
+    return Number(hp) > 0;
+}
+
 /**
  * 假人开一枪。
  *
@@ -329,6 +350,11 @@ export function findNearestEnemy(sim, enemies, sims) {
  */
 export function fireSimShot(sim, target, targetName) {
     if (!sim || !target) return { ok: false, err: "没有目标" };
+
+    // 射手自己已经倒了就别再扣扳机（死了还在开火会刷一屏"实际扣血 0.0"）
+    if (!isAlive(sim)) return { ok: false, err: "射手已阵亡" };
+    // 目标已经倒了同样不用打
+    if (!isAlive(target)) return { ok: false, err: "目标已阵亡" };
 
     const gunId = heldGunId(sim);
     if (!gunId) return { ok: false, err: "手里没枪" };
@@ -369,9 +395,120 @@ export function fireSimShot(sim, target, targetName) {
 
     if (ammo !== undefined) writeAmmo(sim.name, gunKey, ammo - 1);
 
-    console.log(`${TAG} 假人 ${sim.name} 用 ${gunId} 射击 ${targetName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`);
+    logShotThrottled(
+        `${sim.name}|${targetName}`,
+        `${TAG} 假人 ${sim.name} 用 ${gunId} 射击 ${targetName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+    );
 
     return { ok: true, dmg, dealt, zone, gunId };
+}
+
+// ---------------------------------------------------------------------------
+// 真人开枪 → 命中假人（几何判定）
+// ---------------------------------------------------------------------------
+//
+// 为什么必须自己算
+// --------------
+// 枪械包的射线用的是 `dimension.getEntitiesFromRay()`，而在本机 BDS 1.26.52.3 上，
+// 假人在实体列表里是 **null**（`getEntities({types:["minecraft:player"]})` 返回
+// 全是 UNDEF 的数组）。也就是说**射线永远打不到假人**——枪械包那边再怎么改
+// 都不会有伤害。
+//
+// 但"开了几枪、枪口朝哪"只有枪械包知道（射速、散布都在它那边），所以它每开一枪
+// 广播一次 `arc_gun:shot`，这边用几何判定（射线到假人身体的距离）补上伤害。
+// 只补**假人**目标，真人目标由枪械包自己结算，不会双倍伤害。
+
+/**
+ * 射线是否穿过假人的身体。
+ *
+ * 用「竖直圆柱」求交，不是「到身体中心的点距」——后者在真人平视射击时
+ * 会因为眼睛比身体中心高 0.7 格而判定为没打中。
+ *
+ * 返回命中点的垂直比例（0=脚 1=头），没中返回 -1。
+ */
+function rayHitSim(origin, dir, sim) {
+    let feet;
+    try {
+        feet = sim.location;
+    } catch (_) {
+        return -1;
+    }
+    const ox = origin.x, oz = origin.z;
+    const dx = dir.x, dz = dir.z;
+    const px = feet.x - ox, pz = feet.z - oz;
+    const horizLen2 = dx * dx + dz * dz;
+
+    let t;
+    if (horizLen2 < 1e-6) {
+        t = 0;                       // 几乎垂直射击：取正下方
+    } else {
+        t = (px * dx + pz * dz) / horizLen2;
+    }
+    if (t < 0.2 || t > MAX_RANGE) return -1;   // 0.2 格内算枪口自己，不算命中
+
+    const hx = ox + dx * t;
+    const hz = oz + dz * t;
+    const dH = Math.hypot(feet.x - hx, feet.z - hz);
+    if (dH > 0.45) return -1;        // 没擦到身体（玩家碰撞半径 ~0.3，留点余量）
+
+    const hitY = origin.y + dir.y * t;
+    if (hitY < feet.y - 0.2 || hitY > feet.y + 1.9) return -1;
+    return Math.max(0, Math.min(1, (hitY - feet.y) / 1.8));
+}
+
+/**
+ * 处理枪械包广播来的"开了一枪"：把命中的假人打掉血。
+ * 返回被命中的假人名字（没命中返回 null）。
+ */
+export function handleShotEvent(data) {
+    if (!data) return null;
+    const dir = normalized({ x: Number(data.dx) || 0, y: Number(data.dy) || 0, z: Number(data.dz) || 0 });
+    const origin = { x: Number(data.x) || 0, y: Number(data.y) || 0, z: Number(data.z) || 0 };
+    const gunId = String(data.gun || "");
+    const shooterName = String(data.by || "");
+    if (!gunId) return null;
+
+    // 射手：真人从 getAllPlayers 找，假人从 sims 表找
+    let shooter;
+    try {
+        for (const p of world.getAllPlayers()) {
+            if (p && p.name === shooterName) {
+                shooter = p;
+                break;
+            }
+        }
+    } catch (_) { /* ignore */ }
+    if (!shooter && shooterName) shooter = simsRef.get(shooterName) || undefined;
+
+    const base = SIM_GUN_DAMAGE[gunId] !== undefined ? SIM_GUN_DAMAGE[gunId] : DEFAULT_DAMAGE;
+
+    let hitName = null;
+    let hitSim = null;
+    let hitRatio = -1;
+    for (const [name, sim] of simsRef) {
+        if (!sim || sim.isValid === false) continue;
+        if (name === shooterName) continue;    // 别打到自己
+        if (!isAlive(sim)) continue;
+        const ratio = rayHitSim(origin, dir, sim);
+        if (ratio < 0) continue;
+        if (hitRatio < 0 || ratio > 0) {      // 取更靠前/更高的那个
+            hitRatio = ratio;
+            hitName = name;
+            hitSim = sim;
+        }
+    }
+    if (!hitSim) return null;
+
+    const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
+    const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;
+    const dmg = base * mult;
+    const dealt = applyDamage(hitSim, dmg, shooter);
+
+    logShotThrottled(
+        `${shooterName}|${hitName}`,
+        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+    );
+    return hitName;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +582,18 @@ function findSimNear(point, radius = 3.0) {
 // 绝不能再把整个行为包带走**（假人开火、复活监控都在这个文件里）。
 try {
     system.afterEvents.scriptEventReceive.subscribe((event) => {
-    if (!event || event.id !== "arc_gun:simhit") return;
+    if (!event) return;
+
+    // 枪械包每开一枪广播一次 → 这里给命中的假人补伤害
+    // （枪械包的射线看不见假人，只能靠几何判定）。
+    if (event.id === "arc_gun:shot") {
+        try {
+            handleShotEvent(JSON.parse(event.message || "{}"));
+        } catch (_) { /* ignore */ }
+        return;
+    }
+
+    if (event.id !== "arc_gun:simhit") return;
     let data;
     try {
         data = JSON.parse(event.message || "{}");
@@ -483,5 +631,5 @@ try {
     }
     });
 } catch (e) {
-    console.warn(`${TAG} arc_gun:simhit 订阅失败（真人打假人的补刀将不可用）：${e}`);
+    console.warn(`${TAG} 枪械包事件订阅失败（真人打假人的补刀将不可用）：${e}`);
 }
