@@ -33,8 +33,8 @@ class PluginFixTests(unittest.TestCase):
             self.assertEqual(legacy.read_bytes(), plugin._config_path.read_bytes())
             plugin._config_path.write_text('{"model": "new"}', encoding="utf-8")
             plugin._migrate_legacy_config()
-            self.assertEqual(json.loads(plugin._config_path.read_text())["model"], "new")
-            self.assertEqual(json.loads(legacy.read_text())["model"], "old")
+            self.assertEqual(json.loads(plugin._config_path.read_text("utf-8"))["model"], "new")
+            self.assertEqual(json.loads(legacy.read_text("utf-8"))["model"], "old")
 
     def test_config_migration_uses_pristine_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -56,7 +56,7 @@ class PluginFixTests(unittest.TestCase):
             cfg["config_version"] = 1
             plugin._config_path.write_text(json.dumps(cfg), encoding="utf-8")
             plugin._load_config()
-            self.assertEqual(json.loads(plugin._config_path.read_text())["config_version"], confmig.CONFIG_VERSION)
+            self.assertEqual(json.loads(plugin._config_path.read_text("utf-8"))["config_version"], confmig.CONFIG_VERSION)
 
     def test_chat_requires_name_boundary(self):
         plugin = ArcFakePlayerPlugin()

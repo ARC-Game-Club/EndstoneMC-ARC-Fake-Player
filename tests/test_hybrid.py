@@ -509,13 +509,13 @@ def test_packing() -> None:
             json.dumps(existing), encoding="utf-8")
         ok, msg3 = packing.register_pack(world, logger=log)
         check("注册成功", ok is True, msg3)
-        data = json.loads((world / "world_behavior_packs.json").read_text())
+        data = json.loads((world / "world_behavior_packs.json").read_text("utf-8"))
         check("别人的包还在", any(e["pack_id"] == "someone-else-uuid" for e in data))
         check("我们的包已加入", any(e["pack_id"] == packing.PACK_UUID for e in data))
 
         # 再来一次不重复
         packing.register_pack(world, logger=log)
-        data2 = json.loads((world / "world_behavior_packs.json").read_text())
+        data2 = json.loads((world / "world_behavior_packs.json").read_text("utf-8"))
         check("重复注册不产生重复条目", len(data2) == 2, f"{len(data2)} 条")
 
         # 损坏的 json 不能被覆盖
@@ -562,10 +562,10 @@ def test_packing() -> None:
             #
             # 这条守的是"别抹掉服主自己的改动"（比如他加了调试输出）。
             # 判据不是"内容不同就覆盖"，而是"和**上次发布时**比有没有变"。
-            (target / "scripts" / "main.js").write_text("// 用户手动改过")
+            (target / "scripts" / "main.js").write_text("// 用户手动改过", encoding="utf-8")
             ok5, msg7 = packing.extract_pack(src, target, logger=log)
             check("用户改过的文件被保留",
-                  (target / "scripts" / "main.js").read_text() == "// 用户手动改过",
+                  (target / "scripts" / "main.js").read_text("utf-8") == "// 用户手动改过",
                   msg7)
             check("保留时消息里点名了那个文件", "保留" in msg7, msg7)
 
@@ -577,7 +577,7 @@ def test_packing() -> None:
             fresh = tmp_path / "target2"
             packing.extract_pack(src, fresh, logger=log)
             # 模拟"我们上次发布的是旧内容"
-            (fresh / "scripts" / "main.js").write_text("// 插件 v1 的旧脚本")
+            (fresh / "scripts" / "main.js").write_text("// 插件 v1 的旧脚本", encoding="utf-8")
             # 同步记账，让插件认为这个旧内容就是它发布的
             rel_fp = packing._read_release(fresh)
             import hashlib as _h
