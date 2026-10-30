@@ -169,6 +169,23 @@ afterEvents.playerSpawn → e.player 是 undefined
   `setSpawnPoint` 记下出生点，并每秒盯着位置突变，把"谁在哪儿重生了"打进日志。
 
 新增文件：`endstone_arc_fake_player/behavior_pack/scripts/arena_combat.js`
+## 3.9.19：说话清洗——堵住 JSON 残渣露馅
+
+用户抓到假人公屏输出 `<message/>`、`}` 之类的结构残渣：JSON 兜底模式下
+模型偶尔把整个 `{"reply":"…","actions":[…]}` 或 XML 风格标签塞进 say 的
+message 参数，原样上屏一眼假。
+
+- 新增 `_sanitize_speech`，在 `_broadcast`（假人说话唯一出口，游戏内
+  +QQ 同步都走这）进门先洗：剥结构标签 → 整段像 JSON/字典就解析掏
+  reply/message 正文 → 两端悬空的 `{}[]"',:` 逐个剥掉。
+- 剥完为空（整条都是残渣）直接丢弃并记活动日志。
+- 正常聊天不受影响：中间的括号（`{哈哈}`）、非标签尖括号（`x<y`）、
+  句末标点全保留。
+- 顺带修 clean_args 的一个衍生露馅：模型把 message 参数写成字典时
+  `str(dict)` 产生 `{'message': 'hi'}`——ast 兜底解析同样掏正文。
+
+测试 1213 项全绿（本条基于 3.9.18 之后）（新增清洗用例 2 项 15 断言）。
+
 
 ## 3.9.17：行为真人化大版本（配置 v14）
 

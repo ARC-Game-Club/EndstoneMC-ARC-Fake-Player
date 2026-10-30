@@ -21,7 +21,9 @@ _install_stub()
 from endstone_arc_fake_player.actions import ActionCompiler  # noqa: E402
 from endstone_arc_fake_player.agent import Agent, AgentConfig  # noqa: E402
 from endstone_arc_fake_player.llm import LLMReply, ToolCall  # noqa: E402
-from endstone_arc_fake_player.plugin import ArcFakePlayerPlugin  # noqa: E402
+from endstone_arc_fake_player.plugin import (  # noqa: E402
+    ArcFakePlayerPlugin, _sanitize_speech,
+)
 from endstone_arc_fake_player.roam import RoamDriver  # noqa: E402
 from endstone_arc_fake_player.world import WorldAdapter  # noqa: E402
 
@@ -341,10 +343,37 @@ class HumanlikeTests(unittest.TestCase):
             datetime.datetime = real_now
         self.assertEqual(sched.effective_target, 5 if real_hour not in CrowdScheduler.NIGHT_HOURS else 1)
 
+    # ---- 说话清洗（JSON 兜底残渣） ----------------------------------
 
-def time_monotonic():
-    import time
-    return time.monotonic()
+    def test_sanitize_strips_structural_leftovers(self):
+        cases = [
+            # 整个 JSON 动作塞进了 message
+            ('{"reply":"你好","actions":[]}', "你好"),
+            ('{"name":"say","args":{"message":"挖到钻石了"}}', "挖到钻石了"),
+            ('[{"reply":"排队"}]', "排队"),
+            # XML 风格标签
+            ("<message>你好</message>", "你好"),
+            ("你好<message/>", "你好"),
+            ("挖完了<message/>好累", "挖完了 好累"),
+            # Python 字典字符串（clean_args 把 dict str() 化的产物）
+            ("{'message': '来了'}", "来了"),
+            # 两端悬空的残渣
+            ('你好"}', "你好"),
+            ('{"草', "草"),
+            ("来了\",", "来了"),
+            ('"reply": "今晚下矿"', "今晚下矿"),
+            # 正常话不受影响
+            ("这波我的！", "这波我的！"),
+            ("风水轮流转{哈哈}继续", "风水轮流转{哈哈}继续"),  # 中间括号保留
+            ("x<y不大于", "x<y不大于"),  # 非标签的尖括号保留
+        ]
+        for raw, want in cases:
+            got = _sanitize_speech(raw)
+            self.assertEqual(got, want, f"输入 {raw!r} 期望 {want!r} 实得 {got!r}")
+
+    def test_sanitize_drops_pure_leftovers(self):
+        for raw in ("<message/>", "{}", '""', "", "   "):
+            self.assertEqual(_sanitize_speech(raw), "", raw)
 
 
 def main():

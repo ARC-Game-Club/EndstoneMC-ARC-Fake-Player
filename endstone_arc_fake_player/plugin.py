@@ -138,6 +138,78 @@ _SENTENCE_END_MARKS = "！？!?…。"
 _PAUSE_MARKS = "，,、；;：\n"
 _SPEECH_MAX_FRAGMENTS = 4
 
+#: 说话清洗：把模型漏进 say 参数里的**结构残渣**剥掉。
+#:
+#: 露馅场景（实测日志抓到的）：JSON 兜底模式下模型把整个
+#: ``{"reply":"你好","actions":[...]}`` 塞进了 message 参数；或者写成了
+#: XML 风格 ``<message>你好</message>`` / 残留一个孤零零的 ``}``。
+#: 这些打到公屏一眼假。清洗顺序：
+#:   1. 剥结构标签（<message> </say> 之类短标签）
+#:   2. 整段像 JSON/字典 → 解析后取 reply/message/text/content 里的正文
+#:   3. 两端悬空的 ``{ } [ ] " ' , :`` 逐个剥掉
+#: 剥完为空 → 丢掉这条（说明整条都是残渣）。
+_TAG_RE = re.compile(r"</?[A-Za-z_][A-Za-z0-9_]{0,15}\s*/?>")
+_SPEECH_KEYS = ("reply", "message", "text", "content", "say")
+
+
+def _extract_speech_value(obj) -> str:
+    """从解析出的 JSON 对象里掏出"要说的话"。"""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, list):
+        for item in obj:
+            inner = _extract_speech_value(item)
+            if inner:
+                return inner
+        return ""
+    if isinstance(obj, dict):
+        for key in _SPEECH_KEYS:
+            v = obj.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+        args = obj.get("args")
+        if isinstance(args, dict):
+            for key in _SPEECH_KEYS:
+                v = args.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v
+    return ""
+
+
+def _sanitize_speech(message: str) -> str:
+    """清洗一句话：剥标签 → 认 JSON → 剥两端残渣。空串表示整条丢弃。"""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    # 1) 结构标签（<message> </message> <message/> <say> …）
+    text = _TAG_RE.sub(" ", text).strip()
+    # 2) 整段是 JSON / Python 字典串：掏正文
+    if text[:1] in "{[" :
+        import ast
+        import json as _json
+        for attempt in (text, text.replace("'", '"')):
+            try:
+                parsed = _json.loads(attempt)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(attempt)
+                except Exception:
+                    continue
+            inner = _extract_speech_value(parsed)
+            if inner:
+                text = inner.strip()
+                break
+    # "reply": "你好" 这种键值残段
+    if text.lstrip('"\'')[:6].lower().startswith(("reply", "messag")):
+        m = re.match(r'^["\']?(?:reply|message)["\']?\s*[:：]\s*["\'](.+?)["\']?$',
+                     text.strip(), re.S)
+        if m:
+            text = m.group(1)
+    # 3) 两端悬空的结构符（"你好}"、'{"草'、'来了",'）
+    while text and (text[0] in '{}[]"\',:' or text[-1] in '{}[]"\',:'):
+        text = text.strip("{}[]\"\',: ").strip()
+    return re.sub(r"\s{2,}", " ", text).strip()
+
 
 def _split_speech(message: str) -> list[str]:
     """把一句（段）话按标点拆成若干条聊天消息。无标点返回单元素。"""
@@ -6420,8 +6492,16 @@ class ArcFakePlayerPlugin(Plugin):
 
         真人聊天是一句一句发的；模型一口气憋出的"这波我的！跟上"
         拆成两条、中间隔一个打字耗时，观感立刻就不一样。
+
+        进门先过 `_sanitize_speech`：模型偶尔把 JSON 兜底的结构
+        （{"reply":…} / <message>…）整个塞进 message 参数，不剥就
+        上公屏露馅。剥完为空说明整条都是残渣，直接丢弃。
         """
-        frags = _split_speech(message)
+        text = _sanitize_speech(message)
+        if not text:
+            self._record("chat", f"丢弃结构残渣发言：{str(message)[:60]}", who=name)
+            return
+        frags = _split_speech(text)
         if not frags:
             return
         self._send_chat(name, frags[0])
