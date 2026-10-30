@@ -436,7 +436,15 @@ function findSimNear(point, radius = 3.0) {
     return best;
 }
 
-world.afterEvents.scriptEventReceive.subscribe((event) => {
+// ⚠️ scriptEventReceive 是 **system 级**事件，不是 world 级。
+// 写成 `world.afterEvents.scriptEventReceive` 会拿到 undefined，
+// 模块顶层一抛错 → 整个 main.js 加载失败 → 行为包没有心跳 →
+// 插件判定"行为包未连接" → 所有假人都上不了线（2026-10-30 实踩）。
+//
+// 所以这里整段包 try/catch：**这个订阅挂了最多是"真人打假人没补刀"，
+// 绝不能再把整个行为包带走**（假人开火、复活监控都在这个文件里）。
+try {
+    system.afterEvents.scriptEventReceive.subscribe((event) => {
     if (!event || event.id !== "arc_gun:simhit") return;
     let data;
     try {
@@ -473,4 +481,7 @@ world.afterEvents.scriptEventReceive.subscribe((event) => {
         lastSimHitLog = now;
         console.log(`${TAG} 真人 ${data.by} 命中假人 ${hit.name}：伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`);
     }
-});
+    });
+} catch (e) {
+    console.warn(`${TAG} arc_gun:simhit 订阅失败（真人打假人的补刀将不可用）：${e}`);
+}
