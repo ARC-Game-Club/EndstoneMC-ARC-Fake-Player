@@ -544,6 +544,47 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 种地 farm（v3.9.35） ------------------------------------------
+
+    def _farm_compiler(self, inv, ground="grass_block"):
+        dim = FakeDimension()
+        for x in range(-3, 4):
+            for z in range(-3, 4):
+                dim.blocks[(x, 63, z)] = f"minecraft:{ground}"
+        compiler = make_compiler(dim)
+        actor = FakeActor(dim, 0, 64, 0)      # 脚下 y63 是地面
+        compiler.world.scan_inventory = Mock(return_value=list(inv))
+        return compiler, actor
+
+    def test_farm_till_then_plant(self):
+        compiler, actor = self._farm_compiler([("wooden_hoe", 1),
+                                               ("wheat_seeds", 30)])
+        r = compiler.compile(actor, ToolCall("farm", {"size": 2}), {})
+        self.assertIsNotNone(r.plan, r.immediate)
+        ops = [s.op for s in r.plan.steps]
+        self.assertEqual(ops.count("till"), 25)       # 5x5=25 格
+        self.assertEqual(ops.count("plant"), 25)
+        self.assertEqual(ops.index("plant"), ops.index("till") + 25)  # 先耕后种
+
+    def test_farm_rejected_without_hoe(self):
+        compiler, actor = self._farm_compiler([("wheat_seeds", 30)])
+        r = compiler.compile(actor, ToolCall("farm", {}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("锄头", r.immediate)
+
+    def test_farm_rejected_without_seeds(self):
+        compiler, actor = self._farm_compiler([("stone_hoe", 1)])
+        r = compiler.compile(actor, ToolCall("farm", {}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("short_grass", r.immediate)      # 教打草拿种子
+
+    def test_farm_seeds_cap_plot_size(self):
+        compiler, actor = self._farm_compiler([("iron_hoe", 1),
+                                               ("wheat_seeds", 4)])
+        r = compiler.compile(actor, ToolCall("farm", {"size": 3}), {})
+        self.assertIsNotNone(r.plan)
+        self.assertEqual(r.plan.total, 8)              # 4 格 ×（耕+种）
+
     # ---- 挖矿要持镐（v3.9.34） -----------------------------------------
 
     def test_collect_stone_without_pickaxe_rejected(self):

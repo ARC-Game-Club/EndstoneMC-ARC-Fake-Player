@@ -649,6 +649,74 @@ class ActionCompiler:
                 break
         return out
 
+    def _do_farm(self, actor: Any, a: dict[str, Any],
+                 ctx: dict[str, Any]) -> CompileResult:
+        """开垦农田：身边找泥土/草地 → 锄头耕地 → 播种小麦。
+
+        种地的完整链路（教给大脑的）：打草拿种子（collect short_grass）
+        → craft 锄头 → farm 耕地播种 → 等麦子成熟 → collect wheat 收割
+        （掉麦子+种子，种子循环用）→ craft bread（3 麦子横排）。
+        编译期两道闸：没锄头、种子不够 → 拒绝并教补课路径。
+        """
+        size = max(1, min(5, int(a.get("size", 3) or 3)))   # size×size 格
+        seeds = short_id(str(a.get("seed") or "wheat_seeds"))
+        ox, oy, oz = self._floor(actor.location)
+        dim = actor.dimension
+
+        # 找可耕格：泥土/草地 且上方是空气（苗要长）
+        cells: list[tuple[int, int, int]] = []
+        for dx in range(-size, size + 1):
+            for dz in range(-size, size + 1):
+                x, z = ox + dx, oz + dz
+                y = oy - 1               # 脚下方块
+                if y < -60:
+                    continue
+                name = self.world.get_block_name(dim, x, y, z)
+                if name not in ("dirt", "grass_block", "dirt_path"):
+                    continue
+                if not self.world.is_air(dim, x, y + 1, z):
+                    continue
+                cells.append((x, y, z))
+        if not cells:
+            return CompileResult(
+                ok=False,
+                immediate="脚下和周围没有能耕的泥土/草地（要么上面有东西，"
+                          "要么不是泥地）。换块开阔的泥地再 farm")
+
+        # 闸 1：锄头
+        if not self._has_tool(actor, "hoe"):
+            return CompileResult(
+                ok=False,
+                immediate=f"种地要有锄头（耕 {len(cells)} 格地）。"
+                          f"先 craft 木锄/石锄（锄头 = 2 木板 + 2 木棍），"
+                          f"拿好再来 farm")
+        # 闸 2：种子
+        have_seeds = 0
+        for name, cnt in self.world.scan_inventory(actor):
+            if "seed" in name:
+                have_seeds += cnt
+        if have_seeds < len(cells):
+            if have_seeds <= 0:
+                return CompileResult(
+                    ok=False,
+                    immediate="背包里没有种子。先 collect short_grass 打草——"
+                              "草有概率掉小麦种子（打一片总能凑够）；"
+                              "或者收割别人田里的成熟麦子也会掉种子")
+            cells = cells[:have_seeds]
+        steps = []
+        for (x, y, z) in cells:
+            steps.append(Step("till", x, y, z, async_op=True))
+        for (x, y, z) in cells:
+            steps.append(Step("plant", x, y, z, async_op=True, note=seeds))
+        note = ""
+        if len(cells) < (2 * size + 1) ** 2:
+            note = f"（这片只找到 {len(cells)} 格可耕的地）"
+        return CompileResult(
+            plan=Plan(label=f"开垦农田({len(cells)}格)", steps=steps),
+            immediate=f"开始种地：先耕地再播种 {len(cells)} 格{note}。"
+                      f"麦子成熟后用 collect wheat 收割（掉麦子和种子），"
+                      f"3 个麦子 craft 成面包")
+
     def _do_claim_land(self, actor: Any, a: dict[str, Any],
                        ctx: dict[str, Any]) -> CompileResult:
         """圈地安家：以当前位置为中心圈一块自己的领地。

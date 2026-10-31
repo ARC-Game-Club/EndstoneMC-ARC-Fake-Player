@@ -1666,6 +1666,18 @@ class ArcFakePlayerPlugin(Plugin):
                 return _no_body(step, "放置方块")
             return _real_or_retry(step, ra.place_real)
 
+        def h_till(step: Step) -> bool:
+            ra = _real()
+            if ra is None:
+                return _no_body(step, "耕地")
+            return _real_or_retry(step, ra.till_real)
+
+        def h_plant(step: Step) -> bool:
+            ra = _real()
+            if ra is None:
+                return _no_body(step, "播种")
+            return _real_or_retry(step, ra.plant_real)
+
         def h_container(step: Step) -> bool:
             # 容器操作（箱子/熔炉/工作台）只对真身体有意义——npc 模式
             # 没有背包和容器交互，直接判失败。
@@ -2123,6 +2135,8 @@ class ArcFakePlayerPlugin(Plugin):
         e.register("dig_near", h_dig_far)
         e.register("walk_to", h_walk_to)
         e.register("place_real", h_place_real)
+        e.register("till", h_till)
+        e.register("plant", h_plant)
         e.register("attack", h_attack)
         e.register("consume", h_consume)
         e.register("hop", h_hop)

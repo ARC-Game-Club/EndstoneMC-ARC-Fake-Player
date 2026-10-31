@@ -336,6 +336,23 @@ class FakePlayerBridge:
             kind="place", callback=callback,
         )
 
+    def till(self, name: str, x: int, y: int, z: int, *,
+             callback=None) -> int:
+        """锄头耕地：泥土/草地 → farmland。"""
+        return self.send_tracked(
+            "bot:till", {"n": name, "x": int(x), "y": int(y), "z": int(z)},
+            kind="till", callback=callback,
+        )
+
+    def plant(self, name: str, x: int, y: int, z: int,
+              item: str = "wheat_seeds", *, callback=None) -> int:
+        """播种：种子对耕地右键（麦苗长在耕地上一格）。"""
+        return self.send_tracked(
+            "bot:plant", {"n": name, "x": int(x), "y": int(y), "z": int(z),
+                          "item": str(item)},
+            kind="plant", callback=callback,
+        )
+
     def attack(self, name: str, target: str, *,
                callback: Callable[[bool, str, dict], None] | None = None) -> int:
         return self.send_tracked(

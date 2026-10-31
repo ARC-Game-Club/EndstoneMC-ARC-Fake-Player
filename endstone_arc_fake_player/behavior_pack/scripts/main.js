@@ -1180,6 +1180,92 @@ function doPlace(req, id) {
     });
 }
 
+// 耕地与播种：种地的基本功。锄头对着泥土/草地右键 → 变耕地（farmland），
+// 种子对着耕地右键 → 长出麦苗（wheat 方块在耕地上一格）。两者都是
+// "选物品 → 面向方块 → useItemInSlotOnBlock → 验证结果方块"，与
+// doPlace 同构，只是验证目标不同（farmland / wheat）。
+const HOE_RE = /^(wooden|stone|copper|iron|golden|diamond|netherite)_hoe$/;
+
+function bestHoeSlot(cont) {
+    let best = -1, bestRank = -1;
+    for (let slot = 0; slot < cont.size; slot++) {
+        const item = cont.getItem(slot);
+        if (!item) continue;
+        const m = item.typeId.replace("minecraft:", "").match(HOE_RE);
+        if (!m) continue;
+        const rank = TOOL_RANK[m[1]] ?? -1;
+        if (rank > bestRank) { bestRank = rank; best = slot; }
+    }
+    return best;
+}
+
+function doTill(req, id) {
+    const sim = sims.get(req.n);
+    if (!sim) { result(id, false, "假人不存在"); return; }
+    guard(id, () => {
+        if (interactions.has(req.n)) throw new Error("假人正在交互");
+        const loc = vec(req.x, req.y, req.z);
+        checkReach(sim, loc);
+        const dim = sim.dimension;
+        const block = dim.getBlock(loc);
+        if (!block) throw new Error("目标区块未加载");
+        if (!["minecraft:dirt", "minecraft:grass_block", "minecraft:dirt_path"].includes(block.typeId))
+            throw new Error("目标不是泥土/草地，锄不了");
+        const above = dim.getBlock({ x: loc.x, y: loc.y + 1, z: loc.z });
+        if (above && above.typeId !== "minecraft:air") throw new Error("方块上面有东西，清掉再耕");
+        const cont = playerInventory(sim);
+        const slot = bestHoeSlot(cont);
+        if (slot < 0) throw new Error("背包里没有锄头（木板+木棍×2 合成）");
+        const selected = selectInventorySlot(sim, slot);
+        faceBlock(sim, loc);
+        if (sim.useItemInSlotOnBlock(selected, loc, "Up") === false)
+            throw new Error("耕地失败（可能被保护）");
+        const state = { id, timer: 0, settled: false, ticks: 0 };
+        interactions.set(req.n, state);
+        state.timer = system.runInterval(() => {
+            try {
+                if (!sim.isValid || sim.dimension.id !== dim.id) throw new Error("假人失效或已切换维度");
+                const now = dim.getBlock(loc);
+                if (now && String(now.typeId).includes("farmland")) finishInteraction(req.n, state, true, "");
+                else if (++state.ticks >= 5) finishInteraction(req.n, state, false, "这格没耕成田");
+            } catch (e) { finishInteraction(req.n, state, false, String(e)); }
+        }, 1);
+    });
+}
+
+function doPlant(req, id) {
+    const sim = sims.get(req.n);
+    if (!sim) { result(id, false, "假人不存在"); return; }
+    guard(id, () => {
+        if (interactions.has(req.n)) throw new Error("假人正在交互");
+        const loc = vec(req.x, req.y, req.z);
+        checkReach(sim, loc);
+        const dim = sim.dimension;
+        const block = dim.getBlock(loc);
+        if (!block) throw new Error("目标区块未加载");
+        if (String(block.typeId) !== "minecraft:farmland") throw new Error("目标不是耕地，先用锄头耕");
+        const above = dim.getBlock({ x: loc.x, y: loc.y + 1, z: loc.z });
+        if (!above || above.typeId !== "minecraft:air") throw new Error("耕地上已经有作物了");
+        const cont = playerInventory(sim);
+        const slot = findSlot(cont, req.item || "wheat_seeds");
+        if (slot < 0) throw new Error("背包里没有种子 " + (req.item || "wheat_seeds"));
+        const selected = selectInventorySlot(sim, slot);
+        faceBlock(sim, loc);
+        if (sim.useItemInSlotOnBlock(selected, loc, "Up") === false)
+            throw new Error("播种失败");
+        const state = { id, timer: 0, settled: false, ticks: 0 };
+        interactions.set(req.n, state);
+        state.timer = system.runInterval(() => {
+            try {
+                if (!sim.isValid || sim.dimension.id !== dim.id) throw new Error("假人失效或已切换维度");
+                const crop = dim.getBlock({ x: loc.x, y: loc.y + 1, z: loc.z });
+                if (crop && String(crop.typeId).includes("wheat")) finishInteraction(req.n, state, true, "");
+                else if (++state.ticks >= 5) finishInteraction(req.n, state, false, "种子没种上");
+            } catch (e) { finishInteraction(req.n, state, false, String(e)); }
+        }, 1);
+    });
+}
+
 // 库存操作先在 ItemStack 克隆上规划，保留物品附魔、耐久和名称。
 function normId(id) {
     const value = String(id || "");
@@ -1800,6 +1886,12 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
             break;
         case "bot:dig":
             safely(() => doDig(data, id));
+            break;
+        case "bot:till":
+            safely(() => doTill(data, id));
+            break;
+        case "bot:plant":
+            safely(() => doPlant(data, id));
             break;
         case "bot:place":
             safely(() => doPlace(data, id));

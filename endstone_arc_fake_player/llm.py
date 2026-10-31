@@ -109,6 +109,7 @@ SPEC: dict[str, dict[str, str]] = {
     "descend":     {"depth": "int"},
     "sleep":       {},
     "build_structure": {"blocks": "str"},
+    "farm":         {"size": "int", "seed": "str"},
     "claim_land":  {"radius": "int", "name": "str"},
     "set_home":    {},
 
@@ -622,6 +623,12 @@ class LLMClient:
               "附近 3x3 区块内有别人领地会被拒绝——走远 60 格以上再圈。"
               "成功后自动把家设在这，别人也不能动你这块地。",
               {"radius": I, "name": S}, []),
+            f("farm",
+              "开垦农田种小麦：身边找泥土/草地→锄头耕地→播种。前置：背包"
+              "要有锄头（craft：2 木板+2 木棍）和种子（collect short_grass "
+              "打草掉，或收割麦子掉）。size 是边长（1~5，默认 3）。成熟后 "
+              "collect wheat 收割，3 麦子 craft bread。",
+              {"size": I, "seed": S}, []),
             f("set_home",
               "把当前位置设为家（常驻地）：闲逛以这为中心，天黑回这睡觉。"
               "盖完房/放好床后调一次。",

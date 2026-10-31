@@ -771,6 +771,91 @@ class RealBodyActions:
             self._ctl.name, step.x, step.y, step.z,
             step.block or "minecraft:cobblestone", callback=callback)
 
+    TILL_MAX_ATTEMPTS = 3
+
+    def till_real(self, step: Any) -> bool:
+        """走近并用锄头耕地（等 JS 验证 farmland 出现）。"""
+        key = ("till", step.x, step.y, step.z)
+        if key in self._gave_up:
+            return True
+        ctl = self._ctl
+        if key in self._requests:
+            return self._request_step(
+                key, self.TILL_MAX_ATTEMPTS,
+                lambda callback: self._ctl._bridge.till(
+                    self._ctl.name, step.x, step.y, step.z, callback=callback))
+        if ctl.busy:
+            return False
+        if not self._within_reach(step.x, step.y, step.z):
+            last = ctl.last_walk if self._phase_of(key) == "walk" else None
+            if last is not None:
+                ctl.clear_walk_result()
+                self._cleanup(key)
+                if not last.ok:
+                    return self._retry_later(
+                        key, self.WALK_MAX_ATTEMPTS,
+                        f"走近 ({step.x},{step.y},{step.z}) 失败: {last.error}")
+            pre = self.issue(key, limit=self.WALK_MAX_ATTEMPTS)
+            if pre is not None:
+                return pre
+            self._started.add(key)
+            self._set_phase(key, "walk")
+            ctl.clear_walk_result()
+            if not ctl.start_walk(*self._approach_point(step.x, step.y, step.z)):
+                self._cleanup(key)
+            return False
+        if self._phase_of(key) == "walk":
+            ctl.clear_walk_result()
+            self._cleanup(key)
+        return self._request_step(
+            key, self.TILL_MAX_ATTEMPTS,
+            lambda callback: self._ctl._bridge.till(
+                self._ctl.name, step.x, step.y, step.z, callback=callback))
+
+    PLANT_MAX_ATTEMPTS = 3
+
+    def plant_real(self, step: Any) -> bool:
+        """走近并播种（等 JS 验证麦苗出现）。note 是种子物品名。"""
+        item = str(getattr(step, "note", "") or "wheat_seeds")
+        key = ("plant", step.x, step.y, step.z, item)
+        if key in self._gave_up:
+            return True
+        ctl = self._ctl
+        if key in self._requests:
+            return self._request_step(
+                key, self.PLANT_MAX_ATTEMPTS,
+                lambda callback: self._ctl._bridge.plant(
+                    self._ctl.name, step.x, step.y, step.z, item,
+                    callback=callback))
+        if ctl.busy:
+            return False
+        if not self._within_reach(step.x, step.y, step.z):
+            last = ctl.last_walk if self._phase_of(key) == "walk" else None
+            if last is not None:
+                ctl.clear_walk_result()
+                self._cleanup(key)
+                if not last.ok:
+                    return self._retry_later(
+                        key, self.WALK_MAX_ATTEMPTS,
+                        f"走近 ({step.x},{step.y},{step.z}) 失败: {last.error}")
+            pre = self.issue(key, limit=self.WALK_MAX_ATTEMPTS)
+            if pre is not None:
+                return pre
+            self._started.add(key)
+            self._set_phase(key, "walk")
+            ctl.clear_walk_result()
+            if not ctl.start_walk(*self._approach_point(step.x, step.y, step.z)):
+                self._cleanup(key)
+            return False
+        if self._phase_of(key) == "walk":
+            ctl.clear_walk_result()
+            self._cleanup(key)
+        return self._request_step(
+            key, self.PLANT_MAX_ATTEMPTS,
+            lambda callback: self._ctl._bridge.plant(
+                self._ctl.name, step.x, step.y, step.z, item,
+                callback=callback))
+
     def consume_real(self, step: Any) -> bool:
         """Wait for actual item consumption, including eating at full health."""
         return self._request_step(
