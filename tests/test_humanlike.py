@@ -422,6 +422,9 @@ class HumanlikeTests(unittest.TestCase):
         plugin._identities = SimpleNamespace(xuid_of=lambda n: "9372854858298499")
         plugin._qq_sync = Mock()
         plugin._activity = Mock()
+        # 这几条测的是"聊天格式/去标点"，与夜间免打扰无关，**必须显式关掉**：
+        # 否则测试结果取决于跑测试时的钟点（默认 23:00~08:00 静音 → 深夜必挂）。
+        plugin._night_quiet_on = lambda *a, **k: False
         sent: list = []
         core = Mock()
         core.format_player_display_label_with_guild = Mock(

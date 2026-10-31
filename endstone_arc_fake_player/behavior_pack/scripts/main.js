@@ -71,6 +71,7 @@ import {
     rememberSpawnPoint,
     findNearestEnemy,
     fireSimShot,
+    detectHumanShots,
     watchRespawn,
     getRespawnPoint,
     setRespawnPoint,
@@ -1962,6 +1963,16 @@ system.afterEvents.scriptEventReceive.subscribe((event) => {
 system.runInterval(pumpDigging, 1);
 // arena 战斗 AI：0.25 秒一拍（追击刷新 0.75s、开火节流 0.2s 都由内部计时）
 system.runInterval(pumpArena, 5);
+
+// 真人开火检测：**每 tick** 盯枪械包自己的弹药计分板。
+//
+// 每 tick 一次是必须的：枪械包主循环也是每 tick 跑，射速上限 1200 RPM
+// 就是 20 发/秒 = 每 tick 一发。隔 tick 查会漏枪。
+system.runInterval(() => {
+    try {
+        detectHumanShots();
+    } catch (e) { /* 绝不能把整个行为包带走 */ }
+}, 1);
 
 // 复活落点监控：每秒看一眼假人的位置。
 //

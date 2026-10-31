@@ -7553,7 +7553,8 @@ class ArcFakePlayerPlugin(Plugin):
         # 夜间免打扰：只压**主动**发言。这一轮被点名/被打/被交易的应答
         # （agent._turn_woken）照常——半夜有人找它玩，它还是要理的。
         if self._night_quiet_on():
-            agent = self._agents.get(name)
+            # getattr 兜底：on_enable 之前 _agents 还不存在，别让一句闲聊把插件带崩
+            agent = getattr(self, "_agents", {}).get(name)
             if not bool(getattr(agent, "_turn_woken", False)):
                 self._record("chat", f"夜间免打扰，主动发言忍住了：{text[:40]}", who=name)
                 return

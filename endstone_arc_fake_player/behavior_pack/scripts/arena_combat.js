@@ -451,7 +451,7 @@ function normalized(direction) {
     };
 }
 
-function gunKeyOf(gunId) {
+export function gunKeyOf(gunId) {
     return String(gunId).includes(":") ? String(gunId).split(":")[1] : String(gunId);
 }
 
@@ -486,6 +486,49 @@ function ammoObjective(gunKey) {
 }
 
 /** 读弹药。undefined = 没人写过（当成满弹匣，不去覆盖插件的值）。 */
+/**
+ * 只读弹药（**计分板**），不建计分板。
+ *
+ * 为什么读计分板而不是动态属性
+ * ----------------------------
+ * 枪械包把权威弹药写在两处：动态属性 `{gunKey}Ammo`（它自己读自己写）
+ * 和计分板 `{gunKey}Ammo`（跨组件共享）。
+ * 而**动态属性在这台服上是按行为包隔离的**：诊断包读真人玩家的
+ * `firing` / `reloadTimer` / `lastSlotUsed` 全是 undefined，
+ * 只有它自己写的 `arc_diag_raw` 读得到。
+ * 桥接包在别的包里，也读不到枪械包写的动态属性。
+ * 计分板是世界级共享数据（EndStone 插件就用它给真人发弹），只能盯它。
+ *
+ * readAmmo → ammoObjective 会在计分板不存在时 addObjective，
+ * 那会凭空造出一堆空计分板，所以检测"枪械包有没有在管这颗枪的弹药"
+ * 只能用这个只读版本。
+ *
+ * @param {object} player 真人实体
+ * @param {string} gunKey  枪短名（qbz95）
+ * @returns {number|undefined} undefined = 没人写过（不是 0）
+ */
+export function peekAmmo(player, gunKey) {
+    let obj = null;
+    try {
+        obj = world.scoreboard.getObjective(`${gunKey}Ammo`);
+    } catch (_) {
+        return undefined;
+    }
+    if (!obj) return undefined;
+    // 参与者候选：名字 → 身份。名字最通用（EndStone 插件就是按名字写的）。
+    const candidates = [];
+    try { if (player?.name) candidates.push(player.name); } catch (_) { }
+    try { if (player?.scoreboardIdentity) candidates.push(player.scoreboardIdentity); } catch (_) { }
+    for (const c of candidates) {
+        try {
+            const v = obj.getScore(c);
+            if (v === undefined || v === null) continue;
+            return Number(v);
+        } catch (_) { /* 试下一个 */ }
+    }
+    return undefined;
+}
+
 export function readAmmo(name, gunKey) {
     const obj = ammoObjective(gunKey);
     if (!obj) return undefined;
@@ -980,8 +1023,11 @@ function findEngagedSim(shooterName, origin) {
  *
  * 命中判定用的是 rayHitSim（竖直圆柱求交，纯数学，不依赖引擎的射线 API）。
  */
-export function handleHumanShot(player, gunId) {
+export function handleHumanShot(player, gunId, shotCount = 1) {
     if (!player || !gunId) return null;
+    // 一次检测到多枪（桥接包漏了 tick）时按枪数放大伤害，
+    // 而不是重复调用（同一 tick 会被 recentShots 去重挡掉）。
+    const shots = Math.max(1, Math.floor(Number(shotCount) || 1));
 
     let origin;
     try {
@@ -1061,12 +1107,12 @@ export function handleHumanShot(player, gunId) {
 
     const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
     const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;
-    const dmg = base * mult;
+    const dmg = base * mult * shots;
     const dealt = applyDamage(hitSim, dmg, player);
 
     logShotThrottled(
         `${shooterName}|${hitName}`,
-        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）${shots > 1 ? " ×" + shots + "发" : ""}`,
     );
     return hitName;
 }
@@ -1242,11 +1288,40 @@ function findSimNear(point, radius = 3.0) {
 // 所以这里整段包 try/catch：**这个订阅挂了最多是"真人打假人没补刀"，
 // 绝不能再把整个行为包带走**（假人开火、复活监控都在这个文件里）。
 // ---------------------------------------------------------------------------
-// 真人扣扳机（itemStartUse）→ 直接结算命中
+// 真人开火检测：**跟着枪械包的真实开火走**
 // ---------------------------------------------------------------------------
 //
-// itemStartUse 每个行为包都收得到（诊断包一直在收），
-// 所以真人开枪这件事不用绕脚本事件（这台服 world.scriptEvent 压根不存在）。
+// 为什么不再用 itemStartUse 当触发
+// --------------------------------
+// 枪械包自己的开火模型：
+//     itemStartUse → setDynamicProperty("firing", 1)
+//     主循环每 tick：冷却到了 && 弹药>0 && !换弹 →
+//         setPlayerGunAmmo(ammo-1)   ← 弹药减 1（计分板 + 动态属性都写）
+//         播动画/枪声 → fireBullet × 弹丸数
+//     itemStopUse → 清 firing
+//
+// 也就是说 **itemStartUse 只是"按下扳机"**，按住右键只来一次；
+// 真正的连发节奏是枪械包主循环按射速跑的。
+// 桥接包以前拿 itemStartUse 当开火触发 → 按住扫射时**只结算一枪**
+// （用户原话："我按住右键扫射但是只有第一下可以打到假人"）。
+//
+// 现在改成盯**枪械包自己的弹药计分板**：它每真开一枪就减 1，
+// 掉了就是一枪。于是射速、换弹、空仓、半自动锁、RPM 倍率
+// 全部自动跟着枪械包走——桥接包不再自己造一套开火节奏，
+// 只负责枪械包做不到的那一步：沿射线找到假人并扣血
+// （这台服上枪械包看不见模拟玩家：getEntitiesFromRay 里假人是 undefined）。
+//
+// 兜底：枪械包完全没写这颗枪的弹药时，退回"按住扳机期间按固定节奏打"。
+
+/** 真人 → 上次看到的弹药（名字 → {key, value}）。 */
+const humanAmmoWatch = new Map();
+/** 真人 → 按住扳机的状态（名字 → {gunId, nextTick}）。 */
+const humanHold = new Map();
+/** 兜底节奏：5 次/秒（只有枪械包完全没管弹药时才用）。 */
+const HUMAN_HOLD_INTERVAL = 4;
+/** 一次最多结算几枪：再多就是插件批量重置弹药，不是连发。 */
+const HUMAN_MAX_SHOTS_PER_TICK = 5;
+
 try {
     world.afterEvents.itemStartUse.subscribe((event) => {
         try {
@@ -1255,11 +1330,81 @@ try {
             if (!player || !gunId) return;
             if (!gunId.startsWith("blazik:")) return;    // 只管枪械包的枪
             if (simsRef.has(player.name ?? "")) return;   // 假人自己开枪不算
-            handleHumanShot(player, gunId);
+            humanHold.set(player.name, { gunId, nextTick: system.currentTick });
         } catch (_) { /* 绝不能把整个行为包带走 */ }
     });
 } catch (_) {
     // 订阅失败最多是"真人打假人没伤害"，不能连累假人开火/复活监控
+}
+
+try {
+    world.afterEvents.itemStopUse.subscribe((event) => {
+        try {
+            const player = event?.source;
+            if (player) humanHold.delete(player.name);
+        } catch (_) { }
+    });
+} catch (_) { }
+
+/**
+ * 每 tick 调一次：看真人的枪械包有没有开火，有就把命中的假人扣血。
+ *
+ * @returns {number} 本轮结算了几枪
+ */
+export function detectHumanShots() {
+    let players = [];
+    try {
+        players = world.getAllPlayers();
+    } catch (_) {
+        return 0;
+    }
+    if (!Array.isArray(players)) return 0;
+    let shots = 0;
+    for (const p of players) {
+        if (!p) continue;                 // 假人在这个数组里是 undefined
+        let name = "";
+        try { name = p.name ?? ""; } catch (_) { continue; }
+        if (!name) continue;
+        if (simsRef.has(name)) continue;   // 假人自己开枪不算
+        let gunId = null;
+        try { gunId = heldGunId(p); } catch (_) { gunId = null; }
+        if (!gunId || !gunId.startsWith("blazik:")) {
+            humanAmmoWatch.delete(name);
+            humanHold.delete(name);
+            continue;
+        }
+        const key = gunKeyOf(gunId);
+        const ammo = peekAmmo(p, key);
+        if (ammo !== undefined) {
+            // 主路径：弹药掉了 = 枪械包真开了一枪
+            humanHold.delete(name);
+            const prev = humanAmmoWatch.get(name);
+            humanAmmoWatch.set(name, { key, value: ammo });
+            if (!prev || prev.key !== key) continue;   // 刚拿到基线 / 换了枪
+            const drop = prev.value - ammo;
+            if (drop <= 0) continue;                  // 没开火，或刚补弹/换枪
+            if (drop > HUMAN_MAX_SHOTS_PER_TICK) {
+                // 一次掉太多 = 插件重置弹药（EndStone 写 default_ammo），不是连发
+                continue;
+            }
+            handleHumanShot(p, gunId, drop);
+            shots += drop;
+            continue;
+        }
+        // 兜底：枪械包没管这颗枪的弹药 → 按住扳机期间按固定节奏打
+        const hold = humanHold.get(name);
+        if (!hold) continue;
+        if (hold.gunId !== gunId) {
+            humanHold.set(name, { gunId, nextTick: system.currentTick });
+            continue;
+        }
+        const now = system.currentTick;
+        if (now < hold.nextTick) continue;
+        hold.nextTick = now + HUMAN_HOLD_INTERVAL;
+        handleHumanShot(p, gunId, 1);
+        shots += 1;
+    }
+    return shots;
 }
 
 try {
