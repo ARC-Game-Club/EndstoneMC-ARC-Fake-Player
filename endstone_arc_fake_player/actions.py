@@ -758,7 +758,11 @@ class ActionCompiler:
 
         path = finder.find(start, goal)
         if not path:
-            return CompileResult(ok=False, immediate=f"找不到通往 {goal} 的路径")
+            return CompileResult(
+                ok=False,
+                immediate=f"找不到通往 {goal} 的路径"
+                          f"（地形复杂或太远走不过去）。可以试试 tp_warp "
+                          f"直接传送到公共传送点，或换个近点的目的地")
 
         if self.use_real_dig:
             # 有真身体：让原版寻路一次走到终点。假人会真的爬坡、绕树、

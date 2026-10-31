@@ -623,6 +623,10 @@ class ArcFakePlayerPlugin(Plugin):
         self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
         # 假人名 → 上次传送时刻（tp_warp/tp_spawn 共用 60 秒冷却）
         self._tp_cooldown: dict[str, float] = {}
+        # 闲逛走位连续失败的时间戳（monotonic）——受困检测的数据源。
+        self._walk_fails: dict[str, list[float]] = {}
+        # 上次受困救援时刻（每假人 10 分钟最多救一次）
+        self._rescue_at: dict[str, float] = {}
         # 待代同意的 tpa：(假人名, 发起者名) → 到点时刻（monotonic 基准）。
         # _tpa_tick 每秒扫一轮弧光核心的待处理申请，到点就代为"点同意"。
         self._tpa_pending: dict[tuple[str, str], float] = {}
@@ -4689,12 +4693,101 @@ class ArcFakePlayerPlugin(Plugin):
         return _random.choice(cached)
 
     def _roam_walk(self, name: str, x: int, y: int, z: int) -> bool:
-        """闲逛走位：失败要回灌给驱动（3 秒重试），不能干等一个间隔。"""
+        """闲逛走位：失败要回灌给驱动（3 秒重试），不能干等一个间隔。
+
+        连续失败还是**受困救援**的信号——主服出生点那种复杂地形，
+        每一段走位都会失败，不救援就永远在原地打转。"""
         rid = self._bridge.walk(
             name, x, y, z, timeout=200,
             callback=lambda ok, err, info: None if ok
-            else self._roam.note_failure(name, str(err or "走位失败")))
+            else self._on_walk_fail(name, str(err or "走位失败")))
+        if rid >= 0:
+            self._walk_fails.pop(name, None)     # 成功发起就清零计数
         return rid >= 0
+
+    #: 受困判定：5 分钟窗口内走位失败 ≥ 这么多次 → 救援
+    RESCUE_FAIL_COUNT = 5
+    #: 救援冷却（秒）：别把传送当日常交通工具
+    RESCUE_COOLDOWN = 600.0
+
+    def _on_walk_fail(self, name: str, why: str) -> None:
+        """走位失败回灌 + 受困检测。"""
+        self._roam.note_failure(name, why)
+        now = time.monotonic()
+        fails = [t for t in self._walk_fails.get(name, []) if now - t < 300.0]
+        fails.append(now)
+        self._walk_fails[name] = fails
+        if len(fails) >= self.RESCUE_FAIL_COUNT:
+            self._walk_fails.pop(name, None)
+            self._rescue_bot(name)
+
+    def _rescue_bot(self, name: str) -> None:
+        """受困救援：把反复走不出去的假人传送到别的公共传送点。
+
+        场景：主服出生点地形复杂（坑洞/峭壁环绕），闲逛层每段走位都
+        失败，假人永远在原地打转。救援=随机挑一个离当前位 ≥100 格的
+        公共传送点，直接传送过去（走 api_teleport_player_to 的坐标版，
+        与 tp_spawn 同路——那条路对假人是验证过可用的）。
+        核心不在/没有可用传送点时静默放弃（下个失败周期再试）。
+        """
+        last = self._rescue_at.get(name, 0.0)
+        if last and time.monotonic() - last < self.RESCUE_COOLDOWN:
+            return
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return
+        if (core is None
+                or not callable(getattr(core, "api_teleport_player_to", None))
+                or not callable(getattr(core, "api_list_public_warps", None))):
+            return
+        actor = self._live_actor(name)
+        if actor is None:
+            return
+        try:
+            warps = core.api_list_public_warps() or []
+        except Exception:
+            return
+        if not warps:
+            self.logger.info(f"[{name}] 受困但本服没有公共传送点，无法救援")
+            return
+        loc = actor.location
+        import random as _r
+        far = []
+        for w in warps:
+            try:
+                d = math.dist((float(w.get("x", 0)), float(w.get("z", 0))),
+                              (loc.x, loc.z))
+                if d >= 100.0:
+                    far.append(w)
+            except Exception:
+                continue
+        target = _r.choice(far or warps)
+        try:
+            tx, tz = float(target.get("x", 0)), float(target.get("z", 0))
+            ty = float(target.get("y", 64))
+        except Exception:
+            return
+        wname = str(target.get("warp_name") or target.get("name") or "?")
+        try:
+            res = core.api_teleport_player_to(
+                "overworld", tx, ty, tz, player_name=name) or {}
+        except Exception as exc:
+            self.logger.warning(f"[{name}] 受困救援传送失败: {exc}")
+            return
+        if not res.get("ok"):
+            self.logger.warning(f"[{name}] 受困救援被核心拒绝: {res.get('error')}")
+            return
+        self._rescue_at[name] = time.monotonic()
+        self._walk_fails.pop(name, None)
+        self._record("crowd", f"受困救援：走不出去，传送到 [{wname}]", who=name)
+        agent = self._agents.get(name)
+        if agent is not None:
+            agent.note_events([{
+                "op": "rescue", "ok": True,
+                "msg": f"你刚才被困在走不出去的地形里，已传送到 "
+                       f"{wname} 附近——在这附近活动吧"}])
+        self.logger.info(f"{C.GREEN}[{name}] 受困救援 → 传送到 {wname}{C.RESET}")
 
     def _roam_dig(self, name: str, x: int, y: int, z: int) -> bool:
         """闲逛挖一块：同样把失败回灌。

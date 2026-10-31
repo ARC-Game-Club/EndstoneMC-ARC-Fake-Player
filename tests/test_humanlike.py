@@ -544,6 +544,61 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 受困救援（v3.9.29） -------------------------------------------
+
+    def _rescue_plugin(self, warps, ok=True):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._roam = Mock()
+        plugin._walk_fails = {}
+        plugin._rescue_at = {}
+        plugin._agents = {}
+        plugin._live_actor = Mock(return_value=FakeActor(FakeDimension(), 0, 64, 0))
+        core = Mock()
+        core.api_list_public_warps = Mock(return_value=warps)
+        core.api_teleport_player_to = Mock(return_value={"ok": ok})
+        teleports = []
+        core.api_teleport_player_to = Mock(
+            side_effect=lambda d, x, y, z, player_name="":
+            teleports.append((player_name, x, z)) or {"ok": ok})
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=core)))
+        return plugin, teleports
+
+    def test_rescue_after_repeated_walk_fails(self):
+        plugin, teleports = self._rescue_plugin(
+            [{"warp_name": "主城", "x": 500, "y": 70, "z": 500},
+             {"warp_name": "渔村", "x": 800, "y": 65, "z": -300}])
+        for _ in range(5):
+            plugin._on_walk_fail("Bot", "no path")
+        self.assertEqual(len(teleports), 1)
+        self.assertEqual(teleports[0][0], "Bot")
+
+    def test_rescue_cooldown_blocks_spam(self):
+        plugin, teleports = self._rescue_plugin(
+            [{"warp_name": "主城", "x": 500, "y": 70, "z": 500}])
+        for _ in range(5):
+            plugin._on_walk_fail("Bot", "no path")
+        for _ in range(5):                      # 冷却期内再来一轮失败
+            plugin._on_walk_fail("Bot", "no path")
+        self.assertEqual(len(teleports), 1)     # 不重复传送
+
+    def test_no_rescue_below_threshold(self):
+        plugin, teleports = self._rescue_plugin(
+            [{"warp_name": "主城", "x": 500, "y": 70, "z": 500}])
+        for _ in range(4):
+            plugin._on_walk_fail("Bot", "no path")
+        self.assertEqual(teleports, [])
+
+    def test_walk_fail_window_expires(self):
+        import time as _t
+        plugin, teleports = self._rescue_plugin(
+            [{"warp_name": "主城", "x": 500, "y": 70, "z": 500}])
+        plugin._walk_fails["Bot"] = [_t.monotonic() - 400.0] * 4   # 全过期
+        plugin._on_walk_fail("Bot", "no path")                       # 只 1 次新的
+        self.assertEqual(teleports, [])
+
     # ---- 夜间免打扰（v3.9.25） -----------------------------------------
 
     def _quiet_plugin(self):
