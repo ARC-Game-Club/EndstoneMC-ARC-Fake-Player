@@ -338,6 +338,43 @@ export function getRespawnPoint(name) {
     return respawnPoints.get(name) || null;
 }
 
+/** 外部修正某假人的重生点（teleportAfterRespawn 验证后写回用）。 */
+export function setRespawnPoint(name, point) {
+    respawnPoints.set(name, point);
+}
+
+/**
+ * 把"记录在案的重生点"验一遍：脚下必须是实的、可站的方块。
+ *
+ * 为什么要验：记录点有三个来源——服务器配置（弧光核心）、生成时的地面
+ * 扫描、落地后钉的点。任何一个都可能"记下的时候是对的，用的时候不对了"：
+ * 配置点的 Y 本身配在半空、扫描那一列后来被挖空。直接传送过去 = 传进
+ * 半空 = 死后摔一次——正是"复活了就摔死"死循环的来源。
+ *
+ * 返回验证过的落点（脚下不实时沿这一列向下修正到真地面）；返回 null
+ * 表示这一列验证不了（区块没加载 / 整列没有可站方块），调用方自己兜底。
+ */
+export function verifyGroundPoint(point) {
+    const dim = safe(() => world.getDimension("overworld"));
+    if (!dim) return null;
+    let below;
+    try {
+        below = dim.getBlock({ x: point.x, y: point.y - 1, z: point.z });
+    } catch (e) {
+        return null;   // 区块没加载 → 验证不了
+    }
+    if (below && !below.isAir && !below.isLiquid) {
+        const id = String(below.typeId || "").toLowerCase();
+        if (!NOT_STANDABLE.some((bad) => id.endsWith(bad))) {
+            return point;   // 脚下就是实地 → 原样可用
+        }
+    }
+    // 脚下不是实地 → 沿这一列向下找真地面（从 point.y+8 起扫，容忍记录偏差）
+    const groundY = findGroundY(point.x, point.z, point.y + 8);
+    if (groundY === null) return null;
+    return { x: point.x, y: groundY, z: point.z };
+}
+
 /**
  * 假人被移除时清掉它的记录。
  *

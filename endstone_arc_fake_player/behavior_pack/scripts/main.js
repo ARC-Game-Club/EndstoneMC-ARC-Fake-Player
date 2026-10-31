@@ -73,6 +73,8 @@ import {
     fireSimShot,
     watchRespawn,
     getRespawnPoint,
+    setRespawnPoint,
+    verifyGroundPoint,
     forgetBot,
     isAlive,
     setSimEnemies,
@@ -2016,7 +2018,7 @@ function autoRespawn(name, sim) {
 }
 
 /**
- * 重生之后把假人挪到地面重生点。
+ * 重生之后把假人挪到**验证过的地面落点**。
  *
  * 为什么要多这一步
  * ----------------
@@ -2029,13 +2031,20 @@ function autoRespawn(name, sim) {
  * `SpawnY=32767`，由引擎运行时解析，实测 200 / 312 都出现过），而那一列
  * 在山上——所以假人每次重生都掉回半空，落地摔死，接着再重生，死循环。
  *
- * 所以这里在重生完成后自己把它传送回记下来的地面点。传送用的是
- * `sim.teleport()`，和插件平时指挥假人走位用的是同一条路（已验证可用）。
+ * 2026-10-31 加固（"复活了就摔死"仍在发生）：
+ *   1. 记录的重生点**用之前先验**（verifyGroundPoint）：脚下不是实地就
+ *      沿这一列向下修正——记录点可能本身就在半空（配置坐标偏差、生成时
+ *      扫描失败拿生成点当了重生点），传过去等于主动送它摔一次。
+ *   2. 验不了/没有记录点 → 扫**假人自己脚下这一列**：它人就在那，区块
+ *      必然是加载的，扫到的地面就是能站的地方。绝不留它在世界出生点半空。
+ *   3. 传送从"一锤子买卖"改成**传送 + 校验 + 重试**：老写法第 3 拍传一次
+ *      就收工，但引擎的重生摆位可能比我们的传送**晚到**（新引擎上实测过
+ *      被覆盖），传送等于白发。现在传完盯着位置，没到点就再传，最多 3 次。
  */
 function teleportAfterRespawn(name, sim) {
-    const p = getRespawnPoint(name);
-    if (!p) return;
     let ticks = 0;
+    let attempts = 0;
+    let dest = null;
     const timer = system.runInterval(() => {
         ticks += 1;
         try {
@@ -2045,15 +2054,93 @@ function teleportAfterRespawn(name, sim) {
             }
             // 等引擎把这次重生做完（位置还没落地时传送会被覆盖）。
             if (ticks < 3) return;
-            system.clearRun(timer);
+
+            if (dest === null) {
+                dest = pickRespawnDest(name, sim);
+                if (dest === null) {
+                    system.clearRun(timer);
+                    console.warn(
+                        `${TAG} 假人 ${name} 重生后找不到可站的落点，先留在原地等下一轮`,
+                    );
+                    return;
+                }
+            }
+
+            const loc = sim.location;
+            const arrived = Math.hypot(
+                loc.x - dest.x, loc.y - dest.y, loc.z - dest.z,
+            ) <= 4;
+            if (arrived) {
+                system.clearRun(timer);
+                console.log(`${TAG} 假人 ${name} 重生后已落到 (${dest.x}, ${dest.y}, ${dest.z})`);
+                return;
+            }
+            // 途中又死了 → 这轮作废，autoRespawn 会带着新的重生再走一遍。
+            const hp = safely(() => sim.getComponent("minecraft:health")?.currentValue);
+            if (hp !== undefined && hp !== null && hp <= 0) {
+                system.clearRun(timer);
+                return;
+            }
+            if (attempts >= 3) {
+                system.clearRun(timer);
+                console.warn(
+                    `${TAG} 假人 ${name} 重生后传送 3 次仍没站住，现在在`
+                    + ` (${loc.x.toFixed(1)}, ${loc.y.toFixed(1)}, ${loc.z.toFixed(1)})`,
+                );
+                return;
+            }
+            attempts += 1;
             const dim = world.getDimension("overworld");
-            sim.teleport({ x: p.x, y: p.y, z: p.z }, { dimension: dim });
-            console.log(`${TAG} 假人 ${name} 重生后已挪到地面 (${p.x}, ${p.y}, ${p.z})`);
+            sim.teleport({ x: dest.x, y: dest.y, z: dest.z }, { dimension: dim });
         } catch (e) {
-            system.clearRun(timer);
-            console.warn(`${TAG} 假人 ${name} 重生后挪回地面失败: ${e}`);
+            if (attempts >= 3) {
+                system.clearRun(timer);
+                console.warn(`${TAG} 假人 ${name} 重生后挪回地面失败: ${e}`);
+            } else {
+                attempts += 1;   // 单次异常（比如区块没加载好）→ 还有机会
+            }
         }
     }, 1);
+}
+
+/**
+ * 选这次重生要传送去的落点（只选一次，之后 teleportAfterRespawn 盯着它）。
+ *
+ * 优先级：
+ *   1. 记录的重生点 → verifyGroundPoint 验证/修正（脚下不是实地就沿列
+ *      下探到真地面）。修过的点**写回去**，不能每次重生都摔一遍再修一遍。
+ *   2. 记录点验不了（那一列区块没加载）或压根没有记录点 → 扫假人**自己
+ *      脚下这一列**。它人就在那，区块必然加载，扫到的就是能站的地方。
+ *   3. 都不行（整列虚空/异常）→ null，调用方放弃本次传送。
+ */
+function pickRespawnDest(name, sim) {
+    const recorded = getRespawnPoint(name);
+    if (recorded) {
+        const verified = verifyGroundPoint(recorded);
+        if (verified) {
+            if (verified.y !== recorded.y) {
+                console.warn(
+                    `${TAG} 假人 ${name} 的记录重生点 (${recorded.x}, ${recorded.y}, ${recorded.z})`
+                    + ` 脚下不是实地，修正为 (${verified.x}, ${verified.y}, ${verified.z})`,
+                );
+                setRespawnPoint(name, verified);
+            }
+            return verified;
+        }
+        console.warn(
+            `${TAG} 假人 ${name} 的记录重生点 (${recorded.x}, ${recorded.y}, ${recorded.z})`
+            + " 验证不了（区块没加载？），改扫它脚下这一列",
+        );
+    }
+    let loc;
+    try {
+        loc = sim.location;
+    } catch (_) {
+        return null;
+    }
+    return verifyGroundPoint({
+        x: Math.floor(loc.x), y: Math.floor(loc.y), z: Math.floor(loc.z),
+    });
 }
 
 // 心跳：每 5 秒无条件 pong。Python 用它判断行为包是否真的活着。

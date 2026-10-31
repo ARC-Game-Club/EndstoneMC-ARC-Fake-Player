@@ -35,12 +35,16 @@
 """
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import dukpy
+
 from tests.endstone_stub import install
+from tests.test_behavior_pack_imports import _strip_for_dukpy
 
 install()
 
@@ -57,6 +61,68 @@ def _js_slice(src: str, marker: str, length: int = 2600) -> str:
     if i < 0:
         return ""
     return src[i:i + length]
+
+
+#: 给 verifyGroundPoint 用的假世界：y<=64 是石头地面，(5, 68~72) 一团树叶
+#: （树冠），x=999 那列区块没加载（getBlock 抛），x=888 整列空气（虚空）。
+MOCK_GROUND_WORLD = """
+const AIR = { isAir: true, isLiquid: false, typeId: "minecraft:air" };
+const STONE = { isAir: false, isLiquid: false, typeId: "minecraft:stone" };
+const LEAVES = { isAir: false, isLiquid: false, typeId: "minecraft:oak_leaves" };
+const DIM = {
+    getBlock(pos) {
+        if (pos.x === 999) throw new Error("chunk not loaded");
+        if (pos.x === 888) return AIR;
+        if (pos.x === 5 && pos.y >= 68 && pos.y <= 72) return LEAVES;
+        if (pos.y <= 64) return STONE;
+        return AIR;
+    },
+};
+const server = {
+    world: { getDimension(id) { return DIM; } },
+    system: { afterEvents: { scriptEventReceive: { subscribe() {} } } },
+    EntityDamageCause: {},
+};
+"""
+
+PROBE_GROUND = """
+;JSON.stringify({
+    good: verifyGroundPoint({x:0, y:65, z:0}),
+    midair: verifyGroundPoint({x:0, y:75, z:0}),
+    canopy: verifyGroundPoint({x:5, y:71, z:0}),
+    unloaded: verifyGroundPoint({x:999, y:65, z:0}),
+    voidCol: verifyGroundPoint({x:888, y:65, z:0}),
+})
+"""
+
+
+class VerifyGroundPointTests(unittest.TestCase):
+    """verifyGroundPoint：重生点用前必验（"复活了就摔死"的 2026-10-31 加固）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        src = _strip_for_dukpy(JS_SRC, MOCK_GROUND_WORLD) + PROBE_GROUND
+        cls.probe = json.loads(dukpy.evaljs(src))
+
+    def test_standable_point_returned_as_is(self):
+        """脚下就是实地 → 原样返回，不许乱动记录点。"""
+        self.assertEqual(self.probe["good"], {"x": 0, "y": 65, "z": 0})
+
+    def test_midair_point_corrected_to_ground(self):
+        """记录点在半空 → 沿这一列向下修正到真地面（y=64 石头上方）。"""
+        self.assertEqual(self.probe["midair"], {"x": 0, "y": 65, "z": 0})
+
+    def test_tree_canopy_is_not_ground(self):
+        """脚下是树冠 → 继续下探到树下的真地面。"""
+        self.assertEqual(self.probe["canopy"], {"x": 5, "y": 65, "z": 0})
+
+    def test_unloaded_chunk_returns_null(self):
+        """区块没加载（getBlock 抛）→ 返回 null，让调用方走兜底。"""
+        self.assertIsNone(self.probe.get("unloaded"))
+
+    def test_void_column_returns_null(self):
+        """整列虚空 → 没有可站落点 → null。"""
+        self.assertIsNone(self.probe.get("voidCol"))
 
 
 class FakeScheduler:
@@ -385,12 +451,38 @@ class BehaviorPackContractTests(unittest.TestCase):
         self.assertIn("req.rx", main)
         self.assertIn("rememberSpawnPoint(name, out.sim, loc, anchor)", main)
 
+    def test_respawn_teleport_verifies_and_retries(self):
+        """重生传送不能再是"一锤子买卖"（2026-10-31 加固）。
+
+        老写法第 3 拍传一次就收工——引擎的重生摆位可能比我们的传送晚到，
+        把人又挪回半空。必须传完盯着位置，没到点就重试（有上限）。
+        """
+        main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
+        body = _js_slice(main, "function teleportAfterRespawn")
+        self.assertIn("pickRespawnDest(name, sim)", body,
+                      "落点要经过 pickRespawnDest 选+验")
+        self.assertIn("Math.hypot(", body,
+                      "传送后要校验'真的过去了'（到点判定）")
+        self.assertIn("attempts >= 3", body, "重试要有上限")
+
+    def test_respawn_dest_is_verified_before_use(self):
+        """记录的重生点用之前必须验：脚下不是实地就修正，并写回。"""
+        main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
+        body = _js_slice(main, "function pickRespawnDest")
+        self.assertIn("verifyGroundPoint(recorded)", body,
+                      "记录点先验再传——传进半空就是摔死")
+        self.assertIn("setRespawnPoint(name, verified)", body,
+                      "修正要写回，不能每次重生都摔一遍再修一遍")
+        self.assertIn("verifyGroundPoint({", body,
+                      "记录点验不了/没有时，要扫假人脚下这一列兜底")
+        self.assertIn("sim.location", body)
+
 
 def main():
     total = 0
     ok = True
     for cls in (SurfaceScanTests, PendingGameModeTests, SpawnAnchorTests,
-                BehaviorPackContractTests):
+                VerifyGroundPointTests, BehaviorPackContractTests):
         result = unittest.TextTestRunner(verbosity=2).run(
             unittest.defaultTestLoader.loadTestsFromTestCase(cls))
         total += result.testsRun
