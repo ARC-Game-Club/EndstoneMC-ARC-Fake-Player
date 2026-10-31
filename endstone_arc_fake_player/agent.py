@@ -250,6 +250,10 @@ class AgentConfig:
     spontaneous_say_max: float = 0.0
     #: 计划执行期间即使到期也不打断，避免"想一半去做别的"
     wait_for_plan: bool = True
+    #: 计划顺利完成后 2~5 秒内立即规划下一步（"干完一件接着干下一件"，
+    #: 不等满分钟级决策间隔）。关掉可省 token，代价是动作之间回到
+    #: 决策间隔长度的空档（闲逛层会填充）。
+    plan_done_rethink: bool = True
     temperature: float = 0.3
     max_tokens: int = 800
     history_size: int = 20
@@ -593,6 +597,19 @@ class Agent:
         的说话算**应答**——不受自发发言冷却限制。"""
         self.state.woken = True
         self.state.last_decision = 0.0
+
+    def request_rethink(self, delay: float) -> None:
+        """把下一次决策提前到 ``delay`` 秒后（不打断当前节奏的其余闸门）。
+
+        计划顺利完成时由 ``reap_finished`` 调用——用户要的"干完一件事
+        紧接着规划下一件"：不等满整个 decision_interval（分钟级），
+        2~5 秒内就问一次大脑"接下来干嘛"。闲逛层（已压到亚秒间隙）
+        在这 2~5 秒里无缝填充，看起来就是连续干活。
+        token 代价：每个完成的计划多一次调用；关掉用 plan_done_rethink=False。
+        """
+        gap = self.state.decision_gap or self.config.decision_interval
+        ahead = max(0.0, float(gap) - max(0.0, float(delay)))
+        self.state.last_decision = time.monotonic() - ahead
 
     def note_events(self, events: list[dict]) -> None:
         self.state.recent_events.extend(events)
@@ -1173,6 +1190,7 @@ class Agent:
         if not mine:
             return
         self._inflight = [p for p in self._inflight if p not in mine]
+        any_progress = False
         for plan in mine:
             label = plan.label.split(": ", 1)[-1]
             ok = plan.state == PlanState.DONE
@@ -1192,6 +1210,13 @@ class Agent:
             # 熔断入口（编译期失败的在 _note_failure，同一个计数器）。
             if plan.fail_count > 0 and plan.done_count == 0:
                 self._note_failure(f"{label} 全部失败")
+            if plan.done_count > 0:
+                any_progress = True
+        # 干完一件事→2~5 秒后立刻规划下一件（不等满分钟级间隔）。
+        # 只在有实际进展时触发；全败的计划走熔断反馈，让模型自己换路。
+        if any_progress and self.config.plan_done_rethink and not self.state.done_reason:
+            import random as _r2
+            self.request_rethink(_r2.uniform(2.0, 5.0))
 
     def sweep_inflight(self) -> int:
         """把**已经不在执行器里**的计划从 `_inflight` 摘掉。返回摘掉了几个。

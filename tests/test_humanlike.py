@@ -7,7 +7,13 @@ from __future__ import annotations
 
 import random
 import sys
+import time as _time_mod
 import unittest
+
+
+def time_now() -> float:
+    return _time_mod.monotonic()
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -22,7 +28,7 @@ from endstone_arc_fake_player.actions import ActionCompiler  # noqa: E402
 from endstone_arc_fake_player.agent import Agent, AgentConfig  # noqa: E402
 from endstone_arc_fake_player.llm import LLMReply, ToolCall  # noqa: E402
 from endstone_arc_fake_player.plugin import (  # noqa: E402
-    ArcFakePlayerPlugin, _sanitize_speech,
+    ArcFakePlayerPlugin, _sanitize_speech, _strip_punct,
 )
 from endstone_arc_fake_player.roam import RoamDriver  # noqa: E402
 from endstone_arc_fake_player.world import WorldAdapter  # noqa: E402
@@ -374,6 +380,124 @@ class HumanlikeTests(unittest.TestCase):
     def test_sanitize_drops_pure_leftovers(self):
         for raw in ("<message/>", "{}", '""', "", "   "):
             self.assertEqual(_sanitize_speech(raw), "", raw)
+
+    # ---- 说话去标点（v3.9.20） ---------------------------------------
+
+    def test_strip_punct(self):
+        cases = [
+            ("挖到钻石了！", "挖到钻石了"),
+            ("好耶~", "好耶"),
+            ("go go go!", "go go go"),
+            ("233。", "233"),
+            ("（小声）你说啥？", "小声你说啥"),
+            ("来了来了~哈", "来了来了哈"),
+            ("", ""),
+            ("！！！", ""),
+            ("x<y", "xy"),
+        ]
+        for raw, want in cases:
+            self.assertEqual(_strip_punct(raw), want, raw)
+
+    # ---- 核心聊天格式（v3.9.20） --------------------------------------
+
+    def _chat_plugin(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._identities = SimpleNamespace(xuid_of=lambda n: "9372854858298499")
+        plugin._qq_sync = Mock()
+        plugin._activity = Mock()
+        sent: list = []
+        core = Mock()
+        core.format_player_display_label_with_guild = Mock(
+            return_value="§9[金算盘]§r§2[大金商行]§rqianduoduo66")
+        ts = Mock()
+        ts.get_equipped_title_by_xuid = Mock(return_value="金算盘")
+        core.title_system = ts
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=core)),
+            broadcast_message=sent.append)
+        return plugin, sent
+
+    def test_core_chat_format_two_lines(self):
+        plugin, sent = self._chat_plugin()
+        plugin._send_chat("qianduoduo66", "收木头一个价")
+        self.assertEqual(len(sent), 1)
+        msg = sent[0]
+        self.assertTrue(msg.startswith("§9[金算盘]§r§2[大金商行]§rqianduoduo66("), msg)
+        self.assertTrue(msg.endswith(")：\n收木头一个价"), msg)
+
+    def test_broadcast_strips_punctuation_end_to_end(self):
+        plugin, sent = self._chat_plugin()
+        plugin._broadcast("qianduoduo66", "挖到钻石了！大家快来看！")
+        self.assertTrue(sent)
+        for m in sent:
+            self.assertNotIn("！", m)
+        self.assertTrue(any("挖到钻石了" in m for m in sent))
+
+    # ---- 公会身份（v3.9.20） ------------------------------------------
+
+    def test_bot_creates_guild_when_absent(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        calls: list = []
+        gs = Mock()
+        gs.get_membership = Mock(return_value=None)
+        gs.get_guild_by_name = Mock(return_value=None)
+        gs.create_guild = Mock(
+            side_effect=lambda n, x, motto="": (calls.append((n, x)), (True, None))[1])
+        gp = Mock()
+        gp.guild_system = gs
+        gp._refresh_player_name_tag_by_xuid = Mock()
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮")
+        self.assertEqual(calls, [("铜剑帮", "9257971652503711")])
+
+    def test_bot_joins_existing_guild_via_owner(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        gs = Mock()
+        gs.get_membership = Mock(return_value=None)
+        gs.get_guild_by_name = Mock(
+            return_value={"id": 7, "owner_xuid": "9257971652503711"})
+        gs.join_via_live_invite = Mock(return_value=(True, None))
+        gp = Mock()
+        gp.guild_system = gs
+        gp._refresh_player_name_tag_by_xuid = Mock()
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("SuperBoyYiChen", "9604489171753731", "铜剑帮")
+        gs.join_via_live_invite.assert_called_once_with(
+            "9604489171753731", 7, "9257971652503711")
+
+    def test_bot_already_in_guild_is_noop(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        gs = Mock()
+        gs.get_membership = Mock(return_value={"guild_id": 3})
+        gp = Mock()
+        gp.guild_system = gs
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮")
+        gs.create_guild.assert_not_called()
+        gs.join_via_live_invite.assert_not_called()
+
+    # ---- 计划完成即再规划（v3.9.20） -----------------------------------
+
+    def test_request_rethink_shortens_wait(self):
+        agent = self._agent()
+        agent.state.last_snapshot = object()
+        agent.state.thinking = False
+        agent.state.decision_gap = 300.0
+        agent.state.last_decision = time_now()
+        agent.request_rethink(3.0)
+        now = time_now()
+        self.assertFalse(agent.should_think(now + 0.5))
+        self.assertTrue(agent.should_think(now + 3.5))
 
 
 def main():

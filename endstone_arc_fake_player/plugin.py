@@ -241,6 +241,17 @@ def _typing_delay(frag: str) -> float:
     return min(3.0, base) * _random.uniform(0.8, 1.25)
 
 
+#: 说话去标点：保留字词、数字、空白和表情符号，其余（中英文标点、
+#: 括号引号波浪线等）全部去掉。中文玩家的聊天习惯就是不敲标点——
+#: 一句"挖到钻石了！"打到公屏是"挖到钻石了"，才像真人手打。
+_KEEP_SPEECH_RE = re.compile(r"[^\w\s\U0001F000-\U0001FAFF]+")
+
+
+def _strip_punct(frag: str) -> str:
+    """剥掉一句话里的所有标点。剥完为空返回空串（调用方丢弃）。"""
+    return re.sub(r"\s{2,}", " ", _KEEP_SPEECH_RE.sub("", str(frag or ""))).strip()
+
+
 def _mentions(low_message: str, name: str) -> bool:
     """消息（已小写）里是否"点名"提到这个 AI。
 
@@ -977,6 +988,11 @@ class ArcFakePlayerPlugin(Plugin):
             },
             # 角色卡：name 必填；persona 性格、goal 目标、money 初始金钱可选。
             # 改这里后 /ai reload 即可生效（无需重启）。
+            # 可选身份字段（上线时自动应用，幂等）：
+            #   "guild": "公会名"        公会不存在→该假人建会任会长（钱包扣建会费）；
+            #                           已存在→由该会会长经在线邀请直拉入会
+            #   "title": "头衔名"        聊天/头顶名牌的前缀头衔
+            #   "title_rarity": "稀有"   普通/稀有/史诗/传奇/神话（默认普通）
             "characters": [
                 {"name": "Aqing",
                  "persona": "你性格安静温和，说话简短有礼，喜欢钓鱼和收集花草，"
@@ -3535,6 +3551,8 @@ class ArcFakePlayerPlugin(Plugin):
             self._ensure_core_identity(player, name)
             self._core_playtime(name, joining=True)
             self._init_wallet_once(name, money)
+            # 头衔/公会（角色卡配了才生效；核心/公会插件缺席静默跳过）
+            self._apply_card_identity(name, player)
             self._announce_join(name)
             self._record("spawn", f"角色卡真身已加入，目标: {goal[:60]}",
                          who=name)
@@ -3640,6 +3658,105 @@ class ArcFakePlayerPlugin(Plugin):
             self._economy.ensure_wallet(name, float(money))
         else:
             self._economy.ensure_wallet(name, None)
+
+    def _apply_card_identity(self, name: str, player: Any) -> None:
+        """按角色卡给假人佩戴头衔、加入公会（都在线幂等，重复调用无害）。
+
+        角色卡可选字段：
+          "guild": "公会名"        第一个持此公会的假人当会长创建（钱包扣费），
+                                  后来者由会长直拉入会
+          "title": "头衔名"        佩戴在聊天/头顶名牌上
+          "title_rarity": "稀有"  头衔稀有度（普通/稀有/史诗/传奇/神话，默认普通）
+
+        核心或公会插件缺席时静默跳过——假人照样玩，只是没有头衔和公会。
+        """
+        card = None
+        try:
+            for c in self.crowd_cards():
+                if str((c or {}).get("name", "")) == name:
+                    card = c
+                    break
+        except Exception:
+            card = None
+        if not card:
+            return
+        xuid = ""
+        try:
+            if self._identities is not None:
+                xuid = str(self._identities.xuid_of(name) or "")
+        except Exception:
+            xuid = ""
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            core = None
+
+        # ---- 头衔：注册定义 → 解锁 → 佩戴 ----
+        title = str(card.get("title") or "").strip()
+        if title and core is not None:
+            rarity = str(card.get("title_rarity") or "").strip() or "普通"
+            try:
+                if callable(getattr(core, "api_ensure_title_definition", None)):
+                    core.api_ensure_title_definition(
+                        title, rarity, description=f"{name} 的身份头衔")
+                if callable(getattr(core, "api_unlock_title_by_xuid", None)):
+                    core.api_unlock_title_by_xuid(xuid, title, rarity)
+                ts = getattr(core, "title_system", None)
+                if (ts is not None
+                        and callable(getattr(ts, "set_equipped_title_by_xuid", None))
+                        and ts.get_equipped_title_by_xuid(xuid) != title):
+                    ts.set_equipped_title_by_xuid(xuid, title, rarity)
+                self._record("spawn", f"佩戴头衔 [{title}]", who=name)
+            except Exception as exc:
+                self.logger.debug(f"[{name}] 头衔设置失败: {exc}")
+
+        # ---- 公会：建会或入会 ----
+        guild = str(card.get("guild") or "").strip()
+        if guild:
+            self._bot_join_guild(name, xuid, guild)
+
+        # 头衔/公会都会进核心统一的名牌格式（前缀+名字），刷一次。
+        if core is not None and callable(getattr(core, "_update_player_name_tag", None)):
+            try:
+                core._update_player_name_tag(player)
+            except Exception:
+                pass
+
+    def _bot_join_guild(self, name: str, xuid: str, guild_name: str) -> None:
+        """假人入会：公会不存在则自己当会长创建（走钱包扣费），
+        已存在则由该会会长经"在线邀请"通道直拉入会。幂等。"""
+        try:
+            gp = self.server.plugin_manager.get_plugin("arc_guild")
+        except Exception:
+            gp = None
+        gs = getattr(gp, "guild_system", None) if gp is not None else None
+        if gs is None or not callable(getattr(gs, "get_membership", None)):
+            self.logger.debug(f"[{name}] 弧光公会不在，跳过公会身份")
+            return
+        try:
+            if gs.get_membership(xuid):
+                return          # 已经在会里（可能不同会——尊重现状不动）
+            existing = gs.get_guild_by_name(guild_name)
+            if existing is None:
+                ok, err = gs.create_guild(guild_name, xuid, motto="假人公会")
+                if ok:
+                    self._record("spawn", f"创建公会 [{guild_name}] 并任会长", who=name)
+                else:
+                    self._record("spawn", f"创建公会 [{guild_name}] 失败: {err}", who=name)
+            else:
+                gid = int(existing.get("id") or 0)
+                owner = str(existing.get("owner_xuid") or "").strip()
+                ok, err = gs.join_via_live_invite(xuid, gid, owner)
+                if ok:
+                    self._record("spawn", f"加入公会 [{guild_name}]", who=name)
+                else:
+                    self._record("spawn", f"加入公会 [{guild_name}] 失败: {err}", who=name)
+            # 公会前缀槽 + 名牌刷新（公会插件的自家函数，缺席就跳过）
+            refresh = getattr(gp, "_refresh_player_name_tag_by_xuid", None)
+            if callable(refresh):
+                refresh(xuid)
+        except Exception as exc:
+            self.logger.debug(f"[{name}] 公会操作失败: {exc}")
 
     def _ensure_core_identity(self, player: Any, name: str) -> None:
         """假人身体接上时，主动让弧光核心完成"玩家数据初始化"。
@@ -4695,6 +4812,8 @@ class ArcFakePlayerPlugin(Plugin):
             self._ensure_core_identity(player, name)
             self._core_playtime(name, joining=True)
             self._init_wallet_once(name, money)
+            # 头衔/公会（角色卡配了才生效；核心/公会插件缺席静默跳过）
+            self._apply_card_identity(name, player)
             self._announce_join(name)
         else:
             # 等真身加入，_try_attach_pending 接管
@@ -6501,7 +6620,9 @@ class ArcFakePlayerPlugin(Plugin):
         if not text:
             self._record("chat", f"丢弃结构残渣发言：{str(message)[:60]}", who=name)
             return
-        frags = _split_speech(text)
+        # 先按标点分句（错峰发送的依据），再逐句去标点——顺序不能反，
+        # 分句靠标点，真人手打不带标点。
+        frags = [f for f in (_strip_punct(frag) for frag in _split_speech(text)) if f]
         if not frags:
             return
         self._send_chat(name, frags[0])
@@ -6511,11 +6632,54 @@ class ArcFakePlayerPlugin(Plugin):
             self._schedule_chat(name, frag, delay)
 
     def _send_chat(self, name: str, text: str) -> None:
+        """广播一条假人发言。
+
+        优先走弧光核心的**玩家聊天同款格式**（头衔/公会前缀 + 时间戳
+        两行式——真人在本服的聊天都被核心格式化成这样，假人不用同款
+        一眼穿帮）。核心不在或格式化失败时退回旧的简单格式。
+        """
+        if self._core_broadcast_chat(name, text):
+            return
         self.server.broadcast_message(f"{C.AQUA}<{name}>{C.RESET} {text}")
-        # 真人聊天会触发 PlayerChatEvent、被 QQ 同步插件转进群；假人的
-        # broadcast 不触发任何事件——群里"看不到这个人说话"就穿帮了。
-        # 这里直调同步插件的 api_send_event 补一条，格式与真人完全一致。
         self._qq_sync("chat", name, text)
+
+    def _core_broadcast_chat(self, name: str, text: str) -> bool:
+        """用弧光核心 on_player_chat 的同款格式广播。成功返回 True。
+
+        格式（与核心一致，勿漂移）：
+            [头衔][公会]名字(2026.10.31-14:05)：
+            消息内容
+        前缀由核心统一计算（头衔=内置槽，公会=ARCGuild 注册的槽），
+        假人佩戴了头衔/入了会就自然带上——和真人完全一个渲染路径。
+        """
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            core = None
+        if (core is None
+                or not callable(getattr(core, "format_player_display_label_with_guild", None))):
+            return False
+        try:
+            import datetime as _dt
+            xuid = ""
+            if self._identities is not None:
+                xuid = str(self._identities.xuid_of(name) or "")
+            equipped = None
+            ts = getattr(core, "title_system", None)
+            if (ts is not None
+                    and callable(getattr(ts, "get_equipped_title_by_xuid", None))):
+                equipped = ts.get_equipped_title_by_xuid(xuid)
+            now = _dt.datetime.now()
+            time_str = (f"{now.year}.{now.month}.{now.day}-"
+                        f"{now.hour}:{now.minute:02d}")
+            base = core.format_player_display_label_with_guild(
+                name, equipped, xuid)
+            self.server.broadcast_message(f"{base}({time_str})：\n{text}")
+            self._qq_sync("chat", name, text)
+            return True
+        except Exception as exc:
+            self.logger.debug(f"核心聊天格式失败，退回默认格式: {exc}")
+            return False
 
     def _schedule_chat(self, name: str, text: str, seconds: float) -> None:
         """延迟发一句（模拟打字）。调度不可用就直接发，别吞话。

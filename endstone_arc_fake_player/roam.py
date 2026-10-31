@@ -62,8 +62,12 @@ class RoamDriver:
       log(msg)              调试日志
     """
 
-    #: 两次行动的间隔（秒），随机区间——固定间隔看起来像机器
-    ACTION_GAP = (10.0, 26.0)
+    #: 两次行动的间隔（秒），随机区间。
+    #:
+    #: v3.9.20 起 10~26 秒压到 0.8~2.2 秒：用户反馈"执行完一个动作会休息"，
+    #: 真人闲逛是连着走的（到点→几乎立刻下一个兴趣点）。微间隔保留一点点
+    #: 随机性（还是不想像机器），但不再是肉眼可见的罚站。
+    ACTION_GAP = (0.8, 2.2)
     #: 兴趣点离锚点的距离（格），随机区间
     POI_RADIUS = (6, 18)
     #: 到点后顺手挖一块方块的概率（0 = 永不挖）
@@ -107,9 +111,9 @@ class RoamDriver:
         否则一次失败就能让假人在原地罚站半个间隔以上。
         """
         st = self.state_of(name)
-        st.next_at = self._clock() + 3.0
+        st.next_at = self._clock() + 1.5
         if why:
-            self._log(f"[{name}] 闲逛动作失败，3 秒后重试: {why}")
+            self._log(f"[{name}] 闲逛动作失败，1.5 秒后重试: {why}")
 
     def kick_far(self, name: str) -> None:
         """把一个人"带离现场"：下一个兴趣点取远处（40~120 格）。
@@ -135,9 +139,10 @@ class RoamDriver:
 
     def _tick_one(self, name: str, now: float) -> None:
         st = self.state_of(name)
-        # 忙就让路：不发起新动作，行动节奏顺延
+        # 忙就让路：不发起新动作。1 秒后重查——大脑的计划优先，
+        # 但计划一结束闲逛层要能立刻接上，不能空 8 秒。
         if self._busy(name):
-            st.next_at = now + 8.0
+            st.next_at = now + 1.0
             return
         if now < st.next_at:
             return
