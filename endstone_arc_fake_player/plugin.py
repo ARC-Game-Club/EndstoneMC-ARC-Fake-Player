@@ -989,8 +989,10 @@ class ArcFakePlayerPlugin(Plugin):
             # 角色卡：name 必填；persona 性格、goal 目标、money 初始金钱可选。
             # 改这里后 /ai reload 即可生效（无需重启）。
             # 可选身份字段（上线时自动应用，幂等）：
-            #   "guild": "公会名"        公会不存在→该假人建会任会长（钱包扣建会费）；
-            #                           已存在→由该会会长经在线邀请直拉入会
+            #   "guild": "公会名"        入会/建会见下一条 guild_owner
+            #   "guild_owner": true      会长卡：公会不存在→建会任会长（钱包扣建会费）；
+            #                           成员卡（默认）：公会不存在→等会长建会，下次上线再入；
+            #                           公会已存在→一律由会长经在线邀请直拉入会
             #   "title": "头衔名"        聊天/头顶名牌的前缀头衔
             #   "title_rarity": "稀有"   普通/稀有/史诗/传奇/神话（默认普通）
             "characters": [
@@ -3713,7 +3715,8 @@ class ArcFakePlayerPlugin(Plugin):
         # ---- 公会：建会或入会 ----
         guild = str(card.get("guild") or "").strip()
         if guild:
-            self._bot_join_guild(name, xuid, guild)
+            self._bot_join_guild(
+                name, xuid, guild, owner=bool(card.get("guild_owner")))
 
         # 头衔/公会都会进核心统一的名牌格式（前缀+名字），刷一次。
         if core is not None and callable(getattr(core, "_update_player_name_tag", None)):
@@ -3722,9 +3725,16 @@ class ArcFakePlayerPlugin(Plugin):
             except Exception:
                 pass
 
-    def _bot_join_guild(self, name: str, xuid: str, guild_name: str) -> None:
-        """假人入会：公会不存在则自己当会长创建（走钱包扣费），
-        已存在则由该会会长经"在线邀请"通道直拉入会。幂等。"""
+    def _bot_join_guild(self, name: str, xuid: str, guild_name: str,
+                        *, owner: bool = False) -> None:
+        """假人入会。幂等。
+
+        谁当会长由角色卡 ``guild_owner`` 钉死（不受上线顺序影响）：
+          · 会长卡：公会不存在→建会任会长（钱包扣费）；存在→照常入会。
+          · 成员卡：公会不存在→**这轮先不入**（等会长上线建会，下次
+            轮换到自己时再入）——否则谁先上线谁建会，"张少校的弧光
+            卫队"会变成治安队长开的。
+        """
         try:
             gp = self.server.plugin_manager.get_plugin("arc_guild")
         except Exception:
@@ -3738,6 +3748,11 @@ class ArcFakePlayerPlugin(Plugin):
                 return          # 已经在会里（可能不同会——尊重现状不动）
             existing = gs.get_guild_by_name(guild_name)
             if existing is None:
+                if not owner:
+                    self._record(
+                        "spawn", f"公会 [{guild_name}] 尚未由会长创建，"
+                                 f"下次上线再入会", who=name)
+                    return
                 ok, err = gs.create_guild(guild_name, xuid, motto="假人公会")
                 if ok:
                     self._record("spawn", f"创建公会 [{guild_name}] 并任会长", who=name)

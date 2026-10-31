@@ -451,7 +451,7 @@ class HumanlikeTests(unittest.TestCase):
         gp._refresh_player_name_tag_by_xuid = Mock()
         plugin.server = SimpleNamespace(
             plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
-        plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮")
+        plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮", owner=True)
         self.assertEqual(calls, [("铜剑帮", "9257971652503711")])
 
     def test_bot_joins_existing_guild_via_owner(self):
@@ -485,6 +485,23 @@ class HumanlikeTests(unittest.TestCase):
         plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮")
         gs.create_guild.assert_not_called()
         gs.join_via_live_invite.assert_not_called()
+
+    def test_member_bot_waits_for_owner_guild(self):
+        """成员卡遇到公会不存在：不抢建，等会长（防'张少校的卫队被治安队长开走'）。"""
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        gs = Mock()
+        gs.get_membership = Mock(return_value=None)
+        gs.get_guild_by_name = Mock(return_value=None)
+        gs.create_guild = Mock()
+        gp = Mock()
+        gp.guild_system = gs
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("SuperBoyYiChen", "9604489171753731",
+                               "弧光卫队", owner=False)
+        gs.create_guild.assert_not_called()
 
     # ---- 计划完成即再规划（v3.9.20） -----------------------------------
 
