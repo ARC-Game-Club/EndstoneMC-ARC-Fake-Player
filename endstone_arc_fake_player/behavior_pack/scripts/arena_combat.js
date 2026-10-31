@@ -83,6 +83,11 @@ let simsRef = new Map();
 /** 名字 → 出生点（我们生成它的地方）。 */
 const spawnPoints = new Map();
 
+/** 名字 → 它应该在哪儿重生（地面上）。引擎的 setSpawnPoint 对
+ *  SimulatedPlayer 两种写法都不认，所以这个点由我们自己用，
+ *  重生之后把假人传送过来（见 main.js 的 teleportAfterRespawn）。 */
+const respawnPoints = new Map();
+
 /** 名字 → 上一拍的位置，用来发现"死后重生"造成的位置突变。 */
 const lastPositions = new Map();
 
@@ -137,17 +142,25 @@ const NOT_STANDABLE = [
 /**
  * 从 fromY 往下找这一列第一块**能站人**的方块，返回可站立的 y（方块 y + 1）。
  *
- * ⚠️ `getBlock()` 在**区块没加载**时返回 undefined——那不是"这里是空气"，
- * 必须当成"扫不了"直接放弃，不能当成空气一路扫到底（那会一路扫到 y=-64
- * 然后返回 null，白白丢掉一个本来能扫出来的地面）。
+ * ⚠️ 这里**不能**用 `safe()` 包 getBlock——它把"抛异常"和"返回 undefined"
+ * 混成同一个值，于是分不清两种完全不同的情况：
+ *   · 抛异常 = 这一列的区块没加载 → **扫不了**，直接放弃；
+ *   · 返回 undefined = 这一格是空气 → **继续往下找**。
+ * 混起来的后果：假人明明站在地面上（脚下一格就是地板），扫描却在第一格
+ * 空气上就放弃了 → 地面点找不到 → 重生点没地方设。
  */
 function findGroundY(x, z, fromY) {
     const dim = safe(() => world.getDimension("overworld"));
     if (!dim) return null;
     const start = Math.min(fromY, 318);
     for (let y = start; y >= -64; y--) {
-        const block = safe(() => dim.getBlock({ x: x, y: y, z: z }));
-        if (block === undefined) return null;   // 区块没加载 → 扫不了
+        let block;
+        try {
+            block = dim.getBlock({ x: x, y: y, z: z });
+        } catch (e) {
+            return null;   // 区块没加载 → 扫不了
+        }
+        if (!block) continue;            // 空气（或引擎没给）→ 继续往下
         if (block.isAir || block.isLiquid) continue;
         const id = String(block.typeId || "").toLowerCase();
         if (NOT_STANDABLE.some((bad) => id.endsWith(bad))) continue;
@@ -157,20 +170,21 @@ function findGroundY(x, z, fromY) {
 }
 
 /**
- * 设引擎重生点。
+ * 设引擎重生点（**尽力而为**，真正的保障在 respawn 后的那次传送）。
  *
- * ⚠️ **参数个数是这套 bug 的核心**。
- * 本机 BDS 1.26.52.3 的脚本 API 里 `setSpawnPoint` 只收 **0~1** 个参数
- * （dimension 参数被去掉了）。老写法 `setSpawnPoint(loc, dim)` 会抛：
+ * ⚠️ **本机 BDS 上这条路是走不通的**，两种写法都失败：
  *
- *     TypeError: Incorrect number of arguments to function.
- *                Expected 0-1, received 2
+ *   · `setSpawnPoint(loc)`（新引擎签名，dimension 参数已移除）
+ *     → 引擎内部要取实体的 dimension，而 SimulatedPlayer **不暴露** dimension
+ *       → 抛 "Interface property ['dimension'] expected type: Dimension"
+ *   · `setSpawnPoint(loc, dim)`（老引擎签名）
+ *     → 抛 "Incorrect number of arguments to function. Expected 0-1, received 2"
  *
- * 于是重生点**从来没设成功过**——假人死后引擎把它放回"创建时的位置"。
- * 而创建时的位置常常在半空（Python 侧扫不到地表时退回 y=200），
- * 于是：出生在半空 → 摔死 → 自动重生 → 又是半空 → 再摔死，死循环。
+ * 所以重生点这条路只能当"锦上添花"。**真正管用的是 `respawnPoints` + 重生后传送**
+ * （见 main.js 的 autoRespawn / teleportAfterRespawn）。
  *
- * 所以先试 1 个参数（新引擎），失败再退回 2 个参数的写法（老引擎）。
+ * 这里把两种错误都打出来——否则只看得到最后那个"参数个数"错误，
+ * 会误以为是写法不对，而实际上单参数写法也过不去。
  */
 function applySpawnPoint(sim, point) {
     if (!sim || typeof sim.setSpawnPoint !== "function") return false;
@@ -179,19 +193,20 @@ function applySpawnPoint(sim, point) {
         sim.setSpawnPoint(loc);
         return true;
     } catch (e1) {
+        console.warn(`${TAG} setSpawnPoint 单参数写法失败: ${e1}`);
         try {
             const dim = safe(() => world.getDimension("overworld"));
             sim.setSpawnPoint(loc, dim);
             return true;
         } catch (e2) {
-            console.warn(`${TAG} 设置重生点失败: ${e2}`);
+            console.warn(`${TAG} setSpawnPoint 双参数写法也失败: ${e2}`);
             return false;
         }
     }
 }
 
 /**
- * 记录假人的出生点，并把它设成引擎的重生点。
+ * 记录假人的出生点，并算出它该在哪儿重生。
  *
  * ⚠️ 重生点必须落在**地面上**，不能直接用"我们把它生成在哪"。
  * 生成点经常在半空（Python 侧扫不到地表 → 退回 y=200），
@@ -208,12 +223,39 @@ export function rememberSpawnPoint(name, sim, loc) {
     const respawn = groundY === null
         ? point
         : { x: point.x, y: groundY, z: point.z };
-    const ok = applySpawnPoint(sim, respawn);
+    respawnPoints.set(name, respawn);
+    applySpawnPoint(sim, respawn);
     console.log(
         `${TAG} 假人 ${name} 出生于 (${point.x}, ${point.y}, ${point.z})；`
-        + `重生点${ok ? "已设为" : "设置失败"} (${respawn.x}, ${respawn.y}, ${respawn.z})`
-        + (groundY === null ? "（脚下没扫到地面，先按生成点设）" : ""),
+        + `地面重生点 (${respawn.x}, ${respawn.y}, ${respawn.z})`
+        + (groundY === null ? "（脚下没扫到地面，先按生成点算）" : ""),
     );
+}
+
+/**
+ * 这个假人应该在哪儿重生。
+ *
+ * main.js 的 autoRespawn 用它：引擎把假人放回**它自己的**重生点，
+ * 而那个点我们设不上（见 applySpawnPoint），于是引擎退回世界出生点——
+ * 高度是 level.dat 里的自动值（无规则服 32767），可能落在半空，
+ * 落地即摔死，接着再重生，死循环。所以我们自己把它挪到这里。
+ */
+export function getRespawnPoint(name) {
+    return respawnPoints.get(name) || null;
+}
+
+/**
+ * 假人被移除时清掉它的记录。
+ *
+ * 不清的话，每次角色轮换下线都会在四张表里留下一条——
+ * 假人每 20~180 分钟换一轮，几天下来表就撑大了。
+ */
+export function forgetBot(name) {
+    spawnPoints.delete(name);
+    respawnPoints.delete(name);
+    lastPositions.delete(name);
+    lastHealth.delete(name);
+    landingState.delete(name);
 }
 
 /**
@@ -221,7 +263,7 @@ export function rememberSpawnPoint(name, sim, loc) {
  *
  * 为什么还要钉第二遍：生成那一刻的地面扫描也可能失败（区块还没加载完）。
  * 等它**真的站住了**（连续两次采样 Y 不变），脚下那块地一定是实的——
- * 这时候再设一次重生点，就再也不会"死后回到半空"。
+ * 这时候再更新一次，之后它每次重生都会回到这块地上。
  */
 function pinSpawnPointOnLanding(name, sim, loc) {
     const st = landingState.get(name) || { y: null, still: 0, done: false };
@@ -238,9 +280,9 @@ function pinSpawnPointOnLanding(name, sim, loc) {
     const respawn = groundY === null
         ? { x: x, y: Math.floor(loc.y), z: z }
         : { x: x, y: groundY, z: z };
-    if (applySpawnPoint(sim, respawn)) {
-        console.log(`${TAG} 假人 ${name} 已落地，重生点钉在 (${respawn.x}, ${respawn.y}, ${respawn.z})`);
-    }
+    respawnPoints.set(name, respawn);
+    applySpawnPoint(sim, respawn);
+    console.log(`${TAG} 假人 ${name} 已落地，重生点钉在 (${respawn.x}, ${respawn.y}, ${respawn.z})`);
 }
 
 export function getSpawnPoint(name) {

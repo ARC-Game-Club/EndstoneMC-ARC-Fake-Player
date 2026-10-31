@@ -72,6 +72,8 @@ import {
     findNearestEnemy,
     fireSimShot,
     watchRespawn,
+    getRespawnPoint,
+    forgetBot,
     isAlive,
 } from "./arena_combat.js";
 
@@ -464,6 +466,7 @@ function doRemove(name, id) {
         // disconnect 会抛异常是常态（玩家已经不在），忽略
     }
     sims.delete(name);
+    forgetBot(name);
     const w = walking.get(name);
     if (w) {
         walking.delete(name);
@@ -1854,9 +1857,51 @@ function autoRespawn(name, sim) {
     try {
         sim.respawn();
         console.log(`${TAG} 假人 ${name} 阵亡，已自动重生（替它点了重生按钮）`);
+        teleportAfterRespawn(name, sim);
     } catch (e) {
         console.warn(`${TAG} 假人 ${name} 自动重生失败: ${e}`);
     }
+}
+
+/**
+ * 重生之后把假人挪到地面重生点。
+ *
+ * 为什么要多这一步
+ * ----------------
+ * `sim.respawn()` 把假人放回**引擎认定的重生点**。而这个重生点我们设不上：
+ * 对 SimulatedPlayer，`setSpawnPoint` 两种写法都不认（单参数写法因为实体
+ * 不暴露 dimension 而失败，双参数写法因为本机引擎只收 0~1 个参数而失败），
+ * 于是引擎退回**世界出生点**。
+ *
+ * 世界出生点的高度是 level.dat 里的"自动"值（无规则服 ARCAnarchy 是
+ * `SpawnY=32767`，由引擎运行时解析，实测 200 / 312 都出现过），而那一列
+ * 在山上——所以假人每次重生都掉回半空，落地摔死，接着再重生，死循环。
+ *
+ * 所以这里在重生完成后自己把它传送回记下来的地面点。传送用的是
+ * `sim.teleport()`，和插件平时指挥假人走位用的是同一条路（已验证可用）。
+ */
+function teleportAfterRespawn(name, sim) {
+    const p = getRespawnPoint(name);
+    if (!p) return;
+    let ticks = 0;
+    const timer = system.runInterval(() => {
+        ticks += 1;
+        try {
+            if (!sim || sim.isValid === false) {
+                system.clearRun(timer);
+                return;
+            }
+            // 等引擎把这次重生做完（位置还没落地时传送会被覆盖）。
+            if (ticks < 3) return;
+            system.clearRun(timer);
+            const dim = world.getDimension("overworld");
+            sim.teleport({ x: p.x, y: p.y, z: p.z }, { dimension: dim });
+            console.log(`${TAG} 假人 ${name} 重生后已挪到地面 (${p.x}, ${p.y}, ${p.z})`);
+        } catch (e) {
+            system.clearRun(timer);
+            console.warn(`${TAG} 假人 ${name} 重生后挪回地面失败: ${e}`);
+        }
+    }, 1);
 }
 
 // 心跳：每 5 秒无条件 pong。Python 用它判断行为包是否真的活着。

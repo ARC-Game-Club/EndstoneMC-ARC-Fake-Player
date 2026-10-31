@@ -202,7 +202,7 @@ class PendingGameModeTests(unittest.TestCase):
 class BehaviorPackContractTests(unittest.TestCase):
     """行为包侧的契约（源码断言——这套引擎上跑不了 JS，只能钉源码）。"""
 
-    def test_set_spawn_point_uses_one_argument_first(self):
+    def test_set_spawn_point_tries_one_argument_first(self):
         """本机 BDS 的 setSpawnPoint 只收 0~1 个参数，必须先按 1 个参数调。"""
         body = _js_slice(JS_SRC, "function applySpawnPoint")
         self.assertIn("sim.setSpawnPoint(loc);", body)
@@ -212,11 +212,21 @@ class BehaviorPackContractTests(unittest.TestCase):
                         body.index("sim.setSpawnPoint(loc, dim);"),
                         "必须先试 1 个参数，再退回 2 个参数")
 
+    def test_both_spawn_point_errors_are_logged(self):
+        """两种写法的错误都要打出来。
+
+        否则只看得到最后那个"参数个数"错误，会误以为只是写法不对——
+        实际上单参数写法也过不去（实体不暴露 dimension）。
+        """
+        body = _js_slice(JS_SRC, "function applySpawnPoint")
+        self.assertIn("单参数写法失败", body)
+        self.assertIn("双参数写法也失败", body)
+
     def test_respawn_point_is_ground_not_creation_position(self):
         """重生点要落在地面上，不能直接用生成时的位置（可能在半空）。"""
         body = _js_slice(JS_SRC, "export function rememberSpawnPoint")
         self.assertIn("findGroundY(", body)
-        self.assertIn("applySpawnPoint(", body)
+        self.assertIn("respawnPoints.set(name, respawn);", body)
 
     def test_ground_scan_skips_leaves(self):
         """地面扫描要跳过树叶/花草——树冠不是地面。"""
@@ -224,6 +234,18 @@ class BehaviorPackContractTests(unittest.TestCase):
         self.assertIn("NOT_STANDABLE", body)
         self.assertIn("endsWith(bad)", body,
                       "树叶 id 带树种（oak_leaves），只能按后缀拦")
+
+    def test_ground_scan_does_not_abort_on_air(self):
+        """扫描不能在"这一格是空气"上放弃。
+
+        getBlock 抛异常 = 区块没加载（扫不了）；返回 undefined = 空气
+        （继续往下找）。两者混在一起的话，假人明明站在地面上、脚下一格
+        就是地板，扫描也会在第一格空气上就放弃 → 地面点永远找不到。
+        """
+        body = _js_slice(JS_SRC, "function findGroundY")
+        self.assertIn("catch (e)", body, "抛异常（区块没加载）要单独处理")
+        self.assertIn("if (!block) continue;", body,
+                      "undefined 是空气，要继续往下找而不是放弃")
 
     def test_falling_is_not_reported_as_respawn(self):
         """坠落不再被误报成"阵亡后重生"——判据改成"上一拍血量是 0"。"""
@@ -235,7 +257,32 @@ class BehaviorPackContractTests(unittest.TestCase):
     def test_landing_pins_spawn_point(self):
         """落地后要把重生点钉在脚下（生成时那一次扫描也可能失败）。"""
         body = _js_slice(JS_SRC, "function pinSpawnPointOnLanding")
-        self.assertIn("applySpawnPoint(", body)
+        self.assertIn("respawnPoints.set(name, respawn);", body)
+
+    def test_respawn_teleports_to_ground(self):
+        """重生之后必须把它挪回地面——这才是真正管用的那一步。
+
+        引擎的 setSpawnPoint 对 SimulatedPlayer 两种写法都不认，
+        引擎会退回世界出生点（高度是 level.dat 里的自动值，可能在半空）。
+        """
+        self.assertIn("export function getRespawnPoint", JS_SRC)
+        main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
+        self.assertIn("getRespawnPoint", main, "main.js 要用这个点")
+        body = _js_slice(main, "function teleportAfterRespawn")
+        self.assertIn("sim.teleport(", body,
+                      "重生后要靠传送把假人挪回地面")
+        self.assertIn("teleportAfterRespawn(name, sim);", main,
+                      "autoRespawn 里要调用它")
+
+    def test_removed_bot_clears_records(self):
+        """假人被移除时，四张表都要清——不然每轮换人都留一条。"""
+        self.assertIn("export function forgetBot", JS_SRC)
+        body = _js_slice(JS_SRC, "export function forgetBot")
+        for table in ("spawnPoints", "respawnPoints", "lastPositions",
+                      "lastHealth", "landingState"):
+            self.assertIn(f"{table}.delete(name);", body)
+        main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
+        self.assertIn("forgetBot(name);", main)
 
 
 def main():
