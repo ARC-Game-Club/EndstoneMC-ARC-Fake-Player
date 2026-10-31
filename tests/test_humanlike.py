@@ -851,6 +851,84 @@ class HumanlikeTests(unittest.TestCase):
         plugin._social_tick("Bot", agent, actor, _t.monotonic())
         self.assertEqual(walks, [])
 
+    # ---- 泡水/死亡循环检测（v3.9.40） -----------------------------------
+
+    def _water_plugin(self, in_water=True, engaged=False, sleeping=False):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._water_since = {}
+        plugin._rescue_at = {}
+        plugin._agents = {"Bot": Mock()}
+        actor = FakeActor(FakeDimension(), 0, 64, 0)
+        actor.is_in_water = in_water
+        plugin._live_actor = Mock(return_value=actor)
+        plugin._reflex = Mock()
+        plugin._reflex.is_engaged = Mock(return_value=engaged)
+        plugin._sleeping = {"Bot": True} if sleeping else {}
+        rescued = []
+        plugin._rescue_bot = Mock(side_effect=lambda n: rescued.append(n))
+        return plugin, rescued
+
+    def test_water_stuck_triggers_rescue(self):
+        import time as _t
+        plugin, rescued = self._water_plugin()
+        plugin._water_stuck_check()                       # 记首时刻
+        plugin._water_since["Bot"] = _t.monotonic() - 31.0  # 直接泡了 31 秒
+        plugin._water_stuck_check()
+        self.assertEqual(rescued, ["Bot"])
+
+    def test_water_stuck_requires_sustained(self):
+        plugin, rescued = self._water_plugin()
+        plugin._water_stuck_check()                       # 刚入水，不救
+        self.assertEqual(rescued, [])
+
+    def test_water_stuck_ignored_when_fighting_or_asleep(self):
+        import time as _t
+        plugin, rescued = self._water_plugin(engaged=True)
+        plugin._water_stuck_check()
+        plugin._water_since["Bot"] = _t.monotonic() - 60.0
+        plugin._water_stuck_check()
+        self.assertEqual(rescued, [])                     # 打架中不救
+        plugin2, rescued2 = self._water_plugin(sleeping=True)
+        plugin2._water_stuck_check()
+        plugin2._water_since["Bot"] = _t.monotonic() - 60.0
+        plugin2._water_stuck_check()
+        self.assertEqual(rescued, [])                     # 睡觉不救
+
+    def test_water_stuck_fires_even_when_roam_busy(self):
+        """关键：闲逛走位中的 busy 不能挡泡水检测——绕圈走正是被困形态。"""
+        import time as _t
+        plugin, rescued = self._water_plugin()
+        plugin._roam_busy = Mock(return_value=True)       # 模拟"正在走"
+        plugin._water_stuck_check()
+        plugin._water_since["Bot"] = _t.monotonic() - 31.0
+        plugin._water_stuck_check()
+        self.assertEqual(rescued, ["Bot"])
+
+    def test_death_loop_schedules_rescue(self):
+        import time as _t
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._death_times = {}
+        plugin._rescue_at = {}
+        plugin._agents = {}
+        scheduled = []
+        plugin.server = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                run_task=Mock(side_effect=lambda p, fn, delay=0:
+                              scheduled.append(delay))))
+        for _ in range(3):
+            plugin._note_bot_death("Bot")
+        self.assertEqual(scheduled, [240])                # 12 秒后排脱离传送
+        self.assertEqual(plugin._death_times, {})          # 计数已清零
+        # 两次不触发
+        scheduled.clear()
+        for _ in range(2):
+            plugin._note_bot_death("Bot")
+        self.assertEqual(scheduled, [])
+
     # ---- 受困救援（v3.9.29） -------------------------------------------
 
     def _rescue_plugin(self, warps, ok=True):

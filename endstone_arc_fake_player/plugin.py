@@ -666,6 +666,13 @@ class ArcFakePlayerPlugin(Plugin):
         self._warps_cache: tuple[float, list[tuple]] = (0.0, [])
         # 假人名 → 上次传送时刻（tp_warp/tp_spawn 共用 60 秒冷却）
         self._tp_cooldown: dict[str, float] = {}
+        # 泡水计时（假人名 → 首次持续泡水时刻）。日志实证：出生点水池里
+        # 假人绕圈走的每一步都"成功"，失败计数型救援永远不触发——
+        # 泡水本身是独立的受困信号。
+        self._water_since: dict[str, float] = {}
+        # 近期死亡时间戳（假人名 → 列表）：出生点被怪蹲守时 8 秒死一次的
+        # 循环，靠这个检测（3 次/5 分钟 → 强制传送脱离）。
+        self._death_times: dict[str, list[float]] = {}
         # 闲逛走位连续失败的时间戳（monotonic）——受困检测的数据源。
         self._walk_fails: dict[str, list[float]] = {}
         # 上次受困救援时刻（每假人 10 分钟最多救一次）
@@ -3213,6 +3220,7 @@ class ArcFakePlayerPlugin(Plugin):
                         "text": f"你{who}了，几秒后会在重生点醒来"
                                 f"（行为包会自动替你点重生）。这笔账记下了。"}])
                     agent.wake()
+                self._note_bot_death(name)
                 # 复活后补装备：行为包 2~5 秒重生，12 秒后给（装备掉落了
                 # 就按档位补齐；没掉=背包里还有，_apply_gear 只补缺的）
                 try:
@@ -4592,6 +4600,7 @@ class ArcFakePlayerPlugin(Plugin):
         2 秒节拍里做（都是"玩家侧异步等待"性质的看门活，合用一个
         周期任务省一个调度器槽位）。
         """
+        self._water_stuck_check()
         if not self._sleeping and not self._trade_pickups:
             return
         day = not self._is_night()
@@ -4900,6 +4909,70 @@ class ArcFakePlayerPlugin(Plugin):
         if rid >= 0:
             self._walk_fails.pop(name, None)     # 成功发起就清零计数
         return rid >= 0
+
+    #: 持续泡水阈值（秒）：泡在水里超过这么久 → 受困救援。
+    #: 注意**不排除"正在闲逛走位"**——日志实证被困水池的假人绕圈走
+    #: 每步都成功，闲逛的 busy 状态正是被困形态本身，排除了就永远
+    #: 检测不到。只排除睡觉和打架（那是另一类问题，走死亡循环检测）。
+    WATER_STUCK_SECONDS = 30.0
+
+    def _water_stuck_check(self) -> None:
+        """泡水检测：持续泡在水里（出生点水池的典型被困）→ 救援传送。
+
+        为什么失败计数救不了它们：水池里绕圈的每一步走位都成功，
+        `_on_walk_fail` 的计数永远是 0。"""
+        now = time.monotonic()
+        for name in list(self._agents):
+            actor = self._live_actor(name)
+            if actor is None:
+                self._water_since.pop(name, None)
+                continue
+            try:
+                in_water = bool(getattr(actor, "is_in_water", False))
+            except Exception:
+                in_water = False
+            if (not in_water or name in self._sleeping
+                    or self._reflex.is_engaged(name)):
+                self._water_since.pop(name, None)
+                continue
+            since = self._water_since.setdefault(name, now)
+            if now - since >= self.WATER_STUCK_SECONDS:
+                self._water_since.pop(name, None)
+                self._rescue_bot(name)
+
+    #: 死亡循环判定：窗口期内死亡 ≥ 这么多次 → 脱离传送
+    DEATH_LOOP_COUNT = 3
+    DEATH_LOOP_WINDOW = 300.0
+
+    def _note_bot_death(self, name: str) -> None:
+        """死亡记账：短时间反复死（出生点被怪蹲守的循环）→ 传送脱离。
+
+        重生回的还是同一个出生点，怪还在那等着——不传送就是死循环
+        （日志实证 15 分钟被杀 8 次）。重生要几秒，延迟 12 秒再救。"""
+        now = time.monotonic()
+        times = [t for t in self._death_times.get(name, [])
+                 if now - t < self.DEATH_LOOP_WINDOW]
+        times.append(now)
+        self._death_times[name] = times
+        if len(times) < self.DEATH_LOOP_COUNT:
+            return
+        self._death_times.pop(name, None)
+        try:
+            self.server.scheduler.run_task(
+                self, lambda n=name: self._rescue_bot(n), delay=240)
+            agent = self._agents.get(name)
+            if agent is not None:
+                agent.note_events([{
+                    "op": "rescue", "ok": True,
+                    "msg": f"你在短时间内死了 {len(times)} 次——出生点附近"
+                           f"有很强的敌人蹲你。马上会被传送到远处，先在"
+                           f"安全的地方活动，别硬回去"}])
+            self._record("combat",
+                         f"死亡循环（{len(times)} 次/"
+                         f"{self.DEATH_LOOP_WINDOW:.0f}s），安排脱离传送",
+                         who=name)
+        except Exception:
+            pass
 
     #: 受困判定：5 分钟窗口内走位失败 ≥ 这么多次 → 救援
     RESCUE_FAIL_COUNT = 5
