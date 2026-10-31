@@ -180,6 +180,23 @@ const SHOT_LOG_INTERVAL_MS = 2000;
 /** 枪口火焰失败只警告一次，别把日志刷爆。 */
 let muzzleFlashWarned = false;
 
+/** 是不是一把枪。枪械包的枪全在 `blazik:` 命名空间下（护甲/食物/方块是其它命名空间）。 */
+export function isGunId(itemId) {
+    return typeof itemId === "string" && itemId.startsWith("blazik:");
+}
+
+/**
+ * 开火被拒的原因日志。
+ *
+ * 为什么要专门开一个：main.js 调 fireSimShot 时把返回值丢掉了，
+ * 于是"视线被挡 / 手里不是枪 / 空仓"从来没进过日志——2026-11-01
+ * 排查"隔墙穿人"时连"假人到底开没开火"都看不到，全靠猜。
+ * 这里按 key 限流（每类一分钟内最多一条）。
+ */
+function logShotReject(key, message) {
+    logShotThrottled(`reject|${key}`, message);
+}
+
 function logShotThrottled(key, message) {
     const now = Date.now();
     const last = shotLogAt.get(key) || 0;
@@ -726,69 +743,127 @@ function isInvincible(entity) {
     }
 }
 
-/** 会挡住视线的方块（只列常见实心方块）。
+/**
+ * **不**挡视线的方块（其余一律默认挡）。
  *
- *  ⚠ 用**白名单**而不是"不是空气就挡"：后者会被地面、花草、台阶、
- *  自定义 RP 方块误伤 —— AI 于是永远不开枪（比隔墙打更糟）。
+ * 为什么从"白名单"翻成"黑名单"
+ * ----------------------------
+ * 老写法把"会挡视线的方块"列成 70 多项的白名单，不在这张表里的 = 透明。
+ * 结果枪战地图的墙只要不是那几十种之一（自定义 RP 方块 aplok:*、各种
+ * 带颜色前缀的 concrete、抛光石、深板岩……），整面墙就透明 —— 假人
+ * "隔着墙打人"。而且白名单里 `minecraft:concrete` 本身就不是合法 id
+ * （真实 id 是 `minecraft:black_concrete` 这种），那一条从没匹配上。
+ *
+ * 反过来列"放行"的才可靠：**没见过的方块默认挡**，自定义方块自然也算墙。
  */
-const SOLID_BLOCKS = new Set([
-    "minecraft:stone", "minecraft:granite", "minecraft:diorite",
-    "minecraft:andesite", "minecraft:cobblestone", "minecraft:mossy_cobblestone",
-    "minecraft:stone_bricks", "minecraft:mossy_stone_bricks",
-    "minecraft:bricks", "minecraft:obsidian", "minecraft:netherrack",
-    "minecraft:end_stone", "minecraft:end_stone_bricks",
-    "minecraft:dirt", "minecraft:coarse_dirt", "minecraft:podzol",
-    "minecraft:rooted_dirt", "minecraft:grass_block", "minecraft:mycelium",
-    "minecraft:sand", "minecraft:red_sand", "minecraft:gravel",
-    "minecraft:clay", "minecraft:soul_sand", "minecraft:soul_soil",
-    "minecraft:magma", "minecraft:bedrock",
-    "minecraft:oak_planks", "minecraft:spruce_planks", "minecraft:birch_planks",
-    "minecraft:jungle_planks", "minecraft:acacia_planks", "minecraft:dark_oak_planks",
-    "minecraft:oak_log", "minecraft:spruce_log", "minecraft:birch_log",
-    "minecraft:jungle_log", "minecraft:acacia_log", "minecraft:dark_oak_log",
-    "minecraft:oak_wood", "minecraft:spruce_wood", "minecraft:birch_wood",
-    "minecraft:jungle_wood", "minecraft:acacia_wood", "minecraft:dark_oak_wood",
-    "minecraft:oak_fence", "minecraft:spruce_fence", "minecraft:birch_fence",
-    "minecraft:jungle_fence", "minecraft:acacia_fence", "minecraft:dark_oak_fence",
-    "minecraft:glass", "minecraft:glass_pane", "minecraft:tinted_glass",
-    "minecraft:iron_block", "minecraft:gold_block", "minecraft:diamond_block",
-    "minecraft:emerald_block", "minecraft:netherite_block", "minecraft:coal_block",
-    "minecraft:iron_bars", "minecraft:concrete", "minecraft:terracotta",
-    "minecraft:quartz_block", "minecraft:sandstone", "minecraft:red_sandstone",
-    "minecraft:prismarine", "minecraft:dark_prismarine", "minecraft:purpur_block",
-    "minecraft:nether_brick", "minecraft:red_nether_brick",
-    "minecraft:cobblestone_wall", "minecraft:mossy_cobblestone_wall",
-    "minecraft:stone_brick_wall", "minecraft:iron_trapdoor",
+const NON_BLOCKING = new Set([
+    "minecraft:air", "minecraft:cave_air", "minecraft:void_air",
+    "minecraft:water", "minecraft:flowing_water",
+    "minecraft:lava", "minecraft:flowing_lava",
+    // 花草植被、作物、树苗
+    "minecraft:short_grass", "minecraft:tall_grass", "minecraft:fern",
+    "minecraft:large_fern", "minecraft:deadbush", "minecraft:seagrass",
+    "minecraft:kelp", "minecraft:sugar_cane", "minecraft:wheat",
+    "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+    "minecraft:torchflower", "minecraft:pitcher_plant",
+    // 花
+    "minecraft:dandelion", "minecraft:poppy", "minecraft:blue_orchid",
+    "minecraft:allium", "minecraft:azure_bluet", "minecraft:red_tulip",
+    "minecraft:orange_tulip", "minecraft:white_tulip", "minecraft:pink_tulip",
+    "minecraft:oxeye_daisy", "minecraft:cornflower", "minecraft:lily_of_the_valley",
+    // 火把/火/灯笼/线绳类小物件
+    "minecraft:torch", "minecraft:soul_torch", "minecraft:wall_torch",
+    "minecraft:fire", "minecraft:soul_fire", "minecraft:lantern",
+    "minecraft:tripwire", "minecraft:tripwire_hook", "minecraft:cobweb",
+    "minecraft:string",
+    // 按钮/拉杆/压力板/告示牌/旗帜
+    "minecraft:lever", "minecraft:stone_button", "minecraft:oak_button",
+    "minecraft:stone_pressure_plate", "minecraft:oak_pressure_plate",
+    "minecraft:light_weighted_pressure_plate",
+    "minecraft:heavy_weighted_pressure_plate",
+    "minecraft:oak_sign", "minecraft:oak_wall_sign", "minecraft:oak_hanging_sign",
+    // 地毯/雪片/铁轨/脚手架/藤蔓
+    "minecraft:oak_carpet", "minecraft:white_carpet", "minecraft:black_carpet",
+    "minecraft:snow_layer", "minecraft:rail", "minecraft:golden_rail",
+    "minecraft:detector_rail", "minecraft:activator_rail", "minecraft:scaffolding",
+    "minecraft:vine", "minecraft:glow_lichen",
+    // 一片草/花/水的杂项
+    "minecraft:short_dry_grass", "minecraft:tall_dry_grass", "minecraft:bush",
 ]);
 
-/** 视线判定是否可用。
- *
- *  这台服没有 Vector3 类 → getBlockFromRay 用不了（需要原生实例），
- *  所以改成沿射线步进 + getBlock。但 getBlock 收不收普通 {x,y,z}
- *  没验证过，所以整段包 try/catch：**抛异常就永久关闭**这个判定
- *  （退回"不挡枪"的老行为），绝不能因为它把整个行为包带崩
- *  （2026-10-30 实踩过整包加载失败导致假人全灭）。
- */
-let losCheckUsable = true;
+/** 上一次判定的阻挡方块 id（日志用）。 */
+let losLastBlocker = "";
+/** getBlock 不可用的告警只打一次。 */
+let losWarned = false;
 
-/** 射线到 maxDist 之间有没有实心方块挡着。 */
+/**
+ * 射线到 maxDist 之间有没有方块挡着。
+ *
+ * 返回 true = 视线通畅。注意**不再有"永久关闭"**：getBlock 抛异常只影响
+ * 当次（放行 + 告警一次），不会让整局退化成"不挡枪"。
+ */
+/**
+ * 让假人手里握着枪：选中槽不是枪就在快捷栏里找一把切过去。
+ *
+ * 返回手里的枪 id（找不到返回 null）。
+ * 为什么要这么做：假人入场后背包被清、只发护甲，选中槽常常停在护甲上，
+ * 于是"手里拿的不是枪"→ 不开火，玩家看到的是假人站着不还手。
+ * 切选中槽失败（引擎不认）也不报错，退回"不开火"。
+ */
+function ensureHoldingGun(sim) {
+    const held = heldGunId(sim);
+    if (isGunId(held)) return held;
+    let container = null;
+    try {
+        container = sim.getComponent("minecraft:inventory")?.container;
+    } catch (_) {
+        container = null;
+    }
+    if (!container) return null;
+    const size = Math.min(9, Number(container.size) || 9);
+    for (let slot = 0; slot < size; slot++) {
+        let item = null;
+        try {
+            item = container.getItem(slot);
+        } catch (_) {
+            item = null;
+        }
+        if (!item || !isGunId(item.typeId)) continue;
+        try {
+            sim.selectedSlotIndex = slot;
+        } catch (_) {
+            return null;      // 切不过去就别打了（总比拿头盔当枪强）
+        }
+        logShotThrottled(`${sim.name}|takegun`,
+            `${TAG} 假人 ${sim.name} 切到第 ${slot} 格的 ${item.typeId}`);
+        return item.typeId;
+    }
+    return null;
+}
+
 function hasLineOfSight(dim, origin, dir, maxDist) {
-    if (!losCheckUsable || !dim) return true;
-    // 有原生 Vector3 时优先用引擎射线（最准）
+    losLastBlocker = "";
+    if (!dim) return true;
+    // 有原生 Vector3 时优先用引擎射线（最准，直接给出命中的方块）
     const rayOrigin = nativeVec(origin.x, origin.y, origin.z);
     if (rayOrigin) {
         try {
-            const block = dim.getBlockFromRay(
+            const hit = dim.getBlockFromRay(
                 rayOrigin, new Vec3(dir.x, dir.y, dir.z),
                 { maxDistance: Math.min(maxDist, MAX_RANGE) });
-            if (block) return false;
+            if (hit) {
+                losLastBlocker = (hit.block && hit.block.typeId) || "未知方块";
+                return false;
+            }
             return true;
         } catch (_) { /* 落回步进判定 */ }
     }
-    // 步进判定
+    // 步进判定：跳过射手身边和目标身边这两个"贴脸"区间
+    const startAt = 1.0;
+    const stopAt = Math.max(startAt, maxDist - 0.7);
     try {
-        const step = 0.6;
-        for (let d = step; d < maxDist; d += step) {
+        const step = 0.5;
+        for (let d = startAt; d < stopAt; d += step) {
             const block = dim.getBlock({
                 x: origin.x + dir.x * d,
                 y: origin.y + dir.y * d,
@@ -796,13 +871,18 @@ function hasLineOfSight(dim, origin, dir, maxDist) {
             });
             if (!block) continue;
             const typeId = block.typeId;
-            if (!typeId || typeId === "minecraft:air") continue;
-            if (SOLID_BLOCKS.has(typeId)) return false;
+            if (!typeId) continue;
+            if (NON_BLOCKING.has(typeId)) continue;
+            losLastBlocker = typeId;
+            return false;
         }
         return true;
     } catch (e) {
-        losCheckUsable = false;
-        console.warn(`${TAG} 视线判定不可用（getBlock 抛异常），已退回"不挡枪": ${e}`);
+        // 只影响当次：放行并告警一次，绝不永久关闭这个判定
+        if (!losWarned) {
+            losWarned = true;
+            console.warn(`${TAG} 视线判定出错（getBlock），本次放行: ${e}`);
+        }
         return true;
     }
 }
@@ -823,8 +903,18 @@ export function fireSimShot(sim, target, targetName) {
     // 目标无敌中（出生保护 / 开局准备）→ 不打
     if (isInvincible(target)) return { ok: false, err: "目标无敌中" };
 
-    const gunId = heldGunId(sim);
-    if (!gunId) return { ok: false, err: "手里没枪" };
+    // 手里必须是**枪**。
+    //
+    // 2026-10-31 实踩：入场时背包被清、只发护甲，模拟玩家的选中槽停在护甲上，
+    // 于是日志里出现"假人 ak47king 用 minecraft:diamond_helmet 射击 DEVILENMO"
+    // ——拿头盔当枪打人，还照 DEFAULT_DAMAGE 扣血。
+    // 现在：不是枪就自动在快捷栏里找一把切过去，实在没有才不开火。
+    const gunId = ensureHoldingGun(sim);
+    if (!gunId) {
+        logShotReject(`${sim.name}|nogun`,
+            `${TAG} 假人 ${sim.name} 快捷栏里没有枪，不开火`);
+        return { ok: false, err: "手里没枪" };
+    }
 
     const gunKey = gunKeyOf(gunId);
     const ammo = readAmmo(sim.name, gunKey);
@@ -845,6 +935,9 @@ export function fireSimShot(sim, target, targetName) {
 
     // 视线被方块挡住就不开火（不然就是隔墙打人）
     if (!hasLineOfSight(sim.dimension, eye, dir, range)) {
+        logShotReject(`${sim.name}|los`,
+            `${TAG} 假人 ${sim.name} 看不见 ${targetName}：被 ${losLastBlocker || "方块"}`
+            + ` 挡住（距离 ${range.toFixed(1)}），没开火`);
         return { ok: false, err: "视线被挡" };
     }
 
@@ -1062,6 +1155,14 @@ export function handleHumanShot(player, gunId, shotCount = 1) {
     // （队伍在进房那刻就分好了，但那时没在打），所以这里天然不会
     // 误伤等待室里的人。
     const fighting = new Set(getSimsFighting(shooterName));
+    if (fighting.size === 0) {
+        // 这一枪不会结算。最常见的原因：Python 侧的 bot:arena 没把
+        // 这个真人下发成"敌人"（等待阶段不下发，或对局状态不是 playing）。
+        // 不记日志的话，表现就是"我打他完全没反应"，而且查不出来。
+        logShotThrottled(`nofight|${shooterName}`,
+            `${TAG} ${shooterName} 开了一枪（${gunId}），但没有假人把他当敌人，这一枪不结算`);
+        return null;
+    }
 
     let hitName = null;
     let hitSim = null;
@@ -1102,8 +1203,18 @@ export function handleHumanShot(player, gunId, shotCount = 1) {
         hitSim.location.y + 0.9 - origin.y,
         hitSim.location.z - origin.z,
     );
-    if (hitDist > HUMAN_MAX_ENGAGE) return null;
-    if (!hasLineOfSight(hitSim.dimension, origin, dir, hitDist)) return null;
+    if (hitDist > HUMAN_MAX_ENGAGE) {
+        logShotThrottled(`far|${shooterName}`,
+            `${TAG} ${shooterName} 命中 ${hitName} 但超出真人射程`
+            + `（${hitDist.toFixed(1)} > ${HUMAN_MAX_ENGAGE}），没扣血`);
+        return null;
+    }
+    if (!hasLineOfSight(hitSim.dimension, origin, dir, hitDist)) {
+        logShotThrottled(`los|${shooterName}`,
+            `${TAG} ${shooterName} 打 ${hitName} 的射线被 ${losLastBlocker || "方块"}`
+            + ` 挡住（距离 ${hitDist.toFixed(1)}），没扣血`);
+        return null;
+    }
 
     const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
     const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;
