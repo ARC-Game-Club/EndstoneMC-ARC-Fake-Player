@@ -809,8 +809,93 @@ function findEngagedSim(shooterName, origin) {
 }
 
 /**
+ * 真人扣扳机 → 直接把命中的假人打掉血。
+ *
+ * 为什么在这里直接结算，而不是等枪械包广播事件
+ * --------------------------------------------
+ * 这台服（MC 26.52）的 @minecraft/server **没有 world.scriptEvent 这个 API**
+ * （实测 `typeof world.scriptEvent === "undefined"`，诊断包 arc_gun_diag 的
+ * apiProbe 有日志）→ **JS 行为包之间发不了脚本事件**。
+ * 桥接包平时收到的 bot:* 事件是 **Python 插件用 Endstone 的 broadcast_event** 发的，
+ * 不是 JS 发的。所以"枪械包广播 arc_gun:shot → 桥接包收"这条链在这台服上
+ * 从一开始就不成立（广播调用每次都抛异常被吞，日志里 arc_gun:shot 广播数恒为 0）。
+ *
+ * 而 **itemStartUse 每个行为包都收得到**（诊断包一直在收），并且
+ * **getViewDirection() 在这台服是好的**（apiProbe 拿到了完整方向向量）。
+ * 所以：真人扣扳机这件事，桥接包自己就能看到，直接结算，不用绕事件。
+ *
+ * 命中判定用的是 rayHitSim（竖直圆柱求交，纯数学，不依赖引擎的射线 API）。
+ */
+export function handleHumanShot(player, gunId) {
+    if (!player || !gunId) return null;
+
+    let origin;
+    try {
+        const loc = player.location;
+        origin = { x: loc.x, y: loc.y + EYE_HEIGHT, z: loc.z };
+    } catch (_) {
+        return null;
+    }
+
+    let dir = null;
+    try {
+        const d = player.getViewDirection();
+        if (d && Number.isFinite(d.x) && Number.isFinite(d.y) && Number.isFinite(d.z)) {
+            dir = normalized({ x: d.x, y: d.y, z: d.z });
+        }
+    } catch (_) { /* 取不到方向就不结算 */ }
+    if (!dir) return null;
+
+    const shooterName = player.name ?? "";
+    const base = SIM_GUN_DAMAGE[gunId] !== undefined ? SIM_GUN_DAMAGE[gunId] : DEFAULT_DAMAGE;
+
+    // 同一 tick、同一射手只结算一次（防重复广播 + 防连点算多枪）
+    const shotKey = `${shooterName}@${system.currentTick}`;
+    if (recentShots.has(shotKey)) return null;
+    if (recentShots.size > 256) recentShots.clear();
+    recentShots.add(shotKey);
+
+    let hitName = null;
+    let hitSim = null;
+    let hitRatio = -1;
+    for (const [name, sim] of simsRef) {
+        if (!sim || sim.isValid === false) continue;
+        if (name === shooterName) continue;    // 别打到自己
+        if (!isAlive(sim)) continue;
+        const ratio = rayHitSim(origin, dir, sim);
+        if (ratio < 0) continue;
+        if (hitRatio < 0 || ratio > 0) {      // 取更靠前/更高的那个
+            hitRatio = ratio;
+            hitName = name;
+            hitSim = sim;
+        }
+    }
+    if (!hitSim) {
+        logShotThrottled(
+            `miss|${shooterName}`,
+            `${TAG} ${shooterName} 开了一枪（${gunId}）但没打中假人`,
+        );
+        return null;
+    }
+
+    const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
+    const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;
+    const dmg = base * mult;
+    const dealt = applyDamage(hitSim, dmg, player);
+
+    logShotThrottled(
+        `${shooterName}|${hitName}`,
+        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+    );
+    return hitName;
+}
+
+/**
  * 处理枪械包广播来的"开了一枪"：把命中的假人打掉血。
  * 返回被命中的假人名字（没命中返回 null）。
+ *
+ * 注：这条路在这台服上**收不到东西**（world.scriptEvent 不存在，JS 发不出事件），
+ * 留着是为了别的服务器（API 完整时）也能用。
  */
 export function handleShotEvent(data) {
     if (!data) return null;
@@ -834,7 +919,7 @@ export function handleShotEvent(data) {
 
     const base = SIM_GUN_DAMAGE[gunId] !== undefined ? SIM_GUN_DAMAGE[gunId] : DEFAULT_DAMAGE;
 
-    // 同一个 tick、同一个射手，只结算一次。
+    // 同一个 tick、同一个射手，只结算一次（和 handleHumanShot 共用这张表）。
     //
     // 为什么需要：真人开枪的广播可能有两个来源——
     //   ① 枪械包自己主循环里的开火分支；
@@ -975,6 +1060,27 @@ function findSimNear(point, radius = 3.0) {
 //
 // 所以这里整段包 try/catch：**这个订阅挂了最多是"真人打假人没补刀"，
 // 绝不能再把整个行为包带走**（假人开火、复活监控都在这个文件里）。
+// ---------------------------------------------------------------------------
+// 真人扣扳机（itemStartUse）→ 直接结算命中
+// ---------------------------------------------------------------------------
+//
+// itemStartUse 每个行为包都收得到（诊断包一直在收），
+// 所以真人开枪这件事不用绕脚本事件（这台服 world.scriptEvent 压根不存在）。
+try {
+    world.afterEvents.itemStartUse.subscribe((event) => {
+        try {
+            const player = event?.source;
+            const gunId = event?.itemStack?.typeId;
+            if (!player || !gunId) return;
+            if (!gunId.startsWith("blazik:")) return;    // 只管枪械包的枪
+            if (simsRef.has(player.name ?? "")) return;   // 假人自己开枪不算
+            handleHumanShot(player, gunId);
+        } catch (_) { /* 绝不能把整个行为包带走 */ }
+    });
+} catch (_) {
+    // 订阅失败最多是"真人打假人没伤害"，不能连累假人开火/复活监控
+}
+
 try {
     system.afterEvents.scriptEventReceive.subscribe((event) => {
     if (!event) return;
