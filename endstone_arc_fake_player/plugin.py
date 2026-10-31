@@ -53,6 +53,7 @@ Endstone 的 Python API 造不出 SimulatedPlayer，那个接口只在
 # 判断特征：报错里的签名带引号 —— `(event: 'PlayerChatEvent')`。
 # 正常应该是 `(event: PlayerChatEvent)`。
 
+import datetime
 import json
 import math
 import random
@@ -888,6 +889,16 @@ class ArcFakePlayerPlugin(Plugin):
             # 0.15 太冷清了——真人聊天里 AI 多半该接两句。v12 起默认 0.5，
             # 想要"群里有个话痨"就再往上加，想要安静就单独调低。
             "chat_reply_chance": 0.5,
+            # ---- 夜间免打扰 ----
+            # 这段时间假人不**主动**发言（闲聊、签到都不发，QQ 群同步一起静音），
+            # 避免深夜刷群影响大家休息。被点名/被打/交易的**应答不受影响**——
+            # 有人半夜找它，它照样理。进退服的游戏内播报保留（只给在线玩家看）。
+            # 23→8 表示 23:00 起到次日 8:00；start==end 表示全天生效。
+            "night_quiet": {
+                "enabled": True,
+                "start_hour": 23,
+                "end_hour": 8,
+            },
             # ---- 进/退服播报 ----
             # 轮换假人上线/下线时广播一条**原版风格**的消息（真玩家进退服
             # 客户端会自己显示，SimulatedPlayer 不会——不补这条，在线人数
@@ -4201,6 +4212,24 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception:
             return False
 
+    def _night_quiet_on(self, hour: int | None = None) -> bool:
+        """现在是否处于夜间免打扰时段。hour 参数供测试注入。"""
+        cfg_all = getattr(self, "_cfg", None)
+        cfg = (cfg_all.get("night_quiet") or {}) if isinstance(cfg_all, dict) else {}
+        if not cfg.get("enabled", True):
+            return False
+        try:
+            start = int(cfg.get("start_hour", 23)) % 24
+            end = int(cfg.get("end_hour", 8)) % 24
+        except (TypeError, ValueError):
+            return False
+        if start == end:
+            return True          # 起止相同 = 全天
+        h = datetime.datetime.now().hour if hour is None else int(hour) % 24
+        if start > end:          # 跨午夜：23~8 → 23/24/0…7 点
+            return h >= start or h < end
+        return start <= h < end
+
     def _is_night(self) -> bool:
         now = None
         try:
@@ -5153,10 +5182,11 @@ class ArcFakePlayerPlugin(Plugin):
                         f"签到！第{info['rank']}个",
                         "签到"])
                     self._broadcast(name, line)
-                    self._qq_sync(
-                        "custom", name,
-                        f"{name} 签到成功，今日第 {info['rank']} 位，"
-                        f"今日已签到 {info['total']} 人")
+                    if not self._night_quiet_on():
+                        self._qq_sync(
+                            "custom", name,
+                            f"{name} 签到成功，今日第 {info['rank']} 位，"
+                            f"今日已签到 {info['total']} 人")
                     self._record(
                         "checkin",
                         f"签到成功：今日第 {info['rank']}，共 {info['total']} 人",
@@ -5189,7 +5219,7 @@ class ArcFakePlayerPlugin(Plugin):
         # 会触发，qq_sync 自己会发（还延迟 40 tick 等统计同步，时长准确）；
         # 我们再推一条就成了"离开游戏×2"，且从服本地统计滞后会显示
         # "总游戏时长 0 分钟"穿帮。
-        if key == "join_message":
+        if key == "join_message" and not self._night_quiet_on():
             self._qq_sync("join", name)
 
     def _qq_sync(self, event_type: str, name: str, message: str = "") -> None:
@@ -6756,6 +6786,13 @@ class ArcFakePlayerPlugin(Plugin):
         if not text:
             self._record("chat", f"丢弃结构残渣发言：{str(message)[:60]}", who=name)
             return
+        # 夜间免打扰：只压**主动**发言。这一轮被点名/被打/被交易的应答
+        # （agent._turn_woken）照常——半夜有人找它玩，它还是要理的。
+        if self._night_quiet_on():
+            agent = self._agents.get(name)
+            if not bool(getattr(agent, "_turn_woken", False)):
+                self._record("chat", f"夜间免打扰，主动发言忍住了：{text[:40]}", who=name)
+                return
         # 先按标点分句（错峰发送的依据），再逐句去标点——顺序不能反，
         # 分句靠标点，真人手打不带标点。
         frags = [f for f in (_strip_punct(frag) for frag in _split_speech(text)) if f]

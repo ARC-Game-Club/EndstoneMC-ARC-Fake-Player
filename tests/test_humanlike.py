@@ -529,6 +529,48 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 夜间免打扰（v3.9.25） -----------------------------------------
+
+    def _quiet_plugin(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._identities = SimpleNamespace(xuid_of=lambda n: "1")
+        plugin._qq_sync = Mock()
+        plugin._cfg = {"night_quiet": {"enabled": True, "start_hour": 23, "end_hour": 8}}
+        sent: list = []
+        plugin.server = SimpleNamespace(broadcast_message=sent.append)
+        return plugin, sent
+
+    def test_night_quiet_hours(self):
+        plugin, _ = self._quiet_plugin()
+        for h, want in [(22, False), (23, True), (0, True), (7, True), (8, False)]:
+            self.assertEqual(plugin._night_quiet_on(hour=h), want, h)
+
+    def test_night_quiet_mutes_spontaneous_but_not_answers(self):
+        plugin, sent = self._quiet_plugin()
+        plugin._night_quiet_on = lambda: True
+        plugin._agents = {"Bot": SimpleNamespace(_turn_woken=False)}
+        plugin._broadcast("Bot", "半夜闲聊")
+        self.assertEqual(sent, [])          # 主动发言被静音
+        plugin._agents = {"Bot": SimpleNamespace(_turn_woken=True)}
+        plugin._broadcast("Bot", "有人找我")
+        self.assertEqual(len(sent), 1)      # 应答照常
+        plugin._night_quiet_on = lambda: False
+        plugin._agents = {"Bot": SimpleNamespace(_turn_woken=False)}
+        plugin._broadcast("Bot", "白天随便聊")
+        self.assertEqual(len(sent), 2)
+
+    def test_join_qq_sync_muted_at_night(self):
+        plugin, _ = self._quiet_plugin()
+        plugin._night_quiet_on = lambda: True
+        plugin._cfg["join_message"] = "§e{name} 加入了游戏"
+        plugin._announce("join_message", "Bot")
+        plugin._qq_sync.assert_not_called()  # QQ 静音
+        plugin._night_quiet_on = lambda: False
+        plugin._announce("join_message", "Bot")
+        plugin._qq_sync.assert_called_once_with("join", "Bot")
+
     # ---- 安家三件套（v3.9.24） ----------------------------------------
 
     def test_build_structure_compiles_blueprint(self):
