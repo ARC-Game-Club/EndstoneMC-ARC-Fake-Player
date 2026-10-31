@@ -888,6 +888,9 @@ function doDig(req, id) {
         return;
     }
 
+    // 开挖前把最合适的工具换到手上（镐对石头/矿、斧对木头、锹对土）
+    try { autoToolFor(sim, dim, loc); } catch (_) { /* 换不了就照旧 */ }
+
     // 同一方块已经在挖 → 把请求号挂到这次挖掘上，等它结算时一起回复。
     // **绝不静默丢弃**：旧版在这里裸 `return`，那条 `bot:dig` 一条回复都
     // 收不到，Python 侧一直挂到 150 秒超时（"挖着挖着突然不动了"）。
@@ -1205,6 +1208,42 @@ function playerInventory(sim) {
     const inv = sim.getComponent("minecraft:inventory");
     if (!inv || !inv.container) throw new Error("背包不可访问");
     return inv.container;
+}
+
+// 自动持镐/斧/锹：breakBlock 的挖掘速度和掉落都看手持——没镐挖石头
+// 不掉东西、拿着剑半天挖不动。真人都会换工具，这里在开挖前替它把
+// 背包里**该类型最好的工具**换到手上（选不中就照旧，不挡挖掘）。
+const TOOL_RANK = { wooden: 0, stone: 1, copper: 2, iron: 3, golden: 4, diamond: 5, netherite: 6 };
+const TOOL_KIND_RE = /^(wooden|stone|copper|iron|golden|diamond|netherite)_(pickaxe|axe|shovel)$/;
+
+function bestToolSlot(cont, kind) {
+    let best = -1, bestRank = -1;
+    for (let slot = 0; slot < cont.size; slot++) {
+        const item = cont.getItem(slot);
+        if (!item) continue;
+        const m = item.typeId.replace("minecraft:", "").match(TOOL_KIND_RE);
+        if (!m || m[2] !== kind) continue;
+        const rank = TOOL_RANK[m[1]] ?? -1;
+        if (rank > bestRank) { bestRank = rank; best = slot; }
+    }
+    return best;
+}
+
+function blockToolKind(blockShort) {
+    if (/(_ore|stone|cobble|deepslate|granite|diorite|andesite|quartz|basalt|netherrack|blackstone|obsidian|brick|concrete|tuff|calcite|marble|ice$|amethyst|dripstone)/.test(blockShort)) return "pickaxe";
+    if (/(_log$|_wood$|planks|bamboo_block|pumpkin|melon|hay_block|crafting_table|chest$|fence|door$)/.test(blockShort)) return "axe";
+    if (/(dirt|grass_block|sand$|gravel|clay|snow|mud|farmland|podzol)/.test(blockShort)) return "shovel";
+    return null;
+}
+
+function autoToolFor(sim, dim, loc) {
+    const block = dim.getBlock(loc);
+    if (!block) return;
+    const kind = blockToolKind(block.typeId.replace("minecraft:", ""));
+    if (!kind) return;
+    const cont = playerInventory(sim);
+    const slot = bestToolSlot(cont, kind);
+    if (slot >= 0) selectInventorySlot(sim, slot);
 }
 
 function findSlot(cont, typeId) {

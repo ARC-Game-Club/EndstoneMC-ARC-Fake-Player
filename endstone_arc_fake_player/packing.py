@@ -40,7 +40,7 @@ from .nbt import (
 #: ⚠ PACK_VERSION 也必须和 manifest.json 里的 header.version 一致——
 #: 它是往 world_behavior_packs.json 里登记的版本号。升版本时**两处都要改**
 #: （3.9.18 就漏改过这里，登记的版本号被写回 3.9.17）。
-PACK_VERSION = [3, 9, 33]
+PACK_VERSION = [3, 9, 34]
 PACK_UUID = "7d4c1a90-2f63-4b8e-a5d1-9c0e7b3f6a24"
 
 

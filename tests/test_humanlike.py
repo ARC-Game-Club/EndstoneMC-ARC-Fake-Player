@@ -544,6 +544,47 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 挖矿要持镐（v3.9.34） -----------------------------------------
+
+    def test_collect_stone_without_pickaxe_rejected(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler._find_blocks = Mock(return_value=[(1, 63, 1)])
+        actor = FakeActor(dim, 0, 64, 0)
+        compiler.world.scan_inventory = Mock(return_value=[("stick", 2)])
+        r = compiler.compile(actor, ToolCall("collect", {"block": "cobblestone", "count": 8}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("镐子", r.immediate)
+        self.assertIn("chop_tree", r.immediate)
+
+    def test_collect_stone_with_pickaxe_passes(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler._find_blocks = Mock(return_value=[(1, 63, 1)])
+        actor = FakeActor(dim, 0, 64, 0)
+        compiler.world.scan_inventory = Mock(return_value=[("stone_pickaxe", 1)])
+        r = compiler.compile(actor, ToolCall("collect", {"block": "cobblestone", "count": 8}), {})
+        self.assertIsNotNone(r.plan, r.immediate)
+
+    def test_collect_dirt_bare_hands_allowed(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler._find_blocks = Mock(return_value=[(1, 63, 1)])
+        actor = FakeActor(dim, 0, 64, 0)
+        compiler.world.scan_inventory = Mock(return_value=[])
+        r = compiler.compile(actor, ToolCall("collect", {"block": "dirt", "count": 4}), {})
+        self.assertIsNotNone(r.plan, r.immediate)      # 泥土空手能挖
+
+    def test_mine_vein_stone_needs_pickaxe(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler._find_blocks = Mock(return_value=[(2, 63, 2)])
+        actor = FakeActor(dim, 0, 64, 0)
+        compiler.world.scan_inventory = Mock(return_value=[])
+        r = compiler.compile(actor, ToolCall("mine_vein", {"block": "iron_ore"}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("木镐", r.immediate)
+
     # ---- 战力装备档位（v3.9.33） ---------------------------------------
 
     def test_gear_tier_mapping(self):

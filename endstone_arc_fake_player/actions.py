@@ -356,6 +356,12 @@ class ActionCompiler:
         """
         target = short_id(a.get("block", ""))
         cap = int(a.get("max", 16))
+        if self._needs_pickaxe(target) and not self._has_tool(actor, "pickaxe"):
+            return CompileResult(
+                ok=False,
+                immediate=f"挖 {target} 必须有镐子（空手挖不掉）。"
+                          f"先砍树做木镐：chop_tree → craft planks → craft stick → "
+                          f"craft wooden_pickaxe，然后再来挖矿")
         found = self._find_blocks(actor, target, cap, radius=20)
         if found:
             steps = self.dig_steps(found)
@@ -378,6 +384,27 @@ class ActionCompiler:
             immediate=f"20 格内没发现 {target}。{hint}",
         )
 
+    #: 石头系方块（没镐子挖了不掉落）。判据用子串，宁多勿漏——
+    #: 泥土/木头不在内（空手能挖能掉）。
+    _STONE_FAMILY_RE = None  # 惰性编译，见 _needs_pickaxe
+
+    @staticmethod
+    def _needs_pickaxe(block: str) -> bool:
+        import re as _re
+        if ActionCompiler._STONE_FAMILY_RE is None:
+            ActionCompiler._STONE_FAMILY_RE = _re.compile(
+                r"(_ore|stone|cobble|deepslate|granite|diorite|andesite|"
+                r"quartz|basalt|netherrack|blackstone|obsidian|brick|"
+                r"concrete|tuff|calcite|marble|amethyst|dripstone)")
+        return bool(ActionCompiler._STONE_FAMILY_RE.search(str(block or "")))
+
+    def _has_tool(self, actor: Any, kind: str) -> bool:
+        """背包里有没有指定类别的工具（镐/斧/锹，任意材质）。"""
+        for name, _cnt in self.world.scan_inventory(actor):
+            if name.endswith(f"_{kind}"):
+                return True
+        return False
+
     def _do_collect(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         """收集若干块指定方块——和 mine_vein 类似但语义是"攒够数量"。"""
         target = short_id(a.get("block", ""))
@@ -391,6 +418,13 @@ class ActionCompiler:
         if have >= need:
             return CompileResult(immediate=f"背包里已有 {have} 个 {target}，够了")
 
+        if self._needs_pickaxe(target) and not self._has_tool(actor, "pickaxe"):
+            return CompileResult(
+                ok=False,
+                immediate=f"挖 {target} 必须有镐子（空手挖石头不掉东西）。"
+                          f"先 chop_tree 砍树拿原木 → craft 木板和木棍 → "
+                          f"craft wooden_pickaxe（木镐），再回来挖。"
+                          f"有条件就升级石镐/铁镐")
         found = self._find_blocks(actor, target, max(need - have, 4), radius=20)
         if not found:
             return CompileResult(

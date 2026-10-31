@@ -208,6 +208,8 @@ def main() -> int:
           f"实际 {r5.plan.total if r5.plan else 0}")
 
     # --- 找矿：把机器人放到矿区旁边（模拟它自己走下去）---
+    # v3.9.34 起挖矿要持镐——给测试机器人配一把铁镐
+    compiler.world.scan_inventory = lambda a, limit=12: [("iron_pickaxe", 1)]
     actor.location = FakeLocation(21.5, 64.0, 21.5)
     r6 = compiler.compile(actor, ToolCall("mine_vein", {"block": "diamond_ore", "max": 8}), {})
     check("站在矿区附近时 mine_vein 能找到矿石", r6.plan and r6.plan.total >= 4,
