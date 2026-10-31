@@ -1002,10 +1002,22 @@ class ArcFakePlayerPlugin(Plugin):
             ),
             # ---- 枪战自动补位 ----
             # 真人玩家进入等待中的枪战大厅时，自动派 AI 假人去凑人数
-            # （quiet 加入，不抢房主的开局权）。count = 最多派几个。
+            # （quiet 加入，不抢房主的开局权）。
+            # count = 最多派几个；**0 = 全部**（有多少空闲假人就派多少个）。
+            # 服主要求："玩家补位默认全部假玩家都会补位"，所以默认 0。
             "shooter_fill": {
                 "enabled": True,
-                "count": 1,
+                "count": 0,
+            },
+            # ---- 枪战：假人自动进对局 ----
+            # 枪战服的 AI 就是"一直等着进下一局"（需求文档 §1 枪战玩家模式、
+            # §6 定时 quick 加入）。这里是不占 LLM 的确定性主循环：
+            # 空闲假人每隔 interval_seconds 自动 gs quick 一次；
+            # 假人上线时也会立刻进一次。
+            # 没装枪战插件的服（生存服）这段自动空转，不影响任何东西。
+            "shooter_auto_join": {
+                "enabled": True,
+                "interval_seconds": 30,
             },
             # ---- 聊天个性 ----
             # 公屏闲聊（没点名）时 AI 搭话的概率（0~1）。每个 AI 可在
@@ -2577,6 +2589,11 @@ class ArcFakePlayerPlugin(Plugin):
             self._arena_refresh()
         except Exception as exc:
             self.logger.debug(f"arena 刷新失败: {exc}")
+        # 枪战服主循环：闲着的假人自动 gs quick 进对局（自带节流）
+        try:
+            self._shooter_auto_join_tick()
+        except Exception as exc:
+            self.logger.debug(f"自动进枪战失败: {exc}")
         # 锚点闲逛驱动（家/领地/传送点附近逛 + 偶尔挖方块）。
         # 只在开着且大脑空闲时干活；忙时让路（见 _roam_busy）。
         try:
@@ -3961,6 +3978,12 @@ class ArcFakePlayerPlugin(Plugin):
             self._announce_join(name)
             self._record("spawn", f"角色卡真身已加入，目标: {goal[:60]}",
                          who=name)
+            # 假人一上线就 gs quick：已经有对局在跑就立刻进去参战，
+            # 没有就先进一间等着（枪战服主循环，见 _shooter_auto_join_tick）。
+            try:
+                self._shooter_auto_join_one(name)
+            except Exception as exc:
+                self.logger.debug(f"[{name}] 上线自动进枪战失败: {exc}")
 
     # ------------------------------------------------------------------
     # 自动在线（角色卡轮换）—— CrowdScheduler 的游戏侧钩子
@@ -4017,7 +4040,19 @@ class ArcFakePlayerPlugin(Plugin):
     #: arena：名字 → 连续看到它在等待室的刷新次数（滞留检测）
     _arena_waiting: dict[str, int] = {}
     #: arena 刷新周期（秒）——_arena_refresh 的心跳间隔
-    _arena_refresh_seconds: float = 15.0
+    #:
+    #: 15 秒太慢：对局从"等待"切到"进行中"、或者反过来，最多要等 15 秒
+    #: 才发现。这 15 秒里假人要么该打不打、要么该停不停——2026-10-31 实测
+    #: 就是它让假人在真人复活后还接着打（"复活即死"）。5 秒足够跟手。
+    _arena_refresh_seconds: float = 5.0
+    #: arena 战斗 AI 的"对局进行中"状态集合。
+    #:
+    #: ⚠ 只有这些状态下才允许开火。队伍在**进房那一刻**就分好了
+    #: （枪战插件 pick_join_team 平衡两队），所以等待室里已经存在"敌人"——
+    #: 这时开火就是"在出生地大厅里杀人"，真人复活落地就被打死。
+    _arena_live_states: tuple[str, ...] = ("playing", "buying")
+    #: 自动进枪战循环的下次执行时刻（秒）
+    _shooter_auto_next: float = 0.0
 
     def _shooter_plugin(self) -> Any:
         try:
@@ -4030,24 +4065,153 @@ class ArcFakePlayerPlugin(Plugin):
         return plug
 
     def _arena_enable(self, name: str) -> None:
+        """进房后接管战斗 AI。
+
+        ⚠ **只有对局真的在跑（playing/buying）才下发敌人名单。**
+
+        队伍在**进房那一刻**就分好了（枪战插件的 pick_join_team 平衡两队），
+        所以等待室里已经存在"敌人"——真人只要进了等待室就会被算成对面的人。
+        这时开火就是"在出生地大厅里杀人"：真人复活落地就被打死，死循环。
+
+        2026-10-31 枪战服实测：
+            20:46:37 真人进等待室 → 补位派出 5 个假人 → 5 个假人同时开火
+            20:47:36 对局结束 → 还在接着打
+            20:48:26~20:49:05 继续射击真人 → "我一复活就直接死"
+
+        等待阶段照样登记 `_arena_next`——这样假人算"忙"（不会被重复拉进房），
+        刷新器也会继续盯着，等对局一开始（≤5 秒）立刻接管开火。
+        """
         shooter = self._shooter_plugin()
         if shooter is None:
             return
         info = shooter.api_lobby_info(name)
         if not info.get("ok"):
             return
-        enemies = [str(e) for e in (info.get("enemies") or [])]
+        state = str(info.get("state") or "")
+        live = state in self._arena_live_states
+        enemies = [str(e) for e in (info.get("enemies") or [])] if live else []
         minutes = max(2.0, (info.get("match_seconds") or 300) / 60.0 + 2.0)
         self._bridge.arena(name, enemies, minutes)
-        self._arena_next[name] = time.monotonic() + 15.0
-        self.logger.info(f"[{name}] arena 战斗 AI 已启动（敌人："
-                         f"{', '.join(enemies) or '暂无'}）")
+        self._arena_next[name] = time.monotonic() + self._arena_refresh_seconds
+        if live:
+            self.logger.info(f"[{name}] arena 战斗 AI 已启动（敌人："
+                             f"{', '.join(enemies) or '暂无'}）")
+        else:
+            self.logger.info(f"[{name}] 已进枪战房间（{state or '未知'}），"
+                             f"等对局开始再开火")
 
     def _arena_disable(self, name: str) -> None:
         self._arena_waiting.pop(name, None)
         if self._arena_next.pop(name, None) is not None:
             self._bridge.arena_off(name)
             self.logger.info(f"[{name}] arena 战斗 AI 已停止")
+
+    # ------------------------------------------------------------------
+    # 枪战：假人自动进对局（主循环，纯代码，不占 LLM）
+    # ------------------------------------------------------------------
+
+    def _shooter_auto_join_cfg(self) -> dict:
+        cfg = self._cfg.get("shooter_auto_join")
+        return cfg if isinstance(cfg, dict) else {}
+
+    def _shooter_auto_join_tick(self) -> None:
+        """枪战服主循环：所有**闲着**的假人自动 `gs quick` 进对局。
+
+        服主要求（2026-10-31）：
+            · 假玩家一加入游戏，如果已经有游戏在跑 → 立刻 gs quick
+            · 每次有房间创建 → 全部假玩家都加入进去
+            · 玩家补位默认全部假玩家都会补位
+
+        这条循环把那三条都兜住了：
+            · 假人上线 → _try_attach_pending 里立刻调一次（_shooter_auto_join_one）
+            · 每隔 interval_seconds → 上一局结束/新房间建好，空闲假人再进场
+            · 真人建房 → 枪战插件回调 api_fill_shooter（count 默认"全部"）
+
+        **不占 LLM**：纯确定性代码，直调枪战插件的 API，不走提示词、
+        不等决策轮——符合"一切以节省 token 为前提"。
+
+        不拉的情况：
+            · 已经在枪战房间里（先试一下能不能自动开局）
+            · 在打架 / 有执行计划 / 在睡觉（_roam_busy）
+            · 身上没有真身（刚下线）
+        """
+        try:
+            cfg = self._shooter_auto_join_cfg()
+            if not cfg.get("enabled", True):
+                return
+            now = time.monotonic()
+            if now < self._shooter_auto_next:
+                return
+            try:
+                interval = max(5.0, float(cfg.get("interval_seconds") or 30))
+            except (TypeError, ValueError):
+                interval = 30.0
+            self._shooter_auto_next = now + interval
+            shooter = self._shooter_plugin()
+            if shooter is None:
+                return          # 这服没有枪战插件（生存服）——自动空转
+            for name in list(self._agents.keys()):
+                try:
+                    self._shooter_auto_join_one(name, shooter)
+                except Exception as exc:
+                    self.logger.debug(f"[{name}] 自动进枪战失败: {exc}")
+        except Exception as exc:
+            self.logger.debug(f"自动进枪战循环失败: {exc}")
+
+    def _shooter_auto_join_one(self, name: str, shooter: Any = None) -> bool:
+        """把一个假人拉进枪战。返回是否真的进了房间。
+
+        去哪儿：
+            · **有对局在跑** → 直接进那一间（服主要求："已经有游戏在跑
+              则立刻 gs quick"）
+            · 有等待中的空房 → quick 自己挑一间
+            · 一间房都没有 → quick 自己建一间
+            · 房间都在满 → 不新建（否则每轮刷出一间新房）
+        """
+        shooter = shooter or self._shooter_plugin()
+        if shooter is None:
+            return False
+        # 已经在房间里 → 试试能不能自动开局（全 AI 房间人齐了就开打，
+        # 房里有真人则不动，开局权归房主）。
+        try:
+            info = shooter.api_lobby_info(name)
+        except Exception:
+            info = {}
+        if info.get("ok"):
+            lobby_id = str(info.get("lobby_id") or "")
+            if lobby_id:
+                try:
+                    shooter.api_autostart(lobby_id)
+                except Exception:
+                    pass
+            return False
+        if self._roam_busy(name):
+            return False
+        actor = self._live_actor(name)
+        if actor is None:
+            return False
+        target = ""
+        try:
+            status = shooter.api_lobby_status()
+        except Exception:
+            status = {}
+        if status.get("running_lobby_id"):
+            target = str(status["running_lobby_id"])
+        elif int(status.get("open", 0) or 0) <= 0 and int(status.get("total", 0) or 0) > 0:
+            return False      # 房间都在满 → 不新建
+        try:
+            result = shooter.api_quick_join(actor, quiet=True, lobby_id=target)
+        except TypeError:
+            result = shooter.api_quick_join(actor, quiet=True)
+        except Exception as exc:
+            self.logger.debug(f"[{name}] gs quick 失败: {exc}")
+            return False
+        if not result.get("ok"):
+            return False
+        self._arena_enable(name)
+        self._record("game", f"{name} 自动加入枪战", who=name)
+        self.logger.info(f"[{name}] 自动 gs quick 加入枪战")
+        return True
 
     def _init_wallet_once(self, name: str, money: float | None) -> None:
         """首次上线建钱包并设角色卡的初始金钱；之后只确保行存在。
@@ -4345,7 +4509,12 @@ class ArcFakePlayerPlugin(Plugin):
                         continue
             else:
                 self._arena_waiting.pop(name, None)
-            enemies = [str(e) for e in (info.get("enemies") or [])]
+            state = str(info.get("state") or "")
+            # ⚠ 只有对局进行中才允许开火。等待阶段（lobby/countdown）
+            # 双方已经分好队、名单里有"敌人"，但没在打——此时开火
+            # 就是"在出生地大厅里杀人"。下发空名单 = JS 找不到敌人 = 不开火。
+            live = state in self._arena_live_states
+            enemies = [str(e) for e in (info.get("enemies") or [])] if live else []
             minutes = max(2.0, (info.get("match_seconds") or 300) / 60.0 + 2.0)
             self._bridge.arena(name, enemies, minutes)
             self._arena_next[name] = now + self._arena_refresh_seconds
@@ -6039,21 +6208,35 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception:
             return ""
 
-    def api_fill_shooter(self, max_slots: int = 1) -> dict:
-        """枪战插件回调：有真人进了等待中的大厅，派几个 AI 去凑人数。
+    def api_fill_shooter(self, max_slots: int = 1, lobby_id: str = "") -> dict:
+        """枪战插件回调：有真人进了等待中的大厅，派 AI 去凑人数。
 
         派谁：优先**闲着**的角色卡假人（不在打架/对局/有计划）。
         派去的走 quiet 加入（不抢房主的开局权），进房即开 arena 战斗 AI。
-        配置 shooter_fill：{"enabled": true, "count": 1}——关掉就一个都不派。
+
+        配置 shooter_fill：
+            {"enabled": true, "count": 0}
+        `count` = 0（默认）表示**全部**：有多少空闲假人就派多少个，
+        不再像以前那样只派 1 个（服主要求："补位默认全部假玩家都会补位"）。
+        `max_slots` 是房间空位数的上限——塞得下多少就派多少。
+
+        `lobby_id` 不为空时**只**往这一间房里塞（枪战插件传过来的目标房间）。
+        否则 quick 的"随便哪间能进的"会让补位的人散进各个等待室，
+        新建的房间反而没人。
         """
         try:
             cfg = self._cfg.get("shooter_fill")
             cfg = cfg if isinstance(cfg, dict) else {}
             if not cfg.get("enabled", True):
                 return {"ok": False, "text": "未启用"}
-            want = max(1, int(cfg.get("count", 1)))
-            want = min(want, max(1, int(max_slots)))
+            raw_count = int(cfg.get("count", 0) or 0)
+            want = max(1, int(max_slots))
+            if raw_count > 0:
+                want = min(want, raw_count)
             picked: list[str] = []
+            shooter = self._shooter_plugin()
+            if shooter is None:
+                return {"ok": False, "text": "本服没有枪战游戏"}
             for name, agent in list(self._agents.items()):
                 if len(picked) >= want:
                     break
@@ -6065,10 +6248,11 @@ class ArcFakePlayerPlugin(Plugin):
                 actor = self._live_actor(name)
                 if actor is None:
                     continue
-                shooter = self._shooter_plugin()
-                if shooter is None:
-                    break
-                result = shooter.api_quick_join(actor, quiet=True)
+                try:
+                    result = shooter.api_quick_join(actor, quiet=True,
+                                                    lobby_id=lobby_id)
+                except TypeError:
+                    result = shooter.api_quick_join(actor, quiet=True)
                 if not result.get("ok"):
                     continue
                 self._arena_enable(name)

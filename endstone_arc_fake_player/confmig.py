@@ -55,11 +55,13 @@ from typing import Any, Callable
 #:  18 → 种地链路：rules 第 8 条补农业流程；knowledge 补农业段
 #:  17 → 主动追杀：social.vengeance_hunt（被玩家杀死记仇，闲着就去找他算账）
 #:  16 → 夜间免打扰：night_quiet（23~8 点假人不主动发言，QQ 群同步静音）
-#:  15 → 安家流程：prompt_rules 增第 8 条（离领地远/claim_land/盖房/放床）
-#:  14 → 行为真人化大版本：prompt_rules 重写（禁垂直挖矿/descend/狩猎/
+#:   15 → 安家流程：prompt_rules 增第 8 条（离领地远/claim_land/盖房/放床）
+#:   14 → 行为真人化大版本：prompt_rules 重写（禁垂直挖矿/descend/狩猎/
 #:       熔炼链/睡觉/交易）+ prompt_game_knowledge 补床与熔炼表；
 #:       新增 hunt/descend/sleep/offer_trade 四个工具
-CONFIG_VERSION = 18
+#:   19 → 枪战补位默认派"全部"假人（shooter_fill.count 1 → 0）；
+#:       新增 shooter_auto_join（假人自动 gs quick 的主循环）
+CONFIG_VERSION = 19
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:
@@ -304,6 +306,26 @@ LEGACY_DEFAULTS: dict[str, dict[int, Any]] = {
     "chat_reply_chance": {
         10: 0.15,
         11: 0.15,
+    },
+    # 枪战补位派几个：v8~v18 的默认值是"派 1 个"，v19 起是"派全部"
+    # （count=0）。老服手里那份 {"enabled": true, "count": 1} 是**默认值**
+    # 不是用户改的，要能自动升上去——否则服主升级了插件还是只派 1 个人，
+    # 而且没有任何报错提示（纯静默）。
+    #
+    # 登记 8~18 全部版本档：迁移是按"服当前 config_version"**精确**取
+    # 那一档的旧值，只登记一个版本会让其它档的服静默停在旧行为。
+    "shooter_fill": {
+        8: {"enabled": True, "count": 1},
+        9: {"enabled": True, "count": 1},
+        10: {"enabled": True, "count": 1},
+        11: {"enabled": True, "count": 1},
+        12: {"enabled": True, "count": 1},
+        13: {"enabled": True, "count": 1},
+        14: {"enabled": True, "count": 1},
+        15: {"enabled": True, "count": 1},
+        16: {"enabled": True, "count": 1},
+        17: {"enabled": True, "count": 1},
+        18: {"enabled": True, "count": 1},
     },
 }
 

@@ -855,12 +855,21 @@ export function handleHumanShot(player, gunId) {
     if (recentShots.size > 256) recentShots.clear();
     recentShots.add(shotKey);
 
+    // 只打**正在跟这个真人对枪**的假人——别打友军。
+    //
+    // simEnemies 是"假人 → 它的敌人名单"这张表，反查（getSimsFighting）
+    // 就是"哪些假人正把真人当敌人"。等待阶段 Python 侧根本不下发名单
+    // （队伍在进房那刻就分好了，但那时没在打），所以这里天然不会
+    // 误伤等待室里的人。
+    const fighting = new Set(getSimsFighting(shooterName));
+
     let hitName = null;
     let hitSim = null;
     let hitRatio = -1;
     for (const [name, sim] of simsRef) {
         if (!sim || sim.isValid === false) continue;
         if (name === shooterName) continue;    // 别打到自己
+        if (!fighting.has(name)) continue;      // 只打敌人，不打友军
         if (!isAlive(sim)) continue;
         const ratio = rayHitSim(origin, dir, sim);
         if (ratio < 0) continue;
