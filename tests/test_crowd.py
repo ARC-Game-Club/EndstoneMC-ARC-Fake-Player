@@ -44,6 +44,12 @@ class FakePlugin:
         self.config = {
             "enabled": True,
             "target_count": target,
+            # ⚠️ 夜间档必须显式关掉，否则这些测试**取决于跑测试时的钟点**：
+            # crowd.py 的 NIGHT_HOURS = range(1, 8)，凌晨跑测试时
+            # effective_target 会被 night_target_count（默认 1）压下去，
+            # 于是"目标 3 人"之类的断言必然失败（2026-11-01 01:0x 实踩）。
+            # 夜间档本身由 test_night_target_downscaled 单独测（它自己注入时钟）。
+            "night_target_count": 9999,
             "play_minutes_min": play[0],
             "play_minutes_max": play[1],
             "rejoin_gap_min_minutes": gap[0],

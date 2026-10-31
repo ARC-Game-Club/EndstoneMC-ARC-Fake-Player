@@ -1148,21 +1148,24 @@ export function handleHumanShot(player, gunId, shotCount = 1) {
     if (recentShots.size > 256) recentShots.clear();
     recentShots.add(shotKey);
 
-    // 只打**正在跟这个真人对枪**的假人——别打友军。
+    // 真人对**任何活着的假人**开火都结算——**不做友军免疫**。
     //
-    // simEnemies 是"假人 → 它的敌人名单"这张表，反查（getSimsFighting）
-    // 就是"哪些假人正把真人当敌人"。等待阶段 Python 侧根本不下发名单
-    // （队伍在进房那刻就分好了，但那时没在打），所以这里天然不会
-    // 误伤等待室里的人。
-    const fighting = new Set(getSimsFighting(shooterName));
-    if (fighting.size === 0) {
-        // 这一枪不会结算。最常见的原因：Python 侧的 bot:arena 没把
-        // 这个真人下发成"敌人"（等待阶段不下发，或对局状态不是 playing）。
-        // 不记日志的话，表现就是"我打他完全没反应"，而且查不出来。
-        logShotThrottled(`nofight|${shooterName}`,
-            `${TAG} ${shooterName} 开了一枪（${gunId}），但没有假人把他当敌人，这一枪不结算`);
-        return null;
-    }
+    // v3.9.46 起这里有一道闸：只结算"正在把这个真人当敌人"的假人
+    // （反查 simEnemies 名单）。本意是防友伤，实际把整条链卡死了：
+    //
+    //   2026-11-01 01:01:48 [ArcFakePlayer] DEVILENMO 开了一枪（blazik:svch），
+    //   但没有假人把他当敌人，这一枪不结算
+    //
+    // 对局里 Python 侧下发的敌人名单经常不含真人（等待阶段不下发、
+    // 对局状态不是 playing、队伍划分与名单不同步……），于是打上去
+    // 完全没反应——就是用户说的"我打他经常不掉血"。
+    //
+    // 用户明确要求不要友军免疫：
+    //   "不要做友军伤害免疫，如果击杀队友是会扣分的，
+    //    我们已经有了一个成熟的惩罚机制了。"
+    // 所以打队友交给枪战插件既有的扣分机制去罚。
+    // （下面仍然保留 isInvincible——那是游戏自己的出生保护/准备阶段
+    //   无敌，nameTag 上写着[无敌状态]，跟友军免疫是两回事。）
 
     let hitName = null;
     let hitSim = null;
@@ -1170,7 +1173,7 @@ export function handleHumanShot(player, gunId, shotCount = 1) {
     for (const [name, sim] of simsRef) {
         if (!sim || sim.isValid === false) continue;
         if (name === shooterName) continue;    // 别打到自己
-        if (!fighting.has(name)) continue;      // 只打敌人，不打友军
+        // 不再按"是不是敌人"过滤：友伤由枪战插件的团队击杀扣分处理
         if (!isAlive(sim)) continue;
         const ratio = rayHitSim(origin, dir, sim);
         if (ratio < 0) continue;
@@ -1183,7 +1186,7 @@ export function handleHumanShot(player, gunId, shotCount = 1) {
     if (!hitSim) {
         logShotThrottled(
             `miss|${shooterName}`,
-            `${TAG} ${shooterName} 开了一枪（${gunId}）但没打中假人`,
+            `${TAG} ${shooterName} 开了一枪（${gunId}）但射线没擦到任何假人（瞄准/距离）`,
         );
         return null;
     }
@@ -1430,8 +1433,13 @@ const humanAmmoWatch = new Map();
 const humanHold = new Map();
 /** 兜底节奏：5 次/秒（只有枪械包完全没管弹药时才用）。 */
 const HUMAN_HOLD_INTERVAL = 4;
-/** 一次最多结算几枪：再多就是插件批量重置弹药，不是连发。 */
-const HUMAN_MAX_SHOTS_PER_TICK = 5;
+/** 一次最多结算几枪：再多就当作插件批量重置弹药，不是连发。
+ *
+ * 原来写 5 —— 服务器卡一下（一次掉 6~10 发）就整梭子白打，用户看到的是
+ * "打了一梭子只有两枪"（2026-11-01 01:04）。放宽到 12：枪械包最高
+ * 1200 RPM = 20 发/秒，12 发的跨度意味着卡了半秒以上，确实不该按连发算；
+ * 6~11 发这种"卡了几 tick"的必须照打。 */
+const HUMAN_MAX_SHOTS_PER_TICK = 12;
 
 try {
     world.afterEvents.itemStartUse.subscribe((event) => {
@@ -1495,7 +1503,12 @@ export function detectHumanShots() {
             const drop = prev.value - ammo;
             if (drop <= 0) continue;                  // 没开火，或刚补弹/换枪
             if (drop > HUMAN_MAX_SHOTS_PER_TICK) {
-                // 一次掉太多 = 插件重置弹药（EndStone 写 default_ammo），不是连发
+                // 一次掉太多 = 插件重置弹药（EndStone 写 default_ammo），不是连发。
+                // 记日志：万一其实是被漏检吃掉的连发，这行数字能直接看出来
+                // （没有这行 = 压根没检测到弹药变化，问题在别处）。
+                logShotThrottled(`bulk|${name}`,
+                    `${TAG} ${name} 的 ${key} 弹药一次掉了 ${drop} 发`
+                    + `（${prev.value}→${ammo}），按批量重置处理，这一梭子没结算`);
                 continue;
             }
             handleHumanShot(p, gunId, drop);

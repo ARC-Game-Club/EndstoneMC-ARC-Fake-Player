@@ -3085,11 +3085,21 @@ class ArcFakePlayerPlugin(Plugin):
             threshold = float(cfg.get("grudge_threshold", -30.0))
             radius = float(cfg.get("vengeance_radius", 40.0))
             grudges = self._favor.grudges(bot, threshold)
+            # ⚠️ aloc 必须**在 if grudges 之前**算好。
+            #
+            # 原来它写在 `if grudges:` 里面，而下面"主动追杀"那一段
+            # （同一个 if 之外）又读它 —— 假人没有仇人时（grudges 为空，
+            # 这也是最常态）就走不到赋值语句，于是
+            #   UnboundLocalError: cannot access local variable 'aloc'
+            # 整个「感知循环」被跳过，所有假人的社交/反击/arena 刷新停摆。
+            # 2026-11-01 01:00 枪战服实踩，每 tick 刷一次。
+            #
+            # 它本来就是"假人自己的坐标"，跟有没有仇人完全无关。
+            try:
+                aloc = (actor.location.x, actor.location.y, actor.location.z)
+            except Exception:
+                aloc = None
             if grudges:
-                try:
-                    aloc = (actor.location.x, actor.location.y, actor.location.z)
-                except Exception:
-                    aloc = None
                 if aloc is not None:
                     for pname in grudges:
                         if now < self._vengeance_cd.get((bot, pname), 0.0):

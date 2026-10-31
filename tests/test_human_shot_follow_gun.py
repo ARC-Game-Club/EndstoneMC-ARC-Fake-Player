@@ -188,6 +188,19 @@ def _run_probe() -> dict:
     return json.loads(dukpy.evaljs(src))
 
 
+#: 同一段探针，但**不**告诉桥接包"这个假人把真人当敌人"。
+#: 用来锁住"不做友军免疫"：对局里 Python 侧下发的敌人名单经常不含真人，
+#: 旧实现因此在 handleHumanShot 里直接 return null → 打上去完全没反应。
+PROBE_NO_ENEMY = PROBE.replace('setSimEnemies("Bot", ["Human"]);', "")
+
+
+def _run_probe_no_enemy() -> dict:
+    src = (SCRIPTS_DIR / "arena_combat.js").read_text(encoding="utf-8")
+    src = _strip_for_dukpy(src, MOCK)
+    src = src + PROBE_NO_ENEMY
+    return json.loads(dukpy.evaljs(src))
+
+
 class HumanShotFollowsGunTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -245,12 +258,48 @@ class HumanShotFollowsGunTests(unittest.TestCase):
         )
 
 
+class NoFriendlyFireImmunityTests(unittest.TestCase):
+    """**不做友军伤害免疫**（用户明确要求，v3.9.51）。
+
+    用户原话：
+        "不要做友军伤害免疫，如果击杀队友是会扣分的，
+         我们已经有了一个成熟的惩罚机制了。"
+
+    旧实现在 handleHumanShot 里按 simEnemies 名单过滤，只结算"正把真人
+    当敌人"的假人；对局里这份名单经常不含真人 → 打上去完全没反应，
+    就是"我打他经常不掉血"。日志实证（2026-11-01 01:01:48）：
+
+        [ArcFakePlayer] DEVILENMO 开了一枪（blazik:svch），
+        但没有假人把他当敌人，这一枪不结算
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.probe = _run_probe_no_enemy()
+        cls.steps = {s["label"]: s for s in cls.probe["steps"]}
+
+    def test_damage_applies_without_enemy_list(self):
+        s = self.steps["one-shot"]
+        self.assertEqual(
+            s["shots"], 1,
+            "没有敌人名单就不结算 —— 这就是'打他完全没反应'",
+        )
+        self.assertGreater(s["dmg"], 0.0, "没有敌人名单时打不掉血")
+
+    def test_burst_still_counts_without_enemy_list(self):
+        s = self.steps["one-shot-2"]
+        self.assertEqual(s["shots"], 1)
+        self.assertGreater(s["dmg"], 0.0)
+
+
 def main():
     result = unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(HumanShotFollowsGunTests))
-    if not result.wasSuccessful():
+    result2 = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(NoFriendlyFireImmunityTests))
+    if not (result.wasSuccessful() and result2.wasSuccessful()):
         return 1
-    print(f"全部 {result.testsRun} 项通过")
+    print(f"全部 {result.testsRun + result2.testsRun} 项通过")
     return 0
 
 

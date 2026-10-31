@@ -854,6 +854,40 @@ class HumanlikeTests(unittest.TestCase):
         plugin._social_tick("Bot", agent, actor, _t.monotonic())
         self.assertEqual(walks, [])
 
+    # ---- 感知循环不许崩（v3.9.51） -------------------------------------
+
+    def test_no_grudge_does_not_crash(self):
+        """没有仇人时 _social_tick 不能崩。
+
+        2026-11-01 01:00 枪战服实踩（每 tick 刷一次）：
+
+            File "plugin.py", line 3122, in _social_tick
+                and aloc is not None
+            UnboundLocalError: cannot access local variable 'aloc'
+
+        根因：aloc 只在 `if grudges:` 里面赋值，而下面"主动追杀"那一段
+        在同一个 if **之外**又读它 —— 仇人列表一空（最常态）就走不到赋值。
+        后果是整个「感知循环」被跳过，所有假人的社交/反击/arena 刷新停摆。
+        """
+        import time as _t
+        plugin, walks, actor, agent = self._hunt_plugin()
+        plugin._favor.grudges = Mock(return_value=[])
+        plugin._social_tick("Bot", agent, actor, _t.monotonic())   # 不许抛
+        self.assertEqual(walks, [])
+
+    def test_actor_location_failure_does_not_crash(self):
+        """取不到假人坐标时也不能崩（aloc 为 None 要能一路走下去）。"""
+        import time as _t
+        plugin, walks, actor, agent = self._hunt_plugin()
+
+        class _Broken:
+            @property
+            def location(self):
+                raise RuntimeError("no location")
+
+        plugin._social_tick("Bot", agent, _Broken(), _t.monotonic())
+        self.assertEqual(walks, [])
+
     # ---- 反击追击（v3.9.41） -------------------------------------------
 
     def test_reflex_chases_when_out_of_reach(self):
