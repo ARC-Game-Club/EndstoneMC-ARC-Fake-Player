@@ -2953,8 +2953,24 @@ class ArcFakePlayerPlugin(Plugin):
         at = self._attack_target(target)
 
         def _done(ok: bool, err: str, _data: dict) -> None:
-            if not ok and err:
-                self.logger.info(f"[{bot}] 反击 {at} 失败：{err}")
+            if ok or not err:
+                return
+            self.logger.info(f"[{bot}] 反击 {at} 失败：{err}")
+            # 够不着 → 贴过去再打。远程怪（惊魂节的法师/稻草人）永远
+            # 站在 4.5 格外输出，旧版只发攻击指令、够不着就原地挨打——
+            # 用户看到的"不会还手/怪物不掉血"就是这个。朝怪的位置走
+            # 一段（walk 自带寻路），下一拍反射攻击就进范围了。
+            if "够不着" in str(err):
+                pos = self._mob_pos(target)
+                if pos is not None:
+                    try:
+                        self._bridge.walk(bot, int(pos[0]), int(pos[1]),
+                                          int(pos[2]), timeout=100)
+                        self.logger.info(
+                            f"[{bot}] 反击够不着，向 {at} 贴近"
+                            f"（{pos[0]:.0f},{pos[1]:.0f},{pos[2]:.0f}）")
+                    except Exception:
+                        pass
 
         return self._bridge.attack(bot, at, callback=_done) >= 0
 

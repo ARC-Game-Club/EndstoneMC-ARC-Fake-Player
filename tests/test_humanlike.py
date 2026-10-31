@@ -851,6 +851,45 @@ class HumanlikeTests(unittest.TestCase):
         plugin._social_tick("Bot", agent, actor, _t.monotonic())
         self.assertEqual(walks, [])
 
+    # ---- 反击追击（v3.9.41） -------------------------------------------
+
+    def test_reflex_chases_when_out_of_reach(self):
+        """够不着 → 向怪的位置走（远程怪不然永远站 4.5 格外白嫖）。"""
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        walks: list = []
+        plugin._bridge = Mock()
+        plugin._bridge.attack = Mock(
+            side_effect=lambda n, t, callback=None: (
+                callback and callback(False, "zombie 距离 8.0 格，够不着", {}),
+                1)[-1])
+        plugin._bridge.walk = Mock(
+            side_effect=lambda n, x, y, z, timeout=0: walks.append((n, x, y, z)) or 1)
+        plugin._attack_target = Mock(return_value="zombie")
+        plugin._mob_pos = Mock(return_value=(10, 64, -20))
+        ok = plugin._reflex_attack("Bot", "123")
+        self.assertTrue(ok)
+        import time as _t
+        _t.sleep(0.01)          # 回调同步执行（Mock 直接调）
+        self.assertEqual(walks, [("Bot", 10, 64, -20)])
+
+    def test_reflex_no_chase_on_other_errors(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        walks: list = []
+        plugin._bridge = Mock()
+        plugin._bridge.attack = Mock(
+            side_effect=lambda n, t, callback=None: (
+                callback and callback(False, "附近没有 zombie", {}),
+                1)[-1])
+        plugin._bridge.walk = Mock(
+            side_effect=lambda n, x, y, z, timeout=0: walks.append(1) or 1)
+        plugin._attack_target = Mock(return_value="zombie")
+        plugin._reflex_attack("Bot", "123")
+        import time as _t
+        _t.sleep(0.01)
+        self.assertEqual(walks, [])            # 目标没了不追
+
     # ---- 泡水/死亡循环检测（v3.9.40） -----------------------------------
 
     def _water_plugin(self, in_water=True, engaged=False, sleeping=False):

@@ -1600,6 +1600,17 @@ function doAttack(req, id) {
             result(id, false, `${targetName} 距离 ${bestDist.toFixed(1)} 格，够不着`);
             return;
         }
+        // 先转向目标再出手：attackEntity 的命中看朝向，不转脸就是
+        // 对着空气挥（实测怪物不掉血的一个来源）。yaw/pitch 从向量算。
+        try {
+            const dx = best.location.x - origin.x;
+            const dy = best.location.y - origin.y;
+            const dz = best.location.z - origin.z;
+            const horizontal = Math.hypot(dx, dz);
+            const yaw = Math.atan2(-dx, -dz) * 180 / Math.PI;
+            const pitch = Math.atan2(dy, horizontal) * 180 / Math.PI;
+            sim.setRotation({ x: Math.max(-90, Math.min(90, pitch)), y: yaw });
+        } catch (_) { /* 转向失败不挡出手 */ }
         let ok = false;
         try {
             ok = sim.attackEntity(best);
