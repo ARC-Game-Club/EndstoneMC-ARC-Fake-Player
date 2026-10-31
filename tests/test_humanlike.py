@@ -252,6 +252,21 @@ class HumanlikeTests(unittest.TestCase):
 
     # ---- gs 门控 ---------------------------------------------------------
 
+    def test_gs_absent_from_tool_description_without_shooter(self):
+        """没装枪战：run_command 的说明里**一个 gs 都不许出现**——
+        负向提示（"gs 不可用别尝试"）等于把命令名教给模型。"""
+        from endstone_arc_fake_player.llm import LLMClient, set_shooter_available
+        set_shooter_available(False)
+        try:
+            desc = [i for i in LLMClient.tool_spec()
+                    if i["function"]["name"] == "run_command"][0]["function"]["description"]
+            self.assertNotIn("gs", desc.lower())
+            manual = LLMClient.tool_manual()
+            # 手册同样不该在无枪战时出现 gs 命令示例
+            self.assertNotIn("gs quick", manual)
+        finally:
+            set_shooter_available(True)
+
     def test_gs_blocked_when_no_shooter(self):
         dim = FakeDimension()
         compiler = make_compiler(dim)
