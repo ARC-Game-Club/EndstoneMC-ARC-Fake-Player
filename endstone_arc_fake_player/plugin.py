@@ -5710,14 +5710,38 @@ class ArcFakePlayerPlugin(Plugin):
     def _crowd_spawn_pos(self) -> tuple[int, int, int, bool] | None:
         """给新角色挑个出生点。返回 (x, y, z, 地面已知)。
 
-        优先级：
-          1. 真人身边（区块必然加载，而且"新玩家出生在人群边"最自然）
-          2. 已在线假人身边
-          3. 配置的 auto_online.home
-          4. 世界出生点 + 地表扫描；扫不出来就高空（配合安全落地流程）
+        优先级（v3.9.36 起对齐世界出生点——用户定的规矩）：
+          1. 配置的 auto_online.home（服主显式写的，最优先）
+          2. **世界出生点** + 地表扫描（和复活点天然一致：重生也会落回
+             这里，出生/复活不会再一个东一个西）；扫不出地面就高空
+             （配合安全落地流程）
+          3. 世界出生点读不到（level.dat 异常）才退回真人身边——
+             区块必然加载，保底能用。
+
+        旧版"真人身边→假人身边"的顺序会让假人满地图散着出生，
+        和复活点（世界出生点）对不上——"出生在 A、死在 B、复活在 C"。
         """
         import random as _random
-        # 1) 真人
+        # 1) 配置的 home
+        home = self.crowd_config().get("home")
+        if isinstance(home, (list, tuple)) and len(home) >= 3:
+            try:
+                return int(home[0]), int(home[1]), int(home[2]), True
+            except (TypeError, ValueError):
+                pass
+        # 2) 世界出生点
+        spawn = self._world_spawn_xz()
+        if spawn is not None:
+            x, z = spawn
+            try:
+                dim = self.server.level.get_dimension("overworld")
+            except Exception:
+                dim = None
+            y = self._surface_scan_y(dim, x, z) if dim is not None else None
+            if y is not None:
+                return x, y, z, True
+            return x, 200, z, False
+        # 3) 世界出生点读不到 → 真人身边兜底
         try:
             humans = [p for p in self.server.online_players
                       if str(getattr(p, "xuid", "") or "").strip()]
@@ -5731,35 +5755,6 @@ class ArcFakePlayerPlugin(Plugin):
                         int(loc.z) + _random.randint(-4, 4), True)
             except Exception:
                 pass
-        # 2) 已在线假人
-        for actor in list(self._actors.values()) + list(self._external.values()):
-            if not self._is_live(actor):
-                continue
-            try:
-                loc = actor.location
-                return (int(loc.x) + _random.randint(-3, 3), int(loc.y),
-                        int(loc.z) + _random.randint(-3, 3), True)
-            except Exception:
-                continue
-        # 3) 配置的 home
-        home = self.crowd_config().get("home")
-        if isinstance(home, (list, tuple)) and len(home) >= 3:
-            try:
-                return int(home[0]), int(home[1]), int(home[2]), True
-            except (TypeError, ValueError):
-                pass
-        # 4) 世界出生点
-        spawn = self._world_spawn_xz()
-        if spawn is not None:
-            x, z = spawn
-            try:
-                dim = self.server.level.get_dimension("overworld")
-            except Exception:
-                dim = None
-            y = self._surface_scan_y(dim, x, z) if dim is not None else None
-            if y is not None:
-                return x, y, z, True
-            return x, 200, z, False
         return None
 
     def _surface_scan_y(self, dim: Any, x: int, z: int) -> int | None:

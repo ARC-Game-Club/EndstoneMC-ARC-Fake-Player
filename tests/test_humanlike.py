@@ -544,6 +544,46 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 出生点对齐世界（v3.9.36） -------------------------------------
+
+    def _spawn_pos_plugin(self, *, home=None, world_spawn=(5, 64, 7)):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._spawn_xz_cache = (world_spawn[0], world_spawn[2])
+        plugin._world = WorldAdapter(FakeLogger(), surface_only=False)
+        plugin.crowd_config = lambda: ({"home": home} if home else {})
+        dim = FakeDimension()
+        plugin.server = SimpleNamespace(
+            online_players=[SimpleNamespace(
+                xuid="1", location=FakeLocation(-500, 70, -900))],
+            level=SimpleNamespace(get_dimension=lambda n: dim))
+        return plugin
+
+    def test_spawn_prefers_world_spawn_over_players(self):
+        """世界出生点优先于真人身边——出生/复活对齐（用户规矩）。"""
+        plugin = self._spawn_pos_plugin(world_spawn=(5, 64, 7))
+        pos = plugin._crowd_spawn_pos()
+        self.assertIsNotNone(pos)
+        x, y, z, grounded = pos
+        self.assertEqual((x, z), (5, 7))            # 世界出生点，不是真人旁
+        self.assertTrue(grounded)
+
+    def test_spawn_config_home_wins(self):
+        plugin = self._spawn_pos_plugin(home=[7, 65, 9])
+        pos = plugin._crowd_spawn_pos()
+        self.assertEqual(pos[:3], (7, 65, 9))
+
+    def test_spawn_falls_back_to_player_when_no_world_spawn(self):
+        plugin = self._spawn_pos_plugin()
+        plugin._spawn_xz_cache = None
+        # _world_spawn_xz 会尝试读 level.dat——stub 下走缓存 None 后返回 None
+        plugin._world_spawn_xz = lambda: None
+        pos = plugin._crowd_spawn_pos()
+        self.assertIsNotNone(pos)
+        x, y, z, grounded = pos
+        self.assertTrue(abs(x - (-500)) <= 4)      # 真人身边兜底
+
     # ---- 种地 farm（v3.9.35） ------------------------------------------
 
     def _farm_compiler(self, inv, ground="grass_block"):
