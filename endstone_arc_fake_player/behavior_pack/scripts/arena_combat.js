@@ -149,6 +149,30 @@ let lastSimHitLog = 0;
 /** 最近结算过的射击：key = "射手@tick"，用来挡掉同一枪的重复广播。 */
 const recentShots = new Set();
 
+/**
+ * 假人 → 它正在打的敌人名单。
+ *
+ * 谁在跟谁对枪，是 Python 侧下发的（`bot:arena` 带 enemies 名单）。
+ * 这里留一份副本，是为了在这台服**取不到玩家视线方向**时还能判定命中：
+ * 名单里有这个玩家，说明那个假人正举枪对着他。
+ */
+const simEnemies = new Map();
+
+/** 记录某个假人当前的敌人名单。main.js 在 doArena 里调用。 */
+export function setSimEnemies(simName, enemies) {
+    const list = Array.isArray(enemies) ? enemies.map(String) : [];
+    simEnemies.set(simName, new Set(list));
+}
+
+/** 正在跟这个玩家对枪的假人名字集合。 */
+export function getSimsFighting(playerName) {
+    const out = [];
+    for (const [simName, enemies] of simEnemies) {
+        if (enemies && enemies.has(playerName)) out.push(simName);
+    }
+    return out;
+}
+
 /** 射击日志限流：key = "射手|目标"，同一对每 N 毫秒最多记一条。 */
 const shotLogAt = new Map();
 const SHOT_LOG_INTERVAL_MS = 2000;
@@ -754,6 +778,37 @@ function rayHitSim(origin, dir, sim) {
 }
 
 /**
+ * 没有视线方向时的兜底：找出正在跟这个玩家对枪、且离得最近的假人。
+ *
+ * 判据来自 Python 下发的敌人名单（见 setSimEnemies）：
+ * 名单里有这个玩家 ⇒ 这个假人正举枪对着他。
+ * 距离上限 40 格（比射线判定的 48 略小）。
+ */
+function findEngagedSim(shooterName, origin) {
+    let best = null;
+    let bestD = Infinity;
+    for (const [simName, enemies] of simEnemies) {
+        if (!enemies || !enemies.has(shooterName)) continue;
+        const sim = simsRef.get(simName);
+        if (!sim || sim.isValid === false) continue;
+        if (!isAlive(sim)) continue;
+        let d;
+        try {
+            const loc = sim.location;
+            d = Math.hypot(loc.x - origin.x, loc.z - origin.z);
+        } catch (_) {
+            continue;
+        }
+        if (d > 40) continue;
+        if (d < bestD) {
+            bestD = d;
+            best = simName;
+        }
+    }
+    return best;
+}
+
+/**
  * 处理枪械包广播来的"开了一枪"：把命中的假人打掉血。
  * 返回被命中的假人名字（没命中返回 null）。
  */
@@ -794,6 +849,7 @@ export function handleShotEvent(data) {
     let hitName = null;
     let hitSim = null;
     let hitRatio = -1;
+    let hitByEngagement = false;
     for (const [name, sim] of simsRef) {
         if (!sim || sim.isValid === false) continue;
         if (name === shooterName) continue;    // 别打到自己
@@ -806,6 +862,20 @@ export function handleShotEvent(data) {
             hitSim = sim;
         }
     }
+    if (!hitSim && Number(data.nodir || 0) === 1) {
+        // 这台服取不到玩家的视线方向（@minecraft/server 不导出 Vector3，
+        // getViewDirection 也没值）→ 射线判定用不了。
+        // 兜底：**看"谁在跟这个玩家对枪"**——对局里的假人被下发了敌人名单，
+        // 名单里有他，说明它正举枪对着他；玩家这时开枪，打中的就是它。
+        const engaged = findEngagedSim(shooterName, origin);
+        if (engaged) {
+            hitSim = simsRef.get(engaged) || null;
+            hitName = engaged;
+            hitRatio = 0.5;                 // 算躯干伤害
+            hitByEngagement = true;
+        }
+    }
+
     if (!hitSim) {
         // 打偏了也要留痕：这样能区分"广播根本没来"和"广播来了但没打中"。
         logShotThrottled(
@@ -822,7 +892,8 @@ export function handleShotEvent(data) {
 
     logShotThrottled(
         `${shooterName}|${hitName}`,
-        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+        `${TAG} ${shooterName} 开枪命中假人 ${hitName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`
+        + (hitByEngagement ? "（按对枪关系判定：这台服取不到视线方向）" : ""),
     );
     return hitName;
 }

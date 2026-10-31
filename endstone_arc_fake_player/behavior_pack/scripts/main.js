@@ -75,6 +75,7 @@ import {
     getRespawnPoint,
     forgetBot,
     isAlive,
+    setSimEnemies,
 } from "./arena_combat.js";
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +1785,9 @@ function doArena(req, id) {
         return;
     }
     const enemies = Array.isArray(req.enemies) ? req.enemies.map(String) : [];
+    // 把敌人名单同步给 arena_combat.js：这台服取不到玩家视线方向时，
+    // "真人开枪打假人"要靠"谁在跟这个玩家对枪"来判定命中。
+    try { setSimEnemies(name, enemies); } catch (_) { /* ignore */ }
     const minutes = Math.max(1, Math.min(30, Number(req.min) || 6));
     const prev = arenaModes.get(name);
     arenaModes.set(name, {
