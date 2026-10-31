@@ -52,12 +52,13 @@ from typing import Any, Callable
 #:   11 → 自称规范：prompt_speech 增加禁用"本教授/本高手"类自称条款
 #:  12 → 搭话概率：chat_reply_chance 全局默认 0.15 → 0.5（公屏太冷清）
 #:  13 → 玩家传送到假人：tpa_auto_accept（真人向假人发 tpa，假人隔几秒代同意）
+#:  17 → 主动追杀：social.vengeance_hunt（被玩家杀死记仇，闲着就去找他算账）
 #:  16 → 夜间免打扰：night_quiet（23~8 点假人不主动发言，QQ 群同步静音）
 #:  15 → 安家流程：prompt_rules 增第 8 条（离领地远/claim_land/盖房/放床）
 #:  14 → 行为真人化大版本：prompt_rules 重写（禁垂直挖矿/descend/狩猎/
 #:       熔炼链/睡觉/交易）+ prompt_game_knowledge 补床与熔炼表；
 #:       新增 hunt/descend/sleep/offer_trade 四个工具
-CONFIG_VERSION = 16
+CONFIG_VERSION = 17
 
 #: 历史版本的默认值快照：键 → {版本: 当时的默认值}。
 #:

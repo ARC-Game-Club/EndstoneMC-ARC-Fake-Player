@@ -582,6 +582,14 @@ class ArcFakePlayerPlugin(Plugin):
         #: ⚠ 这里**只存标量，绝不存 Actor 句柄**——理由见 `_MobTarget`
         #: 的说明（2026-10-26 无规则服崩服根因）。
         self._mob_targets: dict[str, _MobTarget] = {}
+        #: 主动追杀：下一腿追击的时刻（monotonic），按假人记。
+        self._hunt_next: dict[str, float] = {}
+        #: 追杀占有身体的截止时刻——期间闲逛层让路（别一边朝仇人走
+        #: 一边随机晃，走出个鬼畜折返）。每发一腿续 20 秒，追不上/目标
+        #: 下线后自然过期，闲逛恢复。
+        self._hunt_until: dict[str, float] = {}
+        #: 本轮会话里已经宣言过追杀的 (假人, 仇人)——宣言一次就够，别刷屏。
+        self._hunt_told: set = set()
         #: (假人, 玩家) → 寻仇冷却到期时刻。engage 时预记，防止脱战后
         #: 立刻被复仇扫描重新拉起、无限缠斗。
         self._vengeance_cd: dict[tuple[str, str], float] = {}
@@ -1045,6 +1053,10 @@ class ArcFakePlayerPlugin(Plugin):
                 "reflex_duration_seconds": 90.0,
                 # 仇人出现在多少格内触发寻仇
                 "vengeance_radius": 40.0,
+                # 主动追杀：闲着（没计划/没在打/没睡）就朝在线仇人走过去，
+                # 进入半径后交给就近开战。被玩家杀死 → 记仇 → 主动去找他
+                # 算账，赢一次两清（不做守株待兔的仇人）。
+                "vengeance_hunt": True,
                 # 管理员（OP）的攻击不触发反击与记仇（方便测试管理）
                 "admins_immune": True,
             },
@@ -3008,6 +3020,50 @@ class ArcFakePlayerPlugin(Plugin):
                                  f"（好感度 {self._favor.score(bot, pname):+.1f}），"
                                  f"你决定寻仇！")
                         break
+
+            # 主动追杀：仇人不会自己送上门——闲着就朝最近的在线仇人走，
+            # 走进 vengeance_radius 后上面的就近开战接管。被玩家杀死的
+            # 仇就是这么报的：记仇 → 找过去 → 打赢一次两清。
+            if (not self._reflex.is_engaged(bot)
+                    and cfg.get("vengeance_hunt", True)
+                    and bot not in self._sleeping
+                    and aloc is not None
+                    and not self._roam_busy(bot)):
+                best = None
+                for pname in grudges:
+                    if now < self._vengeance_cd.get((bot, pname), 0.0):
+                        continue
+                    ploc = self._human_pos(pname)
+                    if ploc is None:
+                        continue          # 不在线，追不动
+                    d = math.dist(aloc, ploc)
+                    if d <= radius:
+                        continue          # 就近开战那一路会处理
+                    if best is None or d < best[0]:
+                        best = (d, pname, ploc)
+                if best is not None:
+                    d, pname, ploc = best
+                    if now >= self._hunt_next.get(bot, 0.0):
+                        self._hunt_next[bot] = now + 8.0
+                        # 朝仇人当前位置走一腿（≤48 格；人会动，腿腿重瞄）
+                        scale = min(1.0, 48.0 / max(d, 1.0))
+                        tx = aloc[0] + (ploc[0] - aloc[0]) * scale
+                        tz = aloc[2] + (ploc[2] - aloc[2]) * scale
+                        ty = self._roam_surface(tx, tz, aloc[1])
+                        if ty is not None:
+                            rid = self._bridge.walk(
+                                bot, int(tx), int(ty), int(tz), timeout=200)
+                            if rid >= 0:
+                                self._hunt_until[bot] = now + 20.0
+                            if rid >= 0 and (bot, pname) not in self._hunt_told:
+                                self._hunt_told.add((bot, pname))
+                                self._reflex_event(
+                                    bot, f"你记得 {pname} 杀过你——现在没别的事，"
+                                         f"主动去找他算账（离 {d:.0f} 格），"
+                                         f"打赢一次恩怨两清")
+                                self._record(
+                                    "combat", f"主动追杀仇人 {pname}"
+                                              f"（{d:.0f} 格外）", who=bot)
         # 好感度摘要：30 秒一条，让大脑始终知道和谁是什么关系
         if now >= self._favor_next.get(bot, 0.0):
             self._favor_next[bot] = now + 30.0
@@ -3114,6 +3170,7 @@ class ArcFakePlayerPlugin(Plugin):
                     self._reflex.disengage(bot, "击败了目标")
                     if self._favor.score(bot, name) <= threshold:
                         self._favor.settle_vendetta(bot, name)
+                        self._hunt_told.discard((bot, name))
                         self._reflex_event(
                             bot, f"你击败了仇人 {name}，恩怨两清——"
                                  f"以后井水不犯河水。")
@@ -4266,6 +4323,12 @@ class ArcFakePlayerPlugin(Plugin):
         """
         if name in self._sleeping:
             return True
+        # 主动追杀占有身体期间让路（朝仇人走，别被随机闲逛打断）
+        try:
+            if time.monotonic() < self._hunt_until.get(name, 0.0):
+                return True
+        except Exception:
+            pass
         agent = self._agents.get(name)
         if (self._reflex.is_engaged(name)
                 or name in self._arena_next

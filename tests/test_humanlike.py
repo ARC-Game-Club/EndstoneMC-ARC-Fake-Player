@@ -544,6 +544,72 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 主动追杀（v3.9.31） -------------------------------------------
+
+    def _hunt_plugin(self, dist_to_target=500.0):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._cfg = {"social": {"enabled": True, "grudge_threshold": -30.0,
+                                  "vengeance_radius": 40.0, "vengeance_hunt": True,
+                                  "reflex_duration_seconds": 90.0}}
+        plugin._sleeping = {}
+        plugin._hunt_next = {}
+        plugin._hunt_until = {}
+        plugin._hunt_told = set()
+        plugin._vengeance_cd = {}
+        plugin._favor_next = {}
+        walks: list = []
+        plugin._bridge = Mock()
+        plugin._bridge.walk = Mock(side_effect=lambda n, x, y, z, timeout=0:
+                                   walks.append((n, x, z)) or 1)
+        plugin._reflex = Mock()
+        plugin._reflex.is_engaged = Mock(return_value=False)
+        plugin._favor = Mock()
+        plugin._favor.grudges = Mock(return_value=["Killer"])
+        plugin._favor.describe = Mock(return_value="")
+        plugin._human_pos = Mock(return_value=(dist_to_target, 64, 0))
+        plugin._roam_surface = Mock(return_value=64.0)
+        plugin._roam_busy = Mock(return_value=False)
+        agent = Mock()
+        agent.note_events = Mock()
+        plugin._agents = {"Bot": agent}
+        plugin._executor = Mock()
+        actor = FakeActor(FakeDimension(), 0, 64, 0)
+        return plugin, walks, actor, agent
+
+    def test_hunt_walks_toward_online_grudge(self):
+        import time as _t
+        plugin, walks, actor, agent = self._hunt_plugin()
+        plugin._social_tick("Bot", agent, actor, _t.monotonic())
+        self.assertEqual(len(walks), 1)          # 朝仇人方向发了一腿
+        self.assertEqual(walks[0][0], "Bot")
+        # 腿的落点在假人与仇人连线方向上（x 远大于 0）
+        self.assertGreater(walks[0][1], 40)
+        # 宣言只发一次
+        plugin._social_tick("Bot", agent, actor, _t.monotonic() + 100)
+        told = [c.args for c in agent.note_events.call_args_list
+                if "算账" in str(c)]
+        self.assertEqual(len(told), 1)
+
+    def test_hunt_yields_when_busy_or_engaged(self):
+        import time as _t
+        plugin, walks, actor, agent = self._hunt_plugin()
+        plugin._roam_busy = Mock(return_value=True)
+        plugin._social_tick("Bot", agent, actor, _t.monotonic())
+        self.assertEqual(walks, [])              # 忙（有计划/闲逛占身）不追
+        plugin._roam_busy = Mock(return_value=False)
+        plugin._reflex.is_engaged = Mock(return_value=True)
+        plugin._social_tick("Bot", agent, actor, _t.monotonic())
+        self.assertEqual(walks, [])              # 已在打（就近开战接管）
+
+    def test_hunt_disabled_by_config(self):
+        import time as _t
+        plugin, walks, actor, agent = self._hunt_plugin()
+        plugin._cfg["social"]["vengeance_hunt"] = False
+        plugin._social_tick("Bot", agent, actor, _t.monotonic())
+        self.assertEqual(walks, [])
+
     # ---- 受困救援（v3.9.29） -------------------------------------------
 
     def _rescue_plugin(self, warps, ok=True):
