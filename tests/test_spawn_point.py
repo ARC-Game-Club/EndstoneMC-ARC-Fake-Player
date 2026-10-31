@@ -1,0 +1,258 @@
+"""假人出生点 / 重生点：出生即摔死的根因回归。
+
+背景
+----
+无规则服（ARCAnarchy）的假人"一出生就摔死"，而且是死循环。
+根因是三个坑叠在一起（日志 + level.dat + 源码交叉验证）：
+
+1. **世界的出生高度是"自动"的**。``worlds/ARCAnarchy/level.dat`` 里是
+   ``SpawnX=-243 SpawnY=32767 SpawnZ=-105``——``32767`` 是哨兵值，意思是
+   "引擎运行时自己找"。那一列在山上（地面约 y=151），BDS 每次解析出来
+   的高度还不一样：实测 200 和 312 都出现过。
+2. **重生点从来没设成功过**。插件本来会给每个假人调 ``setSpawnPoint``
+   记住重生点，但这个引擎版本（1.26.52.3）的脚本 API 只收 **0~1** 个
+   参数，老写法 ``setSpawnPoint(loc, dim)`` 传两个会抛::
+
+       TypeError: Incorrect number of arguments to function.
+                  Expected 0-1, received 2
+
+   于是引擎退回**世界出生点**——就是上面那个高度不确定的 32767 自动值。
+   假人从半空掉下来摔死 → 自动重生 → 又是半空 → 再摔。
+3. **"高空安全落地"的保护有洞**。y>128 时插件先用创造模式生成、落地后
+   再切回生存；老实现是"接上后固定等 8 秒"。但从 200 掉到地面要 10 秒
+   以上，8 秒时它**还在半空**——切成生存后落地那一下的坠落伤害直接摔死。
+
+枪战服（ARCShooterGame）为什么没事？它的 level.dat 是
+``SpawnX=0 SpawnY=53 SpawnZ=0``：高度是**写死的**，而且生成点就在地面上，
+上面三个坑一个都踩不到。
+
+这几条用例把三件事钉住：
+
+  1. 地表扫描要**跳过树叶和花草**——不能把树冠当地面；
+  2. 切回生存模式必须**等落地**，不能用固定延迟；
+  3. 行为包侧的重生点必须真的设上（1 个参数 + 老引擎兜底）且落在地面上，
+     坠落不再被误报成"重生"。
+"""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from tests.endstone_stub import install
+
+install()
+
+import endstone_arc_fake_player as pkg  # noqa: E402
+from endstone_arc_fake_player.plugin import ArcFakePlayerPlugin  # noqa: E402
+
+PKG = Path(pkg.__file__).resolve().parent
+JS_SRC = (PKG / "behavior_pack" / "scripts" / "arena_combat.js").read_text("utf-8")
+
+
+def _js_slice(src: str, marker: str, length: int = 2600) -> str:
+    """截出某个 JS 函数附近的源码，用来做契约断言。"""
+    i = src.find(marker)
+    if i < 0:
+        return ""
+    return src[i:i + length]
+
+
+class FakeScheduler:
+    """只记录任务、让人手动泵的假调度器。"""
+
+    def __init__(self):
+        self.pending: list = []
+
+    def run_task(self, owner, task, delay=0, period=0, **kwargs):
+        self.pending.append(task)
+        return len(self.pending)
+
+    def pump(self, times: int = 1) -> int:
+        done = 0
+        for _ in range(times):
+            if not self.pending:
+                break
+            task = self.pending.pop(0)
+            task()
+            done += 1
+        return done
+
+
+class FakePlayer:
+    """高度按剧本递进的假玩家（模拟"从 200 一路掉到地面，然后站住"）。"""
+
+    def __init__(self, ys):
+        self.ys = list(ys)
+        self.i = 0
+
+    @property
+    def location(self):
+        y = self.ys[min(self.i, len(self.ys) - 1)]
+        self.i += 1
+        return SimpleNamespace(x=0.0, y=y, z=0.0)
+
+
+def _world_with(columns: dict):
+    """columns: {(x, z): {y: 短名}} —— 假地表。"""
+    def get_block_name(dim, x, y, z):
+        return columns.get((x, z), {}).get(y, "")
+
+    return SimpleNamespace(get_block_name=get_block_name)
+
+
+class SurfaceScanTests(unittest.TestCase):
+    """Python 侧的地表扫描。"""
+
+    def setUp(self):
+        self.plugin = ArcFakePlayerPlugin()
+        self.plugin.logger = SimpleNamespace(
+            debug=lambda *a, **k: None, info=lambda *a, **k: None,
+            warning=lambda *a, **k: None)
+
+    def _scan(self, columns, x=-243, z=-105):
+        self.plugin._world = _world_with(columns)
+        return self.plugin._surface_scan_y(object(), x, z)
+
+    def test_returns_ground_plus_one(self):
+        """普通地面：扫到 y=153 的泥土 → 可站立的 y=154。"""
+        self.assertEqual(self._scan({(-243, -105): {153: "dirt"}}), 154)
+
+    def test_skips_tree_canopy(self):
+        """树冠不是地面：树叶要跳过，继续往下找到真正的地面。
+
+        这是无规则服那条链的第一环——世界出生点那一列长着树，
+        按"第一个非空气"扫会停在树冠上（y=200），假人就出生在树冠上。
+        """
+        col = {199: "oak_leaves", 198: "oak_leaves", 197: "oak_log", 153: "dirt"}
+        self.assertEqual(self._scan({(-243, -105): col}), 154)
+
+    def test_skips_plants(self):
+        """花草站不住，也要跳过。"""
+        col = {160: "short_grass", 159: "poppy", 153: "dirt"}
+        self.assertEqual(self._scan({(-243, -105): col}), 154)
+
+    def test_grass_block_is_standable(self):
+        """`grass_block` 的后缀是 grass_block 不是 grass —— 不能被误伤。"""
+        self.assertEqual(self._scan({(-243, -105): {153: "grass_block"}}), 154)
+
+    def test_all_air_returns_none(self):
+        """整列都是空气 → 扫不出来（调用方退回 y=200 的高空兜底）。"""
+        self.assertIsNone(self._scan({(-243, -105): {}}))
+
+    def test_air_name_is_skipped(self):
+        """显式的 minecraft:air 也要跳过。"""
+        col = {160: "minecraft:air", 153: "stone"}
+        self.assertEqual(self._scan({(-243, -105): col}), 154)
+
+
+class PendingGameModeTests(unittest.TestCase):
+    """切回生存模式：必须等落地。"""
+
+    def setUp(self):
+        self.plugin = ArcFakePlayerPlugin()
+        self.plugin.logger = SimpleNamespace(
+            debug=lambda *a, **k: None, info=lambda *a, **k: None,
+            warning=lambda *a, **k: None)
+        self.dispatched: list[str] = []
+        self.plugin._dispatch = self.dispatched.append
+        self.sched = FakeScheduler()
+        self.plugin.server = SimpleNamespace(scheduler=self.sched)
+
+    def _prepare(self, ys):
+        player = FakePlayer(ys)
+        self.plugin._find_sim_player = lambda name: player
+        self.plugin._pending_gm["bot"] = 0   # 0 = survival
+        self.plugin._apply_pending_gm("bot", player)
+
+    def test_no_switch_while_falling(self):
+        """还在半空的时候不许切生存——落地那一下会直接摔死。"""
+        self._prepare([200.0, 180.0, 160.0, 154.0])
+        self.sched.pump(4)
+        self.assertEqual(self.dispatched, [],
+                         "半空就切了生存模式，落地必摔死")
+
+    def test_switch_after_landing(self):
+        """站住之后才切生存。"""
+        self._prepare([200.0, 180.0, 160.0, 154.0, 154.0, 154.0])
+        self.sched.pump(8)
+        self.assertEqual(self.dispatched, ["gamemode survival bot"])
+
+    def test_switch_happens_only_once(self):
+        """切过一次就完了，别反复切。"""
+        self._prepare([154.0, 154.0, 154.0, 154.0])
+        self.sched.pump(6)
+        self.assertEqual(self.dispatched, ["gamemode survival bot"])
+
+    def test_switches_even_if_never_lands(self):
+        """一直掉不停（卡住了）也要切，最多等 60 秒。"""
+        ys = [200.0 - i for i in range(400)]
+        self._prepare(ys)
+        self.sched.pump(200)
+        self.assertEqual(self.dispatched, ["gamemode survival bot"])
+
+    def test_no_pending_entry_is_noop(self):
+        """没有待切换项就什么都不做。"""
+        self.plugin._pending_gm.pop("bot", None)
+        self.plugin._apply_pending_gm("bot", FakePlayer([154.0]))
+        self.sched.pump(3)
+        self.assertEqual(self.dispatched, [])
+
+
+class BehaviorPackContractTests(unittest.TestCase):
+    """行为包侧的契约（源码断言——这套引擎上跑不了 JS，只能钉源码）。"""
+
+    def test_set_spawn_point_uses_one_argument_first(self):
+        """本机 BDS 的 setSpawnPoint 只收 0~1 个参数，必须先按 1 个参数调。"""
+        body = _js_slice(JS_SRC, "function applySpawnPoint")
+        self.assertIn("sim.setSpawnPoint(loc);", body)
+        self.assertIn("sim.setSpawnPoint(loc, dim);", body,
+                      "老引擎的两参数写法要留作兜底")
+        self.assertLess(body.index("sim.setSpawnPoint(loc);"),
+                        body.index("sim.setSpawnPoint(loc, dim);"),
+                        "必须先试 1 个参数，再退回 2 个参数")
+
+    def test_respawn_point_is_ground_not_creation_position(self):
+        """重生点要落在地面上，不能直接用生成时的位置（可能在半空）。"""
+        body = _js_slice(JS_SRC, "export function rememberSpawnPoint")
+        self.assertIn("findGroundY(", body)
+        self.assertIn("applySpawnPoint(", body)
+
+    def test_ground_scan_skips_leaves(self):
+        """地面扫描要跳过树叶/花草——树冠不是地面。"""
+        body = _js_slice(JS_SRC, "function findGroundY")
+        self.assertIn("NOT_STANDABLE", body)
+        self.assertIn("endsWith(bad)", body,
+                      "树叶 id 带树种（oak_leaves），只能按后缀拦")
+
+    def test_falling_is_not_reported_as_respawn(self):
+        """坠落不再被误报成"阵亡后重生"——判据改成"上一拍血量是 0"。"""
+        body = _js_slice(JS_SRC, "export function watchRespawn")
+        self.assertNotIn("moved < 8", body,
+                         "位移判据会把每一秒的坠落都当成重生")
+        self.assertIn("wasDead", body)
+
+    def test_landing_pins_spawn_point(self):
+        """落地后要把重生点钉在脚下（生成时那一次扫描也可能失败）。"""
+        body = _js_slice(JS_SRC, "function pinSpawnPointOnLanding")
+        self.assertIn("applySpawnPoint(", body)
+
+
+def main():
+    result = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(SurfaceScanTests))
+    result2 = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(PendingGameModeTests))
+    result3 = unittest.TextTestRunner(verbosity=2).run(
+        unittest.defaultTestLoader.loadTestsFromTestCase(BehaviorPackContractTests))
+    total = result.testsRun + result2.testsRun + result3.testsRun
+    ok = (result.wasSuccessful() and result2.wasSuccessful()
+          and result3.wasSuccessful())
+    if not ok:
+        return 1
+    print(f"全部 {total} 项通过")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

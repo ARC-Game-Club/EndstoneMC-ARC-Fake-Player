@@ -101,6 +101,28 @@ from .social import CombatReflex, FavorStore
 from .world import WorldAdapter, short_id
 
 
+#: 不能当地面的方块短名后缀（`short_id()` 去掉命名空间后的形式）。
+#:
+#: 树叶踩上去会掉下去，花草根本站不住——地表扫描遇到它们要**继续往下找**。
+#: 按"第一个非空气"扫是错的：无规则服的世界出生点那一列正好长着树，
+#: 扫出来的是树冠高度（y=200 上下），假人就出生在树冠上，掉下去摔死。
+#:
+#: ⚠️ 树干/树皮也算进去：站在树干上是站得住，但那是**树顶上**，
+#: 离真正的地面还有几十格，重生点设在树冠 = 死后又摔一次。
+#:
+#: ⚠️ 用**后缀**匹配：树叶 id 带树种（`oak_leaves`/`birch_leaves`/…），
+#: 只有按后缀才拦得住；`grass_block` 的后缀是 `grass_block` 不是 `grass`，
+#: 所以正常地面不会被误伤。
+_NOT_STANDABLE_SUFFIXES = (
+    "leaves", "leaf", "azalea", "sapling", "tallgrass", "short_grass",
+    "grass", "fern", "large_fern", "flower", "poppy", "dandelion",
+    "red_flower", "tall_flower", "vine", "kelp", "seagrass", "sugar_cane",
+    "deadbush", "torch", "carrots", "potatoes", "beetroot",
+    "brown_mushroom", "red_mushroom", "lily_pad", "nether_sprout",
+    "log", "wood", "stem", "hyphae",
+)
+
+
 def _clean_name(raw: str) -> str:
     """把用户输入的名字净化成一个能安全穿过 scriptevent 通道的名字。
 
@@ -3682,19 +3704,26 @@ class ArcFakePlayerPlugin(Plugin):
         return "pending"
 
     def _apply_pending_gm(self, name: str, player: Any) -> None:
-        """高空安全落地的收尾：落地时是创造模式（防摔死），接上后切回
-        配置的模式。见 _request_body 的说明。
+        """高空安全落地的收尾：落地时是创造模式（防摔死），**落地之后**才
+        切回配置的模式。见 _request_body 的说明。
 
-        ⚠️ 切换要**延迟**（约 8 秒）：接上那一刻假人多半还在从 y=200
-        往下掉，立刻切生存会吃满坠落到伤害（实测日志里出现过
-        "TianXing fell from a high place"）。从 200 格落地约 6 秒，
-        8 秒后切换既保命也看不出破绽。
+        ⚠️ 必须确认"已经落地"再切，不能用固定延迟。
+        旧写法是"接上后固定等 8 秒"。但无规则服的世界出生点在山上，
+        假人是从 y=200 掉下去的（落差近 50 格），8 秒后它**还在半空**——
+        这时候切成生存，落地那一下的坠落伤害直接把它摔死：
+        坠落距离是引擎记的，和当前模式无关（创造模式掉下去不扣血，
+        但落地前一刻切回生存，这一下照样摔死）。接着自动重生又回到半空，
+        于是成了"一出生就摔死"的死循环。
+
+        所以改成每 0.5 秒看一眼高度：连续两次几乎不动 = 站稳了，才切。
+        最多等 60 秒，超时也切（总比永远留在创造模式强）。
         """
         want_gm = self._pending_gm.pop(name, None)
         if want_gm is None:
             return
         mode_word = {v: k for k, v in self._GAME_MODE_NUMBERS.items()}.get(
             want_gm, "survival")
+        state: dict[str, Any] = {"y": None, "still": 0, "tries": 0}
 
         def _switch() -> None:
             try:
@@ -3702,8 +3731,32 @@ class ArcFakePlayerPlugin(Plugin):
             except Exception as exc:
                 self.logger.debug(f"[{name}] 游戏模式切换失败: {exc}")
 
+        def _wait_ground() -> None:
+            state["tries"] += 1
+            y = None
+            try:
+                p = self._find_sim_player(name) or player
+                y = float(p.location.y)
+            except Exception:
+                y = None
+            if y is not None:
+                prev = state["y"]
+                state["y"] = y
+                if prev is not None and abs(y - prev) < 0.05:
+                    state["still"] += 1
+                else:
+                    state["still"] = 0
+            if state["still"] < 1 and state["tries"] < 120:
+                # 还在往下掉（或读不到高度）→ 再等 0.5 秒
+                try:
+                    self.server.scheduler.run_task(self, _wait_ground, delay=10)
+                    return
+                except Exception as exc:
+                    self.logger.debug(f"[{name}] 落地检测任务注册失败: {exc}")
+            _switch()
+
         try:
-            self.server.scheduler.run_task(self, _switch, delay=160)
+            self.server.scheduler.run_task(self, _wait_ground, delay=20)
         except Exception as exc:
             self.logger.debug(f"[{name}] 游戏模式切换任务注册失败: {exc}")
 
@@ -5449,12 +5502,24 @@ class ArcFakePlayerPlugin(Plugin):
         return None
 
     def _surface_scan_y(self, dim: Any, x: int, z: int) -> int | None:
-        """从上往下找 (x,z) 这一列第一个非空气方块，返回可站立的 y。"""
+        """从上往下找 (x,z) 这一列第一块**能站人**的方块，返回可站立的 y。
+
+        ⚠️ 树叶和花草要跳过：踩上去会掉下去（或者根本站不住）。
+        按"第一个非空气"扫是错的——无规则服的世界出生点那一列正好长着树，
+        扫出来的是**树冠高度**（y=200 上下），假人就出生在树冠上，
+        掉下去摔死。行为包那边落地后还会把重生点钉回真正的地面。
+        """
         try:
             for y in range(318, -64, -1):
                 name = self._world.get_block_name(dim, x, y, z)
-                if name and name.strip() not in ("", "minecraft:air", "air"):
-                    return y + 1
+                if not name:
+                    continue
+                short = name.strip().split(":")[-1]
+                if short in ("", "air", "cave_air", "void_air"):
+                    continue
+                if short.endswith(_NOT_STANDABLE_SUFFIXES):
+                    continue
+                return y + 1
         except Exception:
             return None
         return None

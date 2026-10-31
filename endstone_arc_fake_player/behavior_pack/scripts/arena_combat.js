@@ -86,6 +86,12 @@ const spawnPoints = new Map();
 /** 名字 → 上一拍的位置，用来发现"死后重生"造成的位置突变。 */
 const lastPositions = new Map();
 
+/** 名字 → 上一拍的血量，用来区分"死过然后重生"和"只是从高处掉下去"。 */
+const lastHealth = new Map();
+
+/** 名字 → 落地判定状态：连续两次采样 Y 不变就算站稳了。 */
+const landingState = new Map();
+
 /** 上一次广播 simhit 的时间，避免刷屏。 */
 let lastSimHitLog = 0;
 
@@ -105,24 +111,136 @@ export function initArenaCombat(sims) {
     if (sims) simsRef = sims;
 }
 
-/** 记录假人的出生点，并把它设成引擎的重生点。 */
+/**
+ * 这些方块不能当地面：踩上去会掉下去（树叶）或根本站不住（花草）。
+ *
+ * 判定用**后缀**匹配，因为方块 id 带树种：`minecraft:oak_leaves`、
+ * `minecraft:birch_leaves`……只有按后缀才拦得住。注意 `grass_block` 的后缀
+ * 是 `grass_block` 不是 `grass`，所以正常地面不会被误伤。
+ *
+ * 树干/树皮也算进去：站在树干上是站得住，但那是**树顶上**，离真正的
+ * 地面还有几十格——重生点设在树冠 = 死后又摔一次。
+ *
+ * 为什么单列一份：Python 侧的地表扫描是"从上往下第一个非空气方块"，
+ * 如果那一列正好长着树，它会返回**树冠的高度**（无规则服的世界出生点就在
+ * 山上，Y 200 上下全是树冠），假人就出生在树冠上——然后掉下去摔死。
+ */
+const NOT_STANDABLE = [
+    "leaves", "leaf", "azalea", "sapling", "tallgrass", "short_grass",
+    "grass", "fern", "large_fern", "flower", "poppy", "dandelion",
+    "red_flower", "tall_flower", "vine", "kelp", "seagrass", "sugar_cane",
+    "deadbush", "torch", "carrots", "potatoes", "beetroot",
+    "brown_mushroom", "red_mushroom", "lily_pad", "nether_sprout",
+    "log", "wood", "stem", "hyphae",
+];
+
+/**
+ * 从 fromY 往下找这一列第一块**能站人**的方块，返回可站立的 y（方块 y + 1）。
+ *
+ * ⚠️ `getBlock()` 在**区块没加载**时返回 undefined——那不是"这里是空气"，
+ * 必须当成"扫不了"直接放弃，不能当成空气一路扫到底（那会一路扫到 y=-64
+ * 然后返回 null，白白丢掉一个本来能扫出来的地面）。
+ */
+function findGroundY(x, z, fromY) {
+    const dim = safe(() => world.getDimension("overworld"));
+    if (!dim) return null;
+    const start = Math.min(fromY, 318);
+    for (let y = start; y >= -64; y--) {
+        const block = safe(() => dim.getBlock({ x: x, y: y, z: z }));
+        if (block === undefined) return null;   // 区块没加载 → 扫不了
+        if (block.isAir || block.isLiquid) continue;
+        const id = String(block.typeId || "").toLowerCase();
+        if (NOT_STANDABLE.some((bad) => id.endsWith(bad))) continue;
+        return y + 1;
+    }
+    return null;
+}
+
+/**
+ * 设引擎重生点。
+ *
+ * ⚠️ **参数个数是这套 bug 的核心**。
+ * 本机 BDS 1.26.52.3 的脚本 API 里 `setSpawnPoint` 只收 **0~1** 个参数
+ * （dimension 参数被去掉了）。老写法 `setSpawnPoint(loc, dim)` 会抛：
+ *
+ *     TypeError: Incorrect number of arguments to function.
+ *                Expected 0-1, received 2
+ *
+ * 于是重生点**从来没设成功过**——假人死后引擎把它放回"创建时的位置"。
+ * 而创建时的位置常常在半空（Python 侧扫不到地表时退回 y=200），
+ * 于是：出生在半空 → 摔死 → 自动重生 → 又是半空 → 再摔死，死循环。
+ *
+ * 所以先试 1 个参数（新引擎），失败再退回 2 个参数的写法（老引擎）。
+ */
+function applySpawnPoint(sim, point) {
+    if (!sim || typeof sim.setSpawnPoint !== "function") return false;
+    const loc = { x: point.x, y: point.y, z: point.z };
+    try {
+        sim.setSpawnPoint(loc);
+        return true;
+    } catch (e1) {
+        try {
+            const dim = safe(() => world.getDimension("overworld"));
+            sim.setSpawnPoint(loc, dim);
+            return true;
+        } catch (e2) {
+            console.warn(`${TAG} 设置重生点失败: ${e2}`);
+            return false;
+        }
+    }
+}
+
+/**
+ * 记录假人的出生点，并把它设成引擎的重生点。
+ *
+ * ⚠️ 重生点必须落在**地面上**，不能直接用"我们把它生成在哪"。
+ * 生成点经常在半空（Python 侧扫不到地表 → 退回 y=200），
+ * 拿半空当重生点 = 死后原地再摔一次。
+ */
 export function rememberSpawnPoint(name, sim, loc) {
     const point = { x: Math.floor(loc.x), y: Math.floor(loc.y), z: Math.floor(loc.z) };
     spawnPoints.set(name, point);
     lastPositions.set(name, null);
-    try {
-        if (typeof sim.setSpawnPoint === "function") {
-            // ⚠️ 假人的 `sim.dimension` 是 **undefined**（脚本 API 对 SimulatedPlayer
-            // 不暴露 dimension），所以必须自己拿维度对象，否则
-            // setSpawnPoint 会报 "Interface property ['dimension'] expected type: Dimension"
-            // 而**静默失败**——假人死后就会被丢到随机位置。
-            const dim = safe(() => world.getDimension("overworld"));
-            sim.setSpawnPoint({ x: point.x, y: point.y, z: point.z }, dim);
-        }
-    } catch (e) {
-        console.warn(`${TAG} 设置 ${name} 的重生点失败: ${e}`);
+    landingState.delete(name);
+    // 假人已经站在这一格上了，所以这一列的区块**一定是加载的**——
+    // 这正是 Python 侧那次扫描失败（区块没加载）时缺的那一环。
+    const groundY = findGroundY(point.x, point.z, point.y);
+    const respawn = groundY === null
+        ? point
+        : { x: point.x, y: groundY, z: point.z };
+    const ok = applySpawnPoint(sim, respawn);
+    console.log(
+        `${TAG} 假人 ${name} 出生于 (${point.x}, ${point.y}, ${point.z})；`
+        + `重生点${ok ? "已设为" : "设置失败"} (${respawn.x}, ${respawn.y}, ${respawn.z})`
+        + (groundY === null ? "（脚下没扫到地面，先按生成点设）" : ""),
+    );
+}
+
+/**
+ * 落地后把重生点钉在脚下。
+ *
+ * 为什么还要钉第二遍：生成那一刻的地面扫描也可能失败（区块还没加载完）。
+ * 等它**真的站住了**（连续两次采样 Y 不变），脚下那块地一定是实的——
+ * 这时候再设一次重生点，就再也不会"死后回到半空"。
+ */
+function pinSpawnPointOnLanding(name, sim, loc) {
+    const st = landingState.get(name) || { y: null, still: 0, done: false };
+    if (st.done) return;
+    if (st.y !== null && Math.abs(loc.y - st.y) < 0.05) st.still += 1;
+    else st.still = 0;
+    st.y = loc.y;
+    landingState.set(name, st);
+    if (st.still < 1) return;      // 需要连续两次几乎不动
+    st.done = true;
+    const x = Math.floor(loc.x);
+    const z = Math.floor(loc.z);
+    const groundY = findGroundY(x, z, Math.floor(loc.y));
+    const respawn = groundY === null
+        ? { x: x, y: Math.floor(loc.y), z: z }
+        : { x: x, y: groundY, z: z };
+    if (applySpawnPoint(sim, respawn)) {
+        console.log(`${TAG} 假人 ${name} 已落地，重生点钉在 (${respawn.x}, ${respawn.y}, ${respawn.z})`);
     }
-    console.log(`${TAG} 假人 ${name} 出生于 (${point.x}, ${point.y}, ${point.z})，重生点已设为此处`);
 }
 
 export function getSpawnPoint(name) {
@@ -519,6 +637,12 @@ export function handleShotEvent(data) {
  * 盯位置突变。假人死一次会被引擎放回重生点——如果重生点不是我们设定的
  * 那个，它就会"莫名其妙"出现在地图另一头。这里把这种事抓出来并说清楚。
  *
+ * ⚠️ 判据是"**上一拍血量是 0**"，不是"这一拍移动超过 8 格"。
+ * 老写法用位移当判据，结果**从高处往下掉的每一秒都算一次"重生"**——
+ * 无规则服假人生在 y=200 掉下去，一路上刷出十几条"阵亡后重生在 (…)"，
+ * 真正的重生反而被淹没在这堆假货里。
+ * 血量从 0 回到满，才是"死过一次又活了"的唯一特征。
+ *
  * 返回 {loc, spawn} 表示"刚重生过"，否则 null。
  */
 export function watchRespawn(name, sim) {
@@ -528,18 +652,20 @@ export function watchRespawn(name, sim) {
     } catch (_) {
         return null;
     }
+    const hp = safe(() => sim.getComponent("minecraft:health")?.currentValue);
     const prev = lastPositions.get(name);
+    const prevHp = lastHealth.get(name);
     lastPositions.set(name, { x: loc.x, y: loc.y, z: loc.z });
-    if (!prev) return null;
+    lastHealth.set(name, hp);
 
-    const moved = Math.hypot(loc.x - prev.x, loc.y - prev.y, loc.z - prev.z);
-    if (moved < 8) return null;
+    // 落地判定（与"是否重生"无关）：站稳之后把重生点钉在脚下。
+    pinSpawnPointOnLanding(name, sim, loc);
+
+    if (prev === null || prev === undefined) return null;
+    const wasDead = prevHp !== undefined && prevHp !== null && prevHp <= 0;
+    if (!wasDead) return null;   // 没死过 → 只是移动/坠落，不算重生
 
     const spawn = spawnPoints.get(name);
-    const hp = safe(() => sim.getComponent("minecraft:health")?.currentValue);
-    const full = hp === undefined || hp >= 19.5;
-    if (!full) return null;   // 血没满 → 是传送/寻路，不算重生
-
     console.log(
         `${TAG} 假人 ${name} 阵亡后重生在 (${loc.x.toFixed(1)}, ${loc.y.toFixed(1)}, ${loc.z.toFixed(1)})`
         + (spawn ? `；设定出生点是 (${spawn.x}, ${spawn.y}, ${spawn.z})` : "；没有设定出生点"),
