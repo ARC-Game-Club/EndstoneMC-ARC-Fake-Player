@@ -529,6 +529,72 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 安家三件套（v3.9.24） ----------------------------------------
+
+    def test_build_structure_compiles_blueprint(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        actor = FakeActor(dim, 0, 64, 0)   # 站在 y64，脚下 y63 是地面
+        # 给点材料
+        compiler._count_material = lambda a, b: 999
+        bp = '[{"off":[0,0,0],"block":"oak_planks"},{"off":[1,0,0],"block":"cobblestone"},{"off":[0,1,0],"block":"oak_planks"}]'
+        r = compiler.compile(actor, ToolCall("build_structure", {"blocks": bp}), {})
+        self.assertIsNotNone(r.plan, r.immediate)
+        self.assertEqual(r.plan.total, 3)
+        ops = {s.op for s in r.plan.steps}
+        self.assertTrue(ops <= {"place_real", "set_block"})
+
+    def test_build_structure_rejects_bad_block(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("build_structure",
+            {"blocks": '[{"off":[0,0,0],"block":"bedrock"}]'}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("格式不对", r.immediate)
+
+    def test_build_structure_rejects_oversize_offset(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("build_structure",
+            {"blocks": '[{"off":[99,0,0],"block":"oak_planks"}]'}), {})
+        self.assertIsNone(r.plan)
+
+    def test_claim_land_blocked_near_land(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler.bind_land_nearby(lambda cx, cz, d: True)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("claim_land", {"radius": 8}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("别人的领地", r.immediate)
+
+    def test_claim_land_emits_step_when_clear(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler.bind_land_nearby(lambda cx, cz, d: False)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("claim_land", {"radius": 6, "name": "小窝"}), {})
+        self.assertIsNotNone(r.plan, r.immediate)
+        step = r.plan.steps[0]
+        self.assertEqual(step.op, "claim_land")
+        import json as _j
+        spec = _j.loads(step.note)
+        self.assertEqual(spec["radius"], 6)
+        self.assertEqual(spec["name"], "小窝")
+
+    def test_set_home_calls_callback(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        got = []
+        compiler.bind_set_home(lambda n, x, y, z: got.append((n, x, y, z)))
+        actor = FakeActor(dim, 10, 64, -5)
+        actor.name = "BossZhong"
+        r = compiler.compile(actor, ToolCall("set_home", {}), {})
+        self.assertEqual(got, [("BossZhong", 10, 64, -5)])
+        self.assertIn("家已设为", r.immediate)
+
     # ---- 领地附近不动土（v3.9.23） -------------------------------------
 
     def test_dig_plan_blocked_near_land(self):

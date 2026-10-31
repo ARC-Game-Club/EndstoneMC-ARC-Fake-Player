@@ -104,10 +104,13 @@ SPEC: dict[str, dict[str, str]] = {
     "note_here":   {"label": "str"},
     "task_done":   {"summary": "str"},
 
-    # ---- 生存进阶（狩猎 / 下探 / 睡觉） ----
+    # ---- 生存进阶（狩猎 / 下探 / 睡觉 / 安家） ----
     "hunt":        {"target": "str", "count": "int"},
     "descend":     {"depth": "int"},
     "sleep":       {},
+    "build_structure": {"blocks": "str"},
+    "claim_land":  {"radius": "int", "name": "str"},
+    "set_home":    {},
 
             # ---- 社交与交易 ----
             "give_item":   {"player": "str", "item": "str", "count": "int"},
@@ -298,6 +301,8 @@ def missing_required(name: str, args: dict[str, Any]) -> bool:
         "hunt": {"target", "count"},
         # 阶梯下探：depth 缺省 8 层。
         "descend": {"depth"},
+        # 圈地：radius/name 都有缺省。
+        "claim_land": {"radius", "name"},
     }
     skip = optional.get(name, set())
     for key in spec:
@@ -602,6 +607,22 @@ class LLMClient:
               "天黑了就回家睡觉：附近有床会走过去一直睡到天亮；"
               "没有床会提醒你先合成一张（3 羊毛+3 木板，要工作台）并放置。"
               "睡到天亮前你不再行动。",
+              {}, []),
+            f("build_structure",
+              "按蓝图一次建造成型建筑（盖房首选）。blocks 是 JSON 数组："
+              "[{\"off\":[dx,dy,dz],\"block\":\"oak_planks\"},…]——off 相对你"
+              "当前位置（水平±20、上下-8~+20，最多160块）。底板、四面墙、"
+              "留门窗洞都靠这份清单表达；材料从背包扣，缺的先采集。",
+              {"blocks": S}, ["blocks"]),
+            f("claim_land",
+              "圈地安家：以你当前位置为中心圈一块自己的领地（radius 默认 8 "
+              "即 17x17 全高）。费用=面积×单价，从你的钱包扣（先攒够）。"
+              "附近 3x3 区块内有别人领地会被拒绝——走远 60 格以上再圈。"
+              "成功后自动把家设在这，别人也不能动你这块地。",
+              {"radius": I, "name": S}, []),
+            f("set_home",
+              "把当前位置设为家（常驻地）：闲逛以这为中心，天黑回这睡觉。"
+              "盖完房/放好床后调一次。",
               {}, []),
             f("descend",
               "阶梯式下探 depth 层（1-12）。比垂直下挖安全——垂直挖会摔死"

@@ -67,6 +67,7 @@ class ActionCompiler:
         self._notes: dict[str, tuple[int, int, int, str]] = {}
         self._goto_player: Callable[[str], Any] | None = None
         self._land_nearby: Any = None
+        self._set_home_cb: Any = None
         self._hostile_tracker: Any = None
         #: 是否让挖掘走真实假人。插件启用行为包后会打开。
         self.use_real_dig = False
@@ -81,6 +82,10 @@ class ActionCompiler:
 
     def bind_player_lookup(self, fn: Callable[[str], Any]) -> None:
         self._goto_player = fn
+
+    def bind_set_home(self, fn: Any) -> None:
+        """注入"把当前位置设为家常驻地"的回调：(name, x, y, z)。"""
+        self._set_home_cb = fn
 
     def bind_land_nearby(self, fn: Any) -> None:
         """注入"这附近（3x3 区块）有没有领地"的查询：(cx, cz, dim) -> bool。
@@ -149,6 +154,7 @@ class ActionCompiler:
         "mine_block", "mine_area", "dig_tunnel", "mine_vein", "collect",
         "chop_tree", "clear_area", "descend",
         "build_box", "build_wall", "build_floor", "place_line",
+        "build_structure",
     }
     #: 步骤里真正动方块的 op（walk_to/attack 等坐标不算）
     DIG_PLACE_STEP_OPS = {"break_block", "dig_far", "place_real", "set_block"}
@@ -464,6 +470,194 @@ class ActionCompiler:
                  for (x, _y, z) in iter_box(a["x1"], y, a["z1"], a["x2"], y, a["z2"],
                                             order="snake", max_steps=self.MAX_AREA)]
         return self._make_build_plan(actor, cells, block, "铺地板")
+
+    def _do_build_structure(self, actor: Any, a: dict[str, Any],
+                            ctx: dict[str, Any]) -> CompileResult:
+        """按蓝图一次建造：LLM 给一份方块清单（JSON），插件逐块放。
+
+        格式（off 相对当前位置）：
+            [{"off": [dx, dy, dz], "block": "oak_planks"}, ...]
+        也接受绝对坐标 {"x","y","z","block"}。校验：方块白名单、
+        偏移范围、数量上限；按类型做材料预算（不够先放够数的部分）。
+        盖房子这类"成型建筑"用它，一次调用就是一整面墙/一栋小屋。
+        """
+        from .llm import ALLOWED_BLOCKS
+
+        raw = a.get("blocks")
+        items = self._parse_blueprint(raw, actor)
+        if items is None:
+            return CompileResult(
+                ok=False,
+                immediate='蓝图格式不对：要 JSON 数组，如 '
+                          '[{"off":[0,0,0],"block":"oak_planks"},'
+                          '{"off":[1,0,0],"block":"oak_planks"}]'
+                          '（off 相对你，±20 格内，最多 160 块）')
+        if not items:
+            return CompileResult(ok=False, immediate="蓝图是空的")
+
+        ox, oy, oz = self._floor(actor.location)
+        dim = actor.dimension
+        cells: list[tuple[int, int, int, str]] = []
+        for off, block in items:
+            bx, by, bz = ox + off[0], oy + off[1], oz + off[2]
+            if not self.world.is_air(dim, bx, by, bz):
+                continue          # 已有方块的位置跳过（地基不平很正常）
+            cells.append((bx, by, bz, block))
+        if not cells:
+            return CompileResult(immediate="蓝图范围内的位置都已被占用，无需建造")
+
+        # 材料预算（按类型）：够多少放多少，缺口写进反馈
+        need_by: dict[str, int] = {}
+        for _, _, _, b in cells:
+            need_by[b] = need_by.get(b, 0) + 1
+        notes: list[str] = []
+        allowed_cells = []
+        for b, need in sorted(need_by.items()):
+            have = self._count_material(actor, b)
+            take = min(need, have)
+            if have <= 0:
+                notes.append(f"没有 {b}（缺 {need}）")
+            elif take < need:
+                notes.append(f"{b} 只够 {take}/{need}")
+            if take > 0:
+                picked = [c for c in cells if c[3] == b][:take]
+                allowed_cells.extend(picked)
+        if not allowed_cells:
+            return CompileResult(
+                ok=False,
+                immediate="背包里没有任何蓝图材料：" + "；".join(notes)
+                          + "。先去采集（collect/ chops），凑够再来 build_structure")
+
+        # 底层先放、近的先放——像真人砌墙的顺序
+        allowed_cells.sort(key=lambda c: (c[1], (c[0]-ox)**2 + (c[2]-oz)**2))
+        if self.use_real_dig:
+            steps = [Step("place_real", x, y, z, block=b, async_op=True)
+                     for (x, y, z, b) in allowed_cells]
+        else:
+            steps = [Step("set_block", x, y, z, block=b)
+                     for (x, y, z, b) in allowed_cells]
+            steps.sort(key=lambda s: (s.y, s.x, s.z))
+        label = f"建造蓝图({len(steps)}块)"
+        imm = f"开始按蓝图建造 {len(steps)} 块"
+        if notes:
+            imm += "（" + "；".join(notes) + "，缺口先跳过）"
+        return CompileResult(plan=Plan(label=label, steps=steps), immediate=imm)
+
+    #: 蓝图的硬边界
+    BLUEPRINT_MAX_BLOCKS = 160
+    BLUEPRINT_MAX_OFFSET = 20
+
+    def _parse_blueprint(self, raw: Any, actor: Any = None) -> list[tuple[tuple[int, int, int], str]] | None:
+        """把模型的蓝图参数解析成 [(off, block)]。格式不对返回 None。"""
+        from .llm import ALLOWED_BLOCKS, _norm_block
+
+        items = None
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return None
+            import json as _json
+            for attempt in (text, text.replace("'", '"')):
+                try:
+                    items = _json.loads(attempt)
+                    break
+                except Exception:
+                    continue
+            if items is None:
+                import ast as _ast
+                try:
+                    items = _ast.literal_eval(text)
+                except Exception:
+                    return None
+        elif isinstance(raw, list):
+            items = raw
+        if not isinstance(items, list) or not items:
+            return None
+        out: list[tuple[tuple[int, int, int], str]] = []
+        for it in items[: self.BLUEPRINT_MAX_BLOCKS * 2]:
+            if not isinstance(it, dict):
+                return None
+            nb = _norm_block(str(it.get("block") or ""))
+            if not nb:
+                return None
+            block = nb.split(":", 1)[-1]     # 白名单存短名，剥掉 minecraft: 前缀
+            if block not in ALLOWED_BLOCKS:
+                return None
+            if "off" in it:
+                off = it.get("off")
+                if (not isinstance(off, (list, tuple)) or len(off) != 3):
+                    return None
+                try:
+                    dx, dy, dz = int(off[0]), int(off[1]), int(off[2])
+                except (TypeError, ValueError):
+                    return None
+                if (abs(dx) > self.BLUEPRINT_MAX_OFFSET
+                        or abs(dz) > self.BLUEPRINT_MAX_OFFSET
+                        or not -8 <= dy <= 20):
+                    return None
+            elif all(k in it for k in ("x", "y", "z")):
+                if actor is None:
+                    return None
+                try:
+                    ax, ay, az = int(it["x"]), int(it["y"]), int(it["z"])
+                except (TypeError, ValueError):
+                    return None
+                act = self._floor(actor.location)
+                dx, dy, dz = ax - act[0], ay - act[1], az - act[2]
+                if (abs(dx) > self.BLUEPRINT_MAX_OFFSET
+                        or abs(dz) > self.BLUEPRINT_MAX_OFFSET
+                        or not -8 <= dy <= 20):
+                    return None
+            else:
+                return None
+            out.append(((dx, dy, dz), block))
+            if len(out) >= self.BLUEPRINT_MAX_BLOCKS:
+                break
+        return out
+
+    def _do_claim_land(self, actor: Any, a: dict[str, Any],
+                       ctx: dict[str, Any]) -> CompileResult:
+        """圈地安家：以当前位置为中心圈一块自己的领地。
+
+        编译期只做一道便宜的闸（附近 3x3 区块有领地就拒绝并让大脑
+        走远点）；真正的重叠校验/扣费/建地由插件的主线程处理器调
+        弧光核心 api_claim_land 完成（同玩家圈地规则：面积×单价，
+        从假人钱包扣）。
+        """
+        radius = max(2, min(24, int(a.get("radius", 8) or 8)))
+        name = str(a.get("name") or "").strip()[:24]
+        x, y, z = self._floor(actor.location)
+        if self._land_nearby is not None:
+            try:
+                dim = str(getattr(actor.dimension, "name", "overworld"))
+                if self._land_nearby(x >> 4, z >> 4, dim):
+                    return CompileResult(
+                        ok=False,
+                        immediate="这附近 3x3 区块内有别人的领地，不能在这圈地。"
+                                  "朝一个方向走 60 格以上再试。")
+            except Exception:
+                pass
+        spec = {"radius": radius, "name": name, "x": x, "y": y, "z": z}
+        return CompileResult(
+            plan=Plan(label=f"圈地安家(半径{radius})",
+                      steps=[Step("claim_land", x, y, z, async_op=False,
+                                  note=json.dumps(spec, ensure_ascii=False))]),
+            immediate=f"开始圈地：以 ({x},{z}) 为中心、半径 {radius}"
+                      f"（费用从钱包扣，成功后自动把家设在这）")
+
+    def _do_set_home(self, actor: Any, a: dict[str, Any],
+                     ctx: dict[str, Any]) -> CompileResult:
+        """把当前位置设为家常驻地（闲逛锚点、睡觉回这）。"""
+        if self._set_home_cb is None:
+            return CompileResult(ok=False, immediate="本服不支持设家")
+        x, y, z = self._floor(actor.location)
+        name = str(getattr(actor, "name", "") or "")
+        try:
+            self._set_home_cb(name, x, y, z)
+        except Exception:
+            return CompileResult(ok=False, immediate="设家失败")
+        return CompileResult(immediate=f"家已设为 ({x},{y},{z})，"
+                                        f"闲逛会以这里为中心，天黑记得回这睡")
 
     def _do_place_line(self, actor: Any, a: dict[str, Any], ctx: dict[str, Any]) -> CompileResult:
         block = a["block"]

@@ -1814,6 +1814,78 @@ class ArcFakePlayerPlugin(Plugin):
                 self._exec_plan.note_failed(f"交易失败：{why}")
             return True
 
+        def h_claim_land(step: Step) -> bool:
+            """圈地安家：主线程调弧光核心 api_claim_land（同玩家规则）。"""
+            owner = self._exec_owner
+            if owner is None:
+                return False
+            try:
+                spec = json.loads(str(step.note or "{}"))
+            except (ValueError, TypeError):
+                spec = {}
+            x = int(spec.get("x", step.x) or 0)
+            z = int(spec.get("z", step.z) or 0)
+            y = int(spec.get("y", step.y) or 64)
+            radius = max(2, min(24, int(spec.get("radius", 8) or 8)))
+            # 复查（编译到执行之间假人可能走了/地可能变了）
+            if self._block_near_land(owner, x, z):
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        "圈地失败：这附近 3x3 区块内有别人的领地，走远 60 格再试")
+                return True
+            try:
+                core = self.server.plugin_manager.get_plugin("arc_core")
+            except Exception:
+                core = None
+            if (core is None
+                    or not callable(getattr(core, "api_claim_land", None))):
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed("圈地失败：弧光核心版本过旧或不在")
+                return True
+            actor = self._live_actor(owner)
+            if actor is None:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed("圈地失败：身体不在线")
+                return True
+            try:
+                dim = str(getattr(actor.dimension, "name", "overworld"))
+            except Exception:
+                dim = "overworld"
+            land_name = str(spec.get("name") or f"{owner}的家")
+            xuid = ""
+            try:
+                xuid = str(self._identities.xuid_of(owner) or "")
+            except Exception:
+                xuid = ""
+            try:
+                res = core.api_claim_land(
+                    xuid, land_name, dim, x, z, radius=radius,
+                    tp_x=float(x), tp_y=float(y), tp_z=float(z)) or {}
+            except Exception as exc:
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(f"圈地异常: {exc}")
+                return True
+            if not res.get("ok"):
+                if self._exec_plan is not None:
+                    self._exec_plan.note_failed(
+                        f"圈地失败：{res.get('error') or '未知原因'}")
+                return True
+            # 成功：家设在这，结果喂回大脑
+            self.set_home(owner, float(x), float(y), float(z))
+            cost = float(res.get("cost") or 0)
+            land_id = res.get("land_id")
+            agent = self._agents.get(owner)
+            if agent is not None:
+                agent.note_events([{
+                    "op": "claim_land", "ok": True,
+                    "msg": f"圈地成功（#{land_id}，花了 {cost:.0f} 金币），"
+                           f"家已设在 ({x},{z})。接下来可以在这盖房、放床、"
+                           f"set_home 已自动完成"}])
+            self._record("spawn",
+                         f"圈地安家 #{land_id}（半径{radius}，{cost:.0f} 金币）"
+                         f" @({x},{z})", who=owner)
+            return True
+
         def h_sleep(step: Step) -> bool:
             """走到床边后挂机到天亮。真正的"睡"由 _sleep_tick 看守。"""
             owner = self._exec_owner
@@ -1928,6 +2000,7 @@ class ArcFakePlayerPlugin(Plugin):
         e.register("tp_spawn", h_tp_spawn)
         e.register("offer_trade", h_offer_trade)
         e.register("sleep", h_sleep)
+        e.register("claim_land", h_claim_land)
 
     def _teleport_step(self, step: Step) -> bool:
         """把一个格子换算成传送坐标。
@@ -3448,6 +3521,8 @@ class ArcFakePlayerPlugin(Plugin):
             compiler.bind_player_lookup(self._resolve_online_player)
             # 动土粗闸：目标区块 3x3 附近有领地 → 编译期整计划拒绝
             compiler.bind_land_nearby(self._land_nearby_chunk)
+            # set_home 工具：把当前位置设为家常驻地
+            compiler.bind_set_home(self.set_home)
 
             # 真实身体的动作处理器
             ctl = self._bodies.add(name)
