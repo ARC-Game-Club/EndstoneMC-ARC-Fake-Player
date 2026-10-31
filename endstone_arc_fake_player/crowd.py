@@ -53,6 +53,16 @@ class CharacterCard:
     chat_reply_chance: float | None = None
     #: 说话风格示例（大模型模仿这几句的语气/口头禅/情绪）。
     style: list[str] | None = None
+    #: 身份系统（上线时自动应用，幂等）——
+    #: title 头衔名（只认系统里已有的定义，配不存在的会被跳过）；
+    #: title_rarity 稀有度（普通/稀有/史诗/传奇/神话，默认"普通"）；
+    #: guild 公会名；guild_owner 是否建会人（每个公会有且仅有一个 true）；
+    #: gear 战力装备档位（无/皮/铜/铁/钻石/下界合金，复活自动补齐）。
+    title: str = ""
+    title_rarity: str = ""
+    guild: str = ""
+    guild_owner: bool = False
+    gear: str = ""
 
     @staticmethod
     def from_dict(raw: Any) -> "CharacterCard | None":
@@ -77,6 +87,11 @@ class CharacterCard:
         style = None
         if isinstance(style_raw, list):
             style = [str(x).strip() for x in style_raw if str(x).strip()]
+        owner_raw = raw.get("guild_owner", False)
+        if isinstance(owner_raw, str):
+            owner_raw = owner_raw.strip().lower() in ("1", "true", "yes", "是", "y")
+        else:
+            owner_raw = bool(owner_raw)
         return CharacterCard(
             name=name,
             persona=str(raw.get("persona", "") or ""),
@@ -87,6 +102,11 @@ class CharacterCard:
             uuid=(str(raw["uuid"]).strip() or None) if raw.get("uuid") else None,
             chat_reply_chance=chance,
             style=style,
+            title=str(raw.get("title", "") or "").strip(),
+            title_rarity=str(raw.get("title_rarity", "") or "").strip(),
+            guild=str(raw.get("guild", "") or "").strip(),
+            guild_owner=owner_raw,
+            gear=str(raw.get("gear", "") or "").strip(),
         )
 
 
