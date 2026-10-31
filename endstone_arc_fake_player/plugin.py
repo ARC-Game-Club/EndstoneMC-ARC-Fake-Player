@@ -2996,7 +2996,8 @@ class ArcFakePlayerPlugin(Plugin):
                     who = f"被 {shown or target} 击杀" if (shown or target) else "死了"
                     agent.note_events([{
                         "kind": "combat",
-                        "text": f"你{who}，已在出生点重生。这笔账记下了。"}])
+                        "text": f"你{who}了，几秒后会在重生点醒来"
+                                f"（行为包会自动替你点重生）。这笔账记下了。"}])
                     agent.wake()
                 return
             if xuid:

@@ -1819,10 +1819,45 @@ system.runInterval(() => {
             try {
                 if (!sim || sim.isValid === false) continue;
                 watchRespawn(name, sim);
+                autoRespawn(name, sim);
             } catch (e) { /* 单个失败不影响别的 */ }
         }
     } catch (e) { /* ignore */ }
 }, 20);
+
+// 自动复活：假人没有客户端去点死亡界面的"重生"按钮——没人替它点，
+// 它就永远躺在死亡位置（对其他玩家不可见，干活/战斗全停）。这里每秒
+// 查一次血量，归零就替它点：延迟 2~5 秒随机，像真人看到"你死了"
+// 界面反应一下再点。respawn() 在旧引擎上可能不存在，先探再调。
+const respawnDue = new Map();
+function autoRespawn(name, sim) {
+    let hp;
+    try {
+        hp = sim.getComponent("minecraft:health")?.currentValue;
+    } catch (_) {
+        return;
+    }
+    if (hp === undefined) return;
+    if (hp > 0) {
+        respawnDue.delete(name);
+        return;
+    }
+    if (typeof sim.respawn !== "function") return;
+    const now = system.currentTick;
+    const due = respawnDue.get(name);
+    if (due === undefined) {
+        respawnDue.set(name, now + 40 + Math.floor(Math.random() * 60));
+        return;
+    }
+    if (now < due) return;
+    respawnDue.delete(name);
+    try {
+        sim.respawn();
+        console.log(`${TAG} 假人 ${name} 阵亡，已自动重生（替它点了重生按钮）`);
+    } catch (e) {
+        console.warn(`${TAG} 假人 ${name} 自动重生失败: ${e}`);
+    }
+}
 
 // 心跳：每 5 秒无条件 pong。Python 用它判断行为包是否真的活着。
 //
