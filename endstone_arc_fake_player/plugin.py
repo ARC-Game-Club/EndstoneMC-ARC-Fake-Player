@@ -2710,6 +2710,35 @@ class ArcFakePlayerPlugin(Plugin):
             if self._live_external(name) is not None:
                 self._bridge.equip(name)
 
+    def _land_nearby_chunk(self, cx: int, cz: int, dim: str) -> bool:
+        """区块 (cx,cz) 周边 3x3 内有没有领地（弧光核心新 API）。
+
+        核心 <0.9.85 没这个 API → 返回 False 放行（执行期的逐格
+        modify_guard 仍然兜底）。查询失败同样放行——这层是"礼貌距离"，
+        不是权限闸。"""
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+        except Exception:
+            return False
+        if core is None or not callable(
+                getattr(core, "api_has_land_nearby_chunk", None)):
+            return False
+        try:
+            return bool(core.api_has_land_nearby_chunk(cx, cz, dim, radius=1))
+        except Exception:
+            return False
+
+    def _block_near_land(self, name: str, x: int, z: int) -> bool:
+        """(x,z) 所在区块附近有没有领地——闲逛挖掘前的轻量闸。"""
+        actor = self._live_actor(name)
+        if actor is None:
+            return True          # 身体都不在了，别挖
+        try:
+            dim = str(getattr(actor.dimension, "name", "overworld"))
+        except Exception:
+            dim = "overworld"
+        return self._land_nearby_chunk(int(x) >> 4, int(z) >> 4, dim)
+
     def _land_modify_guard(self, name: str, x: int, y: int, z: int):
         """挖/放方块前的领地守卫。返回 None=放行，字符串=拒绝原因。
 
@@ -3417,6 +3446,8 @@ class ArcFakePlayerPlugin(Plugin):
             # （没装的服上 run_command 说明也不会再宣传 gs）。
             compiler.shooter_available = self._shooter_available
             compiler.bind_player_lookup(self._resolve_online_player)
+            # 动土粗闸：目标区块 3x3 附近有领地 → 编译期整计划拒绝
+            compiler.bind_land_nearby(self._land_nearby_chunk)
 
             # 真实身体的动作处理器
             ctl = self._bodies.add(name)
@@ -4428,7 +4459,13 @@ class ArcFakePlayerPlugin(Plugin):
         return rid >= 0
 
     def _roam_dig(self, name: str, x: int, y: int, z: int) -> bool:
-        """闲逛挖一块：同样把失败回灌。"""
+        """闲逛挖一块：同样把失败回灌。
+
+        先过领地粗闸——附近 3x3 区块有领地就不发起（返回 False 让
+        闲逛层当失败处理，下个兴趣点自然会换地方）。"""
+        if self._block_near_land(name, x, z):
+            self._roam.note_failure(name, "附近有领地，换地方")
+            return False
         rid = self._bridge.dig(
             name, x, y, z,
             callback=lambda ok, err, info: None if ok

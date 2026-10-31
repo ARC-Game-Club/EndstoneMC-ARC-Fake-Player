@@ -529,6 +529,62 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 领地附近不动土（v3.9.23） -------------------------------------
+
+    def test_dig_plan_blocked_near_land(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        hits = []
+        compiler.bind_land_nearby(lambda cx, cz, d: hits.append((cx, cz, d)) or True)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("mine_area", {
+            "x1": 0, "y1": 63, "z1": 0, "x2": 4, "y2": 63, "z2": 4}), {})
+        self.assertIsNone(r.plan)
+        self.assertIn("领地", r.immediate)
+        self.assertTrue(hits)          # 真的查过区块
+
+    def test_dig_plan_passes_when_no_land(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler.bind_land_nearby(lambda cx, cz, d: False)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("mine_area", {
+            "x1": 0, "y1": 63, "z1": 0, "x2": 4, "y2": 63, "z2": 4}), {})
+        self.assertIsNotNone(r.plan)
+
+    def test_dig_plan_passes_without_core_api(self):
+        """核心没有 API（bind 为 None）→ 粗闸放行（执行期硬闸兜底）。"""
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("mine_area", {
+            "x1": 0, "y1": 63, "z1": 0, "x2": 4, "y2": 63, "z2": 4}), {})
+        self.assertIsNotNone(r.plan)
+
+    def test_non_dig_actions_not_blocked_by_land(self):
+        dim = FakeDimension()
+        compiler = make_compiler(dim)
+        compiler.bind_land_nearby(lambda cx, cz, d: True)   # 到处都是领地
+        actor = FakeActor(dim, 0, 64, 0)
+        r = compiler.compile(actor, ToolCall("jump", {}), {})
+        self.assertIsNotNone(r.plan)
+
+    def test_roam_dig_blocked_near_land(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._roam = Mock()
+        plugin._live_actor = Mock(return_value=FakeActor(FakeDimension(), 0, 64, 0))
+        plugin._bridge = Mock()
+        core = Mock()
+        core.api_has_land_nearby_chunk = Mock(return_value=True)
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=core)))
+        ok = plugin._roam_dig("Bot", 10, 63, 10)
+        self.assertFalse(ok)
+        plugin._bridge.dig.assert_not_called()
+        plugin._roam.note_failure.assert_called_once()
+
     def test_unknown_title_skipped_without_creating(self):
         """配置了系统不存在的头衔：跳过，不解锁不佩戴更不注册定义。"""
         plugin, core, ts = self._title_plugin(has_def=False)

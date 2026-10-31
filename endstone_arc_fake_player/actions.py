@@ -66,6 +66,7 @@ class ActionCompiler:
         self.logger = logger
         self._notes: dict[str, tuple[int, int, int, str]] = {}
         self._goto_player: Callable[[str], Any] | None = None
+        self._land_nearby: Any = None
         self._hostile_tracker: Any = None
         #: 是否让挖掘走真实假人。插件启用行为包后会打开。
         self.use_real_dig = False
@@ -80,6 +81,13 @@ class ActionCompiler:
 
     def bind_player_lookup(self, fn: Callable[[str], Any]) -> None:
         self._goto_player = fn
+
+    def bind_land_nearby(self, fn: Any) -> None:
+        """注入"这附近（3x3 区块）有没有领地"的查询：(cx, cz, dim) -> bool。
+
+        由插件绑到弧光核心的 api_has_land_nearby_chunk；核心不在时为
+        None，粗闸直接放行——硬闸仍是执行期的逐格 modify_guard。"""
+        self._land_nearby = fn
 
     # ------------------------------------------------------------------
     # 位置工具
@@ -135,17 +143,64 @@ class ActionCompiler:
     # 主入口
     # ------------------------------------------------------------------
 
+    #: 会改变世界方块的动作——动土前先过"附近有没有领地"的粗闸
+    #: （别人领地周边 3x3 区块内不挖不建，避免挖墙脚/贴边破坏）。
+    DIG_PLACE_ACTIONS = {
+        "mine_block", "mine_area", "dig_tunnel", "mine_vein", "collect",
+        "chop_tree", "clear_area", "descend",
+        "build_box", "build_wall", "build_floor", "place_line",
+    }
+    #: 步骤里真正动方块的 op（walk_to/attack 等坐标不算）
+    DIG_PLACE_STEP_OPS = {"break_block", "dig_far", "place_real", "set_block"}
+    #: 一次计划最多查多少个区块（超长隧道取前 16 个，足够代表性）
+    MAX_LAND_CHUNK_CHECKS = 16
+
     def compile(self, actor: Any, call: ToolCall, ctx: dict[str, Any]) -> CompileResult:
         handler = getattr(self, f"_do_{call.name}", None)
         if handler is None:
             return CompileResult(ok=False, immediate=f"未知动作 {call.name}")
         try:
-            return handler(actor, call.args, ctx)
+            result = handler(actor, call.args, ctx)
         except ValueError as exc:
             return CompileResult(ok=False, immediate=f"{call.name} 参数问题: {exc}")
         except Exception as exc:
             self.logger.debug(f"编译 {call.name} 失败: {exc}")
             return CompileResult(ok=False, immediate=f"{call.name} 执行失败: {exc}")
+        # 动土粗闸：挖/建类计划的目标区块附近（3x3）有领地就整计划拒绝。
+        # 放在统一的出口而不是每个 handler 里——新加的动土动作天然被覆盖。
+        if result.plan is not None and call.name in self.DIG_PLACE_ACTIONS:
+            near = self._land_nearby_chunk_of(actor, result.plan)
+            if near is not None:
+                cx, cz = near
+                return CompileResult(
+                    ok=False,
+                    immediate=f"区块 ({cx},{cz}) 附近 3x3 范围内有玩家的领地，"
+                              f"这里不动土（挖和建都不行，别贴着别人家挖墙脚）。"
+                              f"走到离领地远一点的地方（50 格开外）再继续。")
+        return result
+
+    def _land_nearby_chunk_of(self, actor: Any, plan: Plan) -> tuple[int, int] | None:
+        """计划步骤坐标 → 涉及区块 → 逐个查附近领地。命中返回该区块。"""
+        if self._land_nearby is None:
+            return None
+        try:
+            dim = str(getattr(actor.dimension, "name", "overworld"))
+        except Exception:
+            dim = "overworld"
+        seen: set[tuple[int, int]] = set()
+        for step in plan.steps:
+            if getattr(step, "op", "") not in self.DIG_PLACE_STEP_OPS:
+                continue
+            seen.add((int(step.x) >> 4, int(step.z) >> 4))
+            if len(seen) >= self.MAX_LAND_CHUNK_CHECKS:
+                break
+        for cx, cz in sorted(seen):
+            try:
+                if self._land_nearby(cx, cz, dim):
+                    return (cx, cz)
+            except Exception:
+                return None      # 查询异常按无领地放行（硬闸在执行期）
+        return None
 
     # ------------------------------------------------------------------
     # 采集类
