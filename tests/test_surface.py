@@ -1217,7 +1217,7 @@ def test_body_lifecycle() -> None:
     check("找不到真身时宁可不认，也不退而认真人",
           "return False" in src[src.find("def _looks_simulated"):src.find("def _find_sim_player")])
     check("_upgrade_placeholder 会 remove 掉旧占位实体",
-          "old.remove()" in src)
+          "self._despawn_body(old)" in src)
     check("_upgrade_placeholder 会同步 ctl.actor",
           "ctl.actor = player" in src)
 

@@ -152,6 +152,27 @@ Python 侧死亡提示改为"几秒后会在重生点醒来（行为包会自动
 
 测试 1237 项全绿（JS 语法校验 + Python 全套）。
 
+## 3.9.27：撤身体不再刷 ERROR
+
+控制台那条 `Cannot remove player X, use Player::kick instead.` 没了。
+
+**原委**：Endstone 把 `Player.remove()` 禁掉了——对玩家类实体（真人、
+SimulatedPlayer）调用，BDS 直接拒绝并打出 `[Server/ERROR]`，而**身体
+并不会被移除**，Python 侧抛出的异常又被 `except Exception: pass` 吞掉。
+于是这条兜底实际是"刷一条 ERROR + 什么也没干"，每次假人轮换下线都会
+在控制台留一条（实测两台假人服各 370+ 条）。
+
+真正能撤掉假人身体的是**行为包**：`bot:remove` → JS 侧 `sim.disconnect()`
+（脚本 API 对模拟玩家有效）——这条一直在正常工作，日志里每条 ERROR 后面
+紧跟着的 "XXX left the game" 就是它干的。
+
+**改法**：撤身体统一走 `_despawn_body()`——玩家类实体不再碰 `remove()`，
+交给行为包那条路；占位 NPC 之类照旧 `remove()`。
+
+顺带修掉一个真 bug：`_upgrade_placeholder` 原来用 `old is not player`
+判断"是不是换下来的旧身体"，可 `_find_sim_player` 每次都返回**新的
+Python 包装对象**，同一个实体两次取出来 `is` 就不相等——等于每次都把
+**正在线上的假人身体**当成旧身体去撤。现在改按实体 runtime id 判断。
 
 ## 3.9.25：夜间免打扰（配置 v16）
 

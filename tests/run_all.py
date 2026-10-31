@@ -47,6 +47,7 @@ ALL_TESTS = [
     "test_context.py",
     "test_activity.py",
     "test_surface.py",
+    "test_despawn_body.py",
     "test_v2_fixes.py",
     "test_interaction_fixes.py",
     "test_plugin_fixes.py",

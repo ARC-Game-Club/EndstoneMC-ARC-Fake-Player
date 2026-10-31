@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from endstone import ColorFormat as C
+from endstone import ColorFormat as C, Player
 from endstone.command import Command, CommandSender, CommandSenderWrapper
 from endstone.event import (
     ActorDamageEvent,
@@ -305,6 +305,54 @@ def _kind_of(text: str) -> str:
         if head.startswith(mark):
             return kind
     return "think"
+
+
+def _is_player_entity(actor: Any) -> bool:
+    """这个实体是不是"玩家类"实体（真人或 SimulatedPlayer）。
+
+    Endstone 把 SimulatedPlayer 暴露成 `Player` 的子类，所以假人的
+    身体在 Python 侧也是"玩家"；占位 NPC 是普通 `Entity`，不是。
+
+    ⚠️ 这里**只认 isinstance**，不搞 `hasattr(actor, "kick")` 那种鸭子
+    类型判断——`unittest.mock.Mock` 会自动生成任意属性，鸭子类型会把
+    测试替身（以及任何字段齐全的普通对象）误判成玩家。
+    """
+    if actor is None:
+        return False
+    try:
+        return isinstance(actor, Player)
+    except Exception:
+        return False
+
+
+def _same_entity(a: Any, b: Any) -> bool:
+    """两个引用是不是同一个底层实体。
+
+    ⚠️ **不能拿 Python 对象身份（`is`）当判据**。
+    `server.online_players` 每次遍历都会给同一个实体套一个**新的**
+    Python 包装对象，所以同一个 SimulatedPlayer 两次取出来 `a is b`
+    是 False。拿它当"是不是同一个"的判据，就会把**活着的身体**
+    误判成陈旧身体去撤——那一下撤的可是正在线上的假人。
+
+    要比的是实体的 runtime id。取不到 id 时返回 False（判成"不是
+    同一个"），后续的撤身体动作对玩家类实体本来就会跳过，所以这里
+    失败也不会误伤。
+    """
+    if a is None or b is None:
+        return False
+    if a is b:
+        return True
+    try:
+        aid = getattr(a, "id", None)
+        bid = getattr(b, "id", None)
+    except Exception:
+        return False
+    if aid is None or bid is None:
+        return False
+    try:
+        return int(aid) == int(bid)
+    except Exception:
+        return False
 
 
 #: 怪物坐标刷新间隔（秒）。怪物一直在动，1 秒刷一次足够追击，
@@ -2129,6 +2177,38 @@ class ArcFakePlayerPlugin(Plugin):
                 ctl.actor = player
             return player
         return None
+
+    def _despawn_body(self, actor: Any) -> None:
+        """撤掉一具身体。失败不报错。
+
+        ⚠️ **玩家类实体不能调 `remove()`**。
+        Endstone 把 `Player.remove()` 禁掉了：对玩家（或 SimulatedPlayer）
+        调用，BDS 会直接拒绝，并打出
+
+            [Server/ERROR]: Cannot remove player X, use Player::kick instead.
+
+        拒绝是**彻底**的：身体不会被移除，Python 侧抛出的异常又被
+        `except Exception: pass` 吞掉，于是这条兜底实际等于
+        "刷一条 ERROR + 什么也没干"。假人的身体是 SimulatedPlayer
+        （Endstone 把它暴露成 Player 子类），所以每次假人轮换下线、
+        每次占位 NPC 被真身替换，都会在控制台留一条这种 ERROR。
+
+        真正能把假人身体撤掉的是**行为包**：`bot:remove` → JS 侧
+        `sim.disconnect()`（脚本 API 对模拟玩家有效）。那条路一直在
+        正常工作——日志里每条 ERROR 后面紧跟着的
+        "Hunter2 left the game" 就是它干的。
+
+        所以这里：玩家类实体交给行为包那条路，不再调 `remove()`；
+        其余实体（占位 NPC 之类）照旧 `remove()`。
+        """
+        if actor is None:
+            return
+        if _is_player_entity(actor):
+            return
+        try:
+            actor.remove()
+        except Exception:
+            pass
 
     #: 哪些名字当前挂的是"占位实体"。真身接上后会被清掉。
     #: 用字典而不是往实体上贴属性：实体是 C++ 对象，未必允许挂
@@ -5023,11 +5103,7 @@ class ArcFakePlayerPlugin(Plugin):
         self._compilers.pop(name, None)
         if self._use_real_body:
             self._bridge.remove(name)
-        if actor is not None:
-            try:
-                actor.remove()
-            except Exception:
-                pass
+        self._despawn_body(actor)
         if was_stealth:
             self._announce_leave(name)
         self._record("crowd", f"已下线（{why}）", who=name)
@@ -5976,11 +6052,16 @@ class ArcFakePlayerPlugin(Plugin):
             return False
 
         old = self._actors.get(name)
-        if old is not None and old is not player:
-            try:
-                old.remove()
-            except Exception:
-                pass
+        if old is not None and not _same_entity(old, player):
+            # ⚠️ 这里原来写的是 `old is not player`，那是**错的**：
+            # `_find_sim_player` 每次都返回新的 Python 包装对象，
+            # 同一个实体两次取出来 `is` 就不相等——照原样写，每次
+            # 都会把**正在线上的假人身体**当成"换下来的旧身体"去撤。
+            # 而且 Endstone 根本不允许撤玩家类实体，于是每次都只是
+            # 刷一条 "Cannot remove player X" 的 ERROR。
+            # 现在按实体 runtime id 判：同一个实体 → 不撤；
+            # 真的是占位 NPC → 照旧撤掉。
+            self._despawn_body(old)
 
         # 假人上线就按配置锁游戏模式。
         #
@@ -6536,11 +6617,7 @@ class ArcFakePlayerPlugin(Plugin):
 
         if self._use_real_body:
             self._bridge.remove(name)
-        if actor is not None:
-            try:
-                actor.remove()
-            except Exception:
-                pass
+        self._despawn_body(actor)
         self._record("remove", f"被{sender.name}移除", who=name)
         sender.send_message(f"{C.GREEN}已移除 {name}{C.RESET}")
 
