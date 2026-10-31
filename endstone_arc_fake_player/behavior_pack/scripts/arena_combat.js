@@ -31,7 +31,50 @@
  * 混淆过的第三方包，改它风险大。改数值时**两边都要改**。
  */
 
-import { world, system, EntityDamageCause, Vector3 } from "@minecraft/server";
+// ⚠️ 这里**必须**用命名空间导入，不能把 Vector3 写进下面那行 import 的花括号里。
+//
+// 这台服务器（MC 26.52）的 @minecraft/server **没有导出 Vector3 这个类**：
+//   [Scripting] [arc_fake_player 假人桥接] SyntaxError: Could not find export
+//   'Vector3' in module '@minecraft/server'
+// 静态 import 在**链接期**就失败 → 整个行为包加载失败 → 心跳断 → Python 判
+// "行为包未连接" → 假人一个都上不来（枪械包 arc_gun_diag 也是这么集体阵亡的）。
+//
+// 命名空间导入不会因为缺导出而炸（缺的只是 undefined），所以：**可选**的导出
+// 一律走命名空间 + 运行时判断，别写进 import 列表。
+import * as server from "@minecraft/server";
+
+const world = server.world;
+const system = server.system;
+const EntityDamageCause = server.EntityDamageCause;
+
+/**
+ * Vector3 这个类在**有些**服务器上有、有些没有（原生类型一直都在，只是
+ * 不一定导出到 JS 侧）。这里是 undefined 就说明这台服没有。
+ */
+const Vec3 = server.Vector3;
+
+/**
+ * 造一个能喂给原生 API 的坐标。
+ *
+ * 有 Vector3 类就造真的（原生 API 只认原生实例，传普通对象会抛
+ * "Native type conversion failed ... expected type: Vector3"）；
+ * 没有就退回普通对象——能用就用，不能用会抛，调用点都有 try/catch 兜着。
+ */
+function toVec(x, y, z) {
+    if (Vec3) return new Vec3(x, y, z);
+    return { x, y, z };
+}
+
+/**
+ * 只在**能造出原生实例**时返回坐标，否则返回 null。
+ *
+ * 用途：像 getBlockFromRay 这种只认真生实例的 API，在没有 Vector3 类的
+ * 服务器上根本没法调，就该老实跳过，而不是拿普通对象去撞。
+ */
+function nativeVec(x, y, z) {
+    if (!Vec3) return null;
+    return new Vec3(x, y, z);
+}
 
 const TAG = "[ArcFakePlayer]";
 
@@ -109,6 +152,9 @@ const recentShots = new Set();
 /** 射击日志限流：key = "射手|目标"，同一对每 N 毫秒最多记一条。 */
 const shotLogAt = new Map();
 const SHOT_LOG_INTERVAL_MS = 2000;
+
+/** 枪口火焰失败只警告一次，别把日志刷爆。 */
+let muzzleFlashWarned = false;
 
 function logShotThrottled(key, message) {
     const now = Date.now();
@@ -564,16 +610,22 @@ export function fireSimShot(sim, target, targetName) {
     //
     // ⚠️ getBlockFromRay 的前两个参数必须是 **Vector3 实例**，传普通对象会抛
     // "Native type conversion failed ... expected type: Vector3"。
-    // 原来这里传的是普通对象 → 每次都抛 → 被 catch 吞掉 → "视线被挡"这条判定
-    // 从来没生效过（假人其实能隔墙打人）。这里补上。
-    try {
-        const block = sim.dimension.getBlockFromRay(
-            new Vector3(eye.x, eye.y, eye.z),
-            new Vector3(dir.x, dir.y, dir.z),
-            { maxDistance: Math.min(range, MAX_RANGE) },
-        );
-        if (block) return { ok: false, err: "视线被挡" };
-    } catch (_) { /* 射线查询失败就当没挡 */ }
+    //
+    // 但这台服的 @minecraft/server **没有导出 Vector3 类**（原生类型在，
+    // 类没导出；静态 import 会让整个包加载失败 → 心跳断 → 假人全灭）。
+    // 所以造不出原生实例时**老实跳过这条判定**，退回 3.9.29 的行为
+    // （不挡枪）。宁可隔墙打，也不该让整个行为包起不来。
+    const rayOrigin = nativeVec(eye.x, eye.y, eye.z);
+    if (rayOrigin) {
+        try {
+            const block = sim.dimension.getBlockFromRay(
+                rayOrigin,
+                new Vec3(dir.x, dir.y, dir.z),
+                { maxDistance: Math.min(range, MAX_RANGE) },
+            );
+            if (block) return { ok: false, err: "视线被挡" };
+        } catch (_) { /* 射线查询失败就当没挡 */ }
+    }
 
     const zone = hitZone(target, eye, dir);
     const base = SIM_GUN_DAMAGE[gunId] !== undefined ? SIM_GUN_DAMAGE[gunId] : DEFAULT_DAMAGE;
@@ -624,12 +676,12 @@ export function fireSimShot(sim, target, targetName) {
 function spawnMuzzleFlash(sim, eye, dir) {
     try {
         const dim = sim.dimension;
-        const muzzle = new Vector3(
+        const muzzle = toVec(
             eye.x + dir.x * 0.6,
             eye.y + dir.y * 0.6,
             eye.z + dir.z * 0.6,
         );
-        const smoke = new Vector3(
+        const smoke = toVec(
             eye.x + dir.x * 1.0,
             eye.y + dir.y * 1.0,
             eye.z + dir.z * 1.0,
@@ -639,7 +691,12 @@ function spawnMuzzleFlash(sim, eye, dir) {
         dim.spawnParticle("nova:sparkles", muzzle);
         dim.spawnParticle("nova:bullet_smoke", smoke);
     } catch (e) {
-        console.warn(`${TAG} 枪口火焰生成失败: ${e}`);
+        // 这台服没有 Vector3 类时坐标只能是普通对象，spawnParticle 可能不收。
+        // 每枪都报一遍会把日志刷爆，所以只报第一次。
+        if (!muzzleFlashWarned) {
+            muzzleFlashWarned = true;
+            console.warn(`${TAG} 枪口火焰生成失败（只报一次）: ${e}`);
+        }
     }
 }
 
