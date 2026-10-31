@@ -15,6 +15,7 @@ def time_now() -> float:
     return _time_mod.monotonic()
 
 from pathlib import Path
+import types
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -464,6 +465,8 @@ class HumanlikeTests(unittest.TestCase):
         gp = Mock()
         gp.guild_system = gs
         gp._refresh_player_name_tag_by_xuid = Mock()
+        # 本用例专测旧路径回退：抹掉 Mock 自动生成的免费 API 属性
+        del gp.api_bot_create_guild
         plugin.server = SimpleNamespace(
             plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
         plugin._bot_join_guild("BossZhong", "9257971652503711", "铜剑帮", owner=True)
@@ -665,6 +668,66 @@ class HumanlikeTests(unittest.TestCase):
         r = compiler.compile(actor, ToolCall("mine_vein", {"block": "iron_ore"}), {})
         self.assertIsNone(r.plan)
         self.assertIn("木镐", r.immediate)
+
+    # ---- 角色卡字段兼容（v3.9.39：修身份全失效的根因） ------------------
+
+    def test_card_field_dict_and_object(self):
+        from endstone_arc_fake_player.plugin import ArcFakePlayerPlugin as P
+        self.assertEqual(P._card_field({"name": "A"}, "name"), "A")
+        self.assertEqual(P._card_field({"name": "A"}, "guild", None), None)
+        obj = types.SimpleNamespace(name="B", guild="钟氏财团", guild_owner=True)
+        self.assertEqual(P._card_field(obj, "name"), "B")
+        self.assertEqual(P._card_field(obj, "guild"), "钟氏财团")
+        self.assertTrue(P._card_field(obj, "guild_owner"))
+        self.assertIsNone(P._card_field(obj, "gear"))
+
+    def test_identity_applies_with_object_card(self):
+        """crowd_cards 返回 CharacterCard 对象——身份应用必须能读（3.9.38
+        及以前把它当 dict，AttributeError 被静默吞，公会/头衔全没生效）。"""
+        plugin, core, ts = self._title_plugin(has_def=True)
+        card = types.SimpleNamespace(name="BossZhong", goal="x",
+                                     title="十人斩", guild="", guild_owner=False)
+        plugin.crowd_cards = lambda: [card]
+        plugin._apply_card_identity("BossZhong", Mock())
+        core.api_unlock_title_by_xuid.assert_called_once()
+
+    def test_guild_create_prefers_free_bot_api(self):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        gs = Mock()
+        gs.get_membership = Mock(return_value=None)
+        gs.get_guild_by_name = Mock(return_value=None)
+        gs.create_guild = Mock(return_value=(True, None))
+        gp = Mock()
+        gp.guild_system = gs
+        gp.api_bot_create_guild = Mock(return_value=(True, None))
+        gp._refresh_player_name_tag_by_xuid = Mock()
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("BossZhong", "9257971652503711",
+                               "钟氏财团", owner=True)
+        gp.api_bot_create_guild.assert_called_once()      # 走免费 API
+        gs.create_guild.assert_not_called()               # 不走扣费路径
+
+    def test_guild_create_falls_back_without_bot_api(self):
+        """旧版公会插件没有免费 API → 退回普通建会（可能扣费）。"""
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        gs = Mock()
+        gs.get_membership = Mock(return_value=None)
+        gs.get_guild_by_name = Mock(return_value=None)
+        gs.create_guild = Mock(return_value=(True, None))
+        gp = Mock()
+        gp.guild_system = gs
+        gp._refresh_player_name_tag_by_xuid = Mock()
+        del gp.api_bot_create_guild
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=gp)))
+        plugin._bot_join_guild("BossZhong", "9257971652503711",
+                               "钟氏财团", owner=True)
+        gs.create_guild.assert_called_once()
 
     # ---- 战力装备档位（v3.9.33） ---------------------------------------
 

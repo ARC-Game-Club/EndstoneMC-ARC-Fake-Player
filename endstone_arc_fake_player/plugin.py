@@ -4040,6 +4040,19 @@ class ArcFakePlayerPlugin(Plugin):
         else:
             self._economy.ensure_wallet(name, None)
 
+    @staticmethod
+    def _card_field(card: Any, key: str, default: Any = None) -> Any:
+        """角色卡字段读取，**同时兼容对象和字典**。
+
+        crowd_cards() 返回 CharacterCard 对象（属性访问），但历史代码
+        和测试里有 dict 形态——这里统一入口。之前 _apply_card_identity
+        把对象当 dict 用 `.get()`，AttributeError 被外层 try 静默吞掉，
+        公会/头衔/装备全部无声失效（活动日志零记录的根因）。
+        """
+        if isinstance(card, dict):
+            return card.get(key, default)
+        return getattr(card, key, default)
+
     def _apply_card_identity(self, name: str, player: Any) -> None:
         """按角色卡给假人佩戴头衔、加入公会（都在线幂等，重复调用无害）。
 
@@ -4054,11 +4067,12 @@ class ArcFakePlayerPlugin(Plugin):
         card = None
         try:
             for c in self.crowd_cards():
-                if str((c or {}).get("name", "")) == name:
+                if str(self._card_field(c, "name", "") or "") == name:
                     card = c
                     break
-        except Exception:
-            card = None
+        except Exception as exc:
+            self.logger.warning(f"[{name}] 角色卡查找失败，身份跳过: {exc}")
+            return
         if not card:
             return
         xuid = ""
@@ -4076,9 +4090,9 @@ class ArcFakePlayerPlugin(Plugin):
         # 不创建新头衔（用户定的规矩）：配置里写了系统不存在的头衔就跳过
         # 并记日志，绝不往 title_definitions 里塞自定义行——否则假人会
         # 带着"全世界只有它有"的头衔，一眼穿帮还污染头衔图鉴。
-        title = str(card.get("title") or "").strip()
+        title = str(self._card_field(card, "title") or "").strip()
         if title and core is not None:
-            rarity = str(card.get("title_rarity") or "").strip() or "普通"
+            rarity = str(self._card_field(card, "title_rarity") or "").strip() or "普通"
             try:
                 ts = getattr(core, "title_system", None)
                 exists = callable(getattr(ts, "has_title_definition", None)) and                     ts.has_title_definition(title, rarity)
@@ -4098,10 +4112,11 @@ class ArcFakePlayerPlugin(Plugin):
                 self.logger.debug(f"[{name}] 头衔设置失败: {exc}")
 
         # ---- 公会：建会或入会 ----
-        guild = str(card.get("guild") or "").strip()
+        guild = str(self._card_field(card, "guild") or "").strip()
         if guild:
             self._bot_join_guild(
-                name, xuid, guild, owner=bool(card.get("guild_owner")))
+                name, xuid, guild,
+                owner=bool(self._card_field(card, "guild_owner")))
 
         # 头衔/公会都会进核心统一的名牌格式（前缀+名字），刷一次。
         if core is not None and callable(getattr(core, "_update_player_name_tag", None)):
@@ -4122,14 +4137,15 @@ class ArcFakePlayerPlugin(Plugin):
         try:
             card = None
             for c in self.crowd_cards():
-                if str((c or {}).get("name", "")) == name:
+                if str(self._card_field(c, "name", "") or "") == name:
                     card = c
                     break
-        except Exception:
-            card = None
+        except Exception as exc:
+            self.logger.warning(f"[{name}] 角色卡查找失败，装备跳过: {exc}")
+            return
         if not card:
             return
-        tier = str(card.get("gear") or "").strip()
+        tier = str(self._card_field(card, "gear") or "").strip()
         if not tier:
             return          # 没配档位 = 萌新裸装，什么都不给
         items = gear_items_for(tier)
@@ -4184,7 +4200,14 @@ class ArcFakePlayerPlugin(Plugin):
                         "spawn", f"公会 [{guild_name}] 尚未由会长创建，"
                                  f"下次上线再入会", who=name)
                     return
-                ok, err = gs.create_guild(guild_name, xuid, motto="假人公会")
+                # 假人建会走免费 API（用户规矩：假人用公会/头衔不要钱）；
+                # 公会插件版本旧没有这个 API 时退回普通建会（会按服务器
+                # 配置扣建会费——钱包不够会失败并记录）。
+                bot_create = getattr(gp, "api_bot_create_guild", None)
+                if callable(bot_create):
+                    ok, err = bot_create(xuid, guild_name, motto="假人公会")
+                else:
+                    ok, err = gs.create_guild(guild_name, xuid, motto="假人公会")
                 if ok:
                     self._record("spawn", f"创建公会 [{guild_name}] 并任会长", who=name)
                 else:
