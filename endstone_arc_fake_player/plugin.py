@@ -993,8 +993,11 @@ class ArcFakePlayerPlugin(Plugin):
             #   "guild_owner": true      会长卡：公会不存在→建会任会长（钱包扣建会费）；
             #                           成员卡（默认）：公会不存在→等会长建会，下次上线再入；
             #                           公会已存在→一律由会长经在线邀请直拉入会
-            #   "title": "头衔名"        聊天/头顶名牌的前缀头衔
-            #   "title_rarity": "稀有"   普通/稀有/史诗/传奇/神话（默认普通）
+            #   "title": "头衔名"        聊天/头顶名牌的前缀头衔。**只认系统里
+            #                           已有的定义**，配了不存在的头衔会跳过并
+            #                           记活动日志（不会创建新头衔）
+            #   "title_rarity": "稀有"   普通/稀有/史诗/传奇/神话（默认普通），
+            #                           要和该头衔在系统里的稀有度一致
             "characters": [
                 {"name": "Aqing",
                  "persona": "你性格安静温和，说话简短有礼，喜欢钓鱼和收集花草，"
@@ -3693,22 +3696,28 @@ class ArcFakePlayerPlugin(Plugin):
         except Exception:
             core = None
 
-        # ---- 头衔：注册定义 → 解锁 → 佩戴 ----
+        # ---- 头衔：只用系统里**已有**的定义 → 解锁 → 佩戴 ----
+        # 不创建新头衔（用户定的规矩）：配置里写了系统不存在的头衔就跳过
+        # 并记日志，绝不往 title_definitions 里塞自定义行——否则假人会
+        # 带着"全世界只有它有"的头衔，一眼穿帮还污染头衔图鉴。
         title = str(card.get("title") or "").strip()
         if title and core is not None:
             rarity = str(card.get("title_rarity") or "").strip() or "普通"
             try:
-                if callable(getattr(core, "api_ensure_title_definition", None)):
-                    core.api_ensure_title_definition(
-                        title, rarity, description=f"{name} 的身份头衔")
-                if callable(getattr(core, "api_unlock_title_by_xuid", None)):
-                    core.api_unlock_title_by_xuid(xuid, title, rarity)
                 ts = getattr(core, "title_system", None)
-                if (ts is not None
-                        and callable(getattr(ts, "set_equipped_title_by_xuid", None))
-                        and ts.get_equipped_title_by_xuid(xuid) != title):
-                    ts.set_equipped_title_by_xuid(xuid, title, rarity)
-                self._record("spawn", f"佩戴头衔 [{title}]", who=name)
+                exists = callable(getattr(ts, "has_title_definition", None)) and                     ts.has_title_definition(title, rarity)
+                if not exists:
+                    self._record(
+                        "spawn", f"头衔 [{title}]({rarity}) 系统里不存在，"
+                                 f"跳过（只佩戴已有头衔，不创建新的）", who=name)
+                else:
+                    if callable(getattr(core, "api_unlock_title_by_xuid", None)):
+                        core.api_unlock_title_by_xuid(xuid, title, rarity)
+                    if (ts is not None
+                            and callable(getattr(ts, "set_equipped_title_by_xuid", None))
+                            and ts.get_equipped_title_by_xuid(xuid) != title):
+                        ts.set_equipped_title_by_xuid(xuid, title, rarity)
+                    self._record("spawn", f"佩戴头衔 [{title}]", who=name)
             except Exception as exc:
                 self.logger.debug(f"[{name}] 头衔设置失败: {exc}")
 

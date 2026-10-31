@@ -503,6 +503,42 @@ class HumanlikeTests(unittest.TestCase):
                                "弧光卫队", owner=False)
         gs.create_guild.assert_not_called()
 
+    # ---- 头衔只认系统已有定义（v3.9.22） ------------------------------
+
+    def _title_plugin(self, has_def: bool):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin._identities = SimpleNamespace(xuid_of=lambda n: "9257971652503711")
+        ts = Mock()
+        ts.has_title_definition = Mock(return_value=has_def)
+        ts.get_equipped_title_by_xuid = Mock(return_value=None)
+        core = Mock()
+        core.title_system = ts
+        core.api_unlock_title_by_xuid = Mock()
+        core._update_player_name_tag = Mock()
+        plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=Mock(return_value=core)),
+            online_players=[])
+        return plugin, core, ts
+
+    def test_existing_title_unlocked_and_equipped(self):
+        plugin, core, ts = self._title_plugin(has_def=True)
+        plugin.crowd_cards = lambda: [{"name": "BossZhong", "goal": "x", "title": "十人斩"}]
+        plugin._apply_card_identity("BossZhong", Mock())
+        core.api_unlock_title_by_xuid.assert_called_once()
+        ts.set_equipped_title_by_xuid.assert_called_once()
+
+    def test_unknown_title_skipped_without_creating(self):
+        """配置了系统不存在的头衔：跳过，不解锁不佩戴更不注册定义。"""
+        plugin, core, ts = self._title_plugin(has_def=False)
+        plugin.crowd_cards = lambda: [{"name": "BossZhong", "goal": "x", "title": "十人斩"}]
+        plugin._apply_card_identity("BossZhong", Mock())
+        core.api_unlock_title_by_xuid.assert_not_called()
+        ts.set_equipped_title_by_xuid.assert_not_called()
+        # 确保没有走"注册定义"的老路
+        core.api_ensure_title_definition.assert_not_called()
+
     # ---- 计划完成即再规划（v3.9.20） -----------------------------------
 
     def test_request_rethink_shortens_wait(self):
