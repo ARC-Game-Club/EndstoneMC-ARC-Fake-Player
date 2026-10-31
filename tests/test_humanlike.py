@@ -544,6 +544,62 @@ class HumanlikeTests(unittest.TestCase):
         core.api_unlock_title_by_xuid.assert_called_once()
         ts.set_equipped_title_by_xuid.assert_called_once()
 
+    # ---- 战力装备档位（v3.9.33） ---------------------------------------
+
+    def test_gear_tier_mapping(self):
+        from endstone_arc_fake_player.plugin import gear_items_for, GEAR_TIERS
+        self.assertEqual(gear_items_for("无"), [])
+        self.assertEqual(gear_items_for("萌新"), [])
+        self.assertEqual(gear_items_for("leather"), GEAR_TIERS["leather"])
+        copper = gear_items_for("铜")
+        self.assertTrue(any("copper_helmet" in i for i in copper))
+        iron = gear_items_for("铁")
+        self.assertTrue(any("shield" in i for i in iron))
+        diamond = gear_items_for("钻石")
+        self.assertTrue(any("diamond_sword" in i for i in diamond))
+        nx = gear_items_for("下界合金")
+        self.assertTrue(any("netherite_helmet" in i for i in nx))
+        self.assertIsNone(gear_items_for("圣剑"))          # 未知档位
+
+    def _gear_plugin(self, inv_names, card_gear="钻石"):
+        plugin = ArcFakePlayerPlugin()
+        plugin.logger = Mock()
+        plugin._activity = Mock()
+        plugin.crowd_cards = lambda: [{"name": "Bot", "goal": "x",
+                                       "gear": card_gear}]
+        actor = FakeActor(FakeDimension(), 0, 64, 0)
+        plugin._live_actor = Mock(return_value=actor)
+        plugin._world = Mock()
+        plugin._world.scan_inventory = Mock(
+            return_value=[(n, 1) for n in inv_names])
+        given: list = []
+        plugin._dispatch = Mock(side_effect=lambda cmd:
+                                given.append(cmd) or True)
+        plugin._record = Mock()
+        return plugin, given
+
+    def test_apply_gear_gives_only_missing(self):
+        plugin, given = self._gear_plugin(
+            ["diamond_helmet", "diamond_chestplate"])   # 已有两件
+        plugin._apply_gear("Bot")
+        joined = " | ".join(given)
+        self.assertNotIn("diamond_helmet", joined)       # 有的不发
+        self.assertNotIn("diamond_chestplate", joined)
+        self.assertIn("diamond_leggings", joined)        # 缺的补上
+        self.assertIn("diamond_sword", joined)
+        self.assertEqual(len(given), 3)                  # 5 件装备补 3 件
+
+    def test_apply_gear_none_tier_gives_nothing(self):
+        plugin, given = self._gear_plugin([], card_gear="无")
+        plugin._apply_gear("Bot")
+        self.assertEqual(given, [])
+
+    def test_apply_gear_no_card_no_give(self):
+        plugin, given = self._gear_plugin([])
+        plugin.crowd_cards = lambda: []
+        plugin._apply_gear("Bot")
+        self.assertEqual(given, [])
+
     # ---- 主动追杀（v3.9.31） -------------------------------------------
 
     def _hunt_plugin(self, dist_to_target=500.0):

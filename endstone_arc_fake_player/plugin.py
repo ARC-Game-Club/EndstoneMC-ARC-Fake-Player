@@ -154,6 +154,41 @@ def _clean_name(raw: str) -> str:
     return cleaned or "bot"
 
 
+#: 战力装备档位：角色卡 "gear" 字段 → 每次复活/上线补齐的装备清单。
+#: 大佬钻石、超级高手下界合金、萌新没有、正常水平铜/铁——按人设战力
+#: 配，复活（死亡掉落）后自动补齐缺的部分，护甲 15 秒内自动上身。
+#: 剑进背包；档位也可以写中文（"下界合金"/"钻石"/"铁"/"铜"/"皮"/"无"）。
+GEAR_TIERS: dict[str, list[str]] = {
+    "none":     [],
+    "leather":  ["leather_helmet", "leather_chestplate", "leather_leggings",
+                 "leather_boots", "stone_sword"],
+    "copper":   ["copper_helmet", "copper_chestplate", "copper_leggings",
+                 "copper_boots", "copper_sword"],
+    "iron":     ["iron_helmet", "iron_chestplate", "iron_leggings",
+                 "iron_boots", "iron_sword", "shield"],
+    "diamond":  ["diamond_helmet", "diamond_chestplate", "diamond_leggings",
+                 "diamond_boots", "diamond_sword"],
+    "netherite": ["netherite_helmet", "netherite_chestplate",
+                  "netherite_leggings", "netherite_boots",
+                  "netherite_sword", "shield"],
+}
+GEAR_ALIASES = {
+    "无": "none", "裸装": "none", "萌新": "none",
+    "皮": "leather", "皮甲": "leather", "皮革": "leather",
+    "铜": "copper", "铜甲": "copper", "铜装": "copper",
+    "铁": "iron", "铁甲": "iron", "铁装": "iron",
+    "钻": "diamond", "钻石": "diamond", "钻甲": "diamond", "钻石甲": "diamond",
+    "合金": "netherite", "下界合金": "netherite", "下界合金甲": "netherite",
+}
+
+
+def gear_items_for(tier: str) -> list[str] | None:
+    """档位名（中英皆可）→ 装备清单。未知档位返回 None。"""
+    key = str(tier or "").strip().lower()
+    key = GEAR_ALIASES.get(key, GEAR_ALIASES.get(str(tier or "").strip(), key))
+    return GEAR_TIERS.get(key)
+
+
 #: 聊天分句：句末标点留在分片尾部（"这波我的！"），停顿标点拆开时
 #: 丢掉（"刚过来，谁在边上" → "刚过来" + "谁在边上"，行尾挂逗号很怪）。
 #: 真人聊天是一句一句蹦的，模型憋出的一整段按这个拆开、错开时间发。
@@ -1093,6 +1128,9 @@ class ArcFakePlayerPlugin(Plugin):
             #   "title": "头衔名"        聊天/头顶名牌的前缀头衔。**只认系统里
             #                           已有的定义**，配了不存在的头衔会跳过并
             #                           记活动日志（不会创建新头衔）
+            #   "gear": "钻石"           战力装备档位：无(萌新裸装)/皮/铜/铁/
+            #                           钻石/下界合金——上线和每次复活按档位
+            #                           补齐缺的装备（护甲自动上身，剑进背包）
             #   "title_rarity": "稀有"   普通/稀有/史诗/传奇/神话（默认普通），
             #                           要和该头衔在系统里的稀有度一致
             "characters": [
@@ -3161,6 +3199,13 @@ class ArcFakePlayerPlugin(Plugin):
                         "text": f"你{who}了，几秒后会在重生点醒来"
                                 f"（行为包会自动替你点重生）。这笔账记下了。"}])
                     agent.wake()
+                # 复活后补装备：行为包 2~5 秒重生，12 秒后给（装备掉落了
+                # 就按档位补齐；没掉=背包里还有，_apply_gear 只补缺的）
+                try:
+                    self.server.scheduler.run_task(
+                        self, lambda n=name: self._apply_gear(n), delay=240)
+                except Exception:
+                    pass
                 return
             if xuid:
                 # 真玩家死了。若正被我们的假人寻仇 → 得手，恩怨两清。
@@ -4045,6 +4090,52 @@ class ArcFakePlayerPlugin(Plugin):
                 core._update_player_name_tag(player)
             except Exception:
                 pass
+        # 战力装备（按 gear 档位补齐，护甲 15 秒内自动上身）
+        self._apply_gear(name)
+
+    def _apply_gear(self, name: str) -> None:
+        """按角色卡 gear 档位补齐装备（上线时 + 每次复活后）。
+
+        只补**缺的**：背包里已有的部件跳过（keepInventory 开着也不会
+        越发越多）。护甲进背包后由 15 秒的护甲自穿自动上身，剑进快捷栏。
+        控制台 give 对 SimulatedPlayer 有效（与部署手册的 /give 清单同路）。
+        """
+        try:
+            card = None
+            for c in self.crowd_cards():
+                if str((c or {}).get("name", "")) == name:
+                    card = c
+                    break
+        except Exception:
+            card = None
+        if not card:
+            return
+        tier = str(card.get("gear") or "").strip()
+        if not tier:
+            return          # 没配档位 = 萌新裸装，什么都不给
+        items = gear_items_for(tier)
+        if items is None:
+            self._record("spawn", f"未知装备档位 {tier!r}（可用：无/皮/铜/铁/钻石/下界合金）", who=name)
+            return
+        if not items:
+            return
+        actor = self._live_actor(name)
+        if actor is None:
+            return
+        have: set[str] = set()
+        try:
+            for iname, _cnt in self._world.scan_inventory(actor):
+                have.add(str(iname))
+        except Exception:
+            have = set()
+        given: list[str] = []
+        for item in items:
+            if any(item in h for h in have):
+                continue
+            if self._dispatch(f"give {name} {item} 1"):
+                given.append(item)
+        if given:
+            self._record("spawn", f"按档位[{tier}]补给装备：{','.join(given)}", who=name)
 
     def _bot_join_guild(self, name: str, xuid: str, guild_name: str,
                         *, owner: bool = False) -> None:
