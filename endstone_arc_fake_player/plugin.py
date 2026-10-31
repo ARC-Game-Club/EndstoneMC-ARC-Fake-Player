@@ -4050,7 +4050,11 @@ class ArcFakePlayerPlugin(Plugin):
     #: ⚠ 只有这些状态下才允许开火。队伍在**进房那一刻**就分好了
     #: （枪战插件 pick_join_team 平衡两队），所以等待室里已经存在"敌人"——
     #: 这时开火就是"在出生地大厅里杀人"，真人复活落地就被打死。
-    _arena_live_states: tuple[str, ...] = ("playing", "buying")
+    #:
+    #: ⚠ 而且**不含 buying**：开局准备阶段是"无敌且无法移动"（见枪战插件
+    #: TITLE_BUY_SUB），那段时间谁都打不死——包括真人。假人在准备阶段
+    #: 开火却打死了人，就是"无敌状态没用"的直接原因。
+    _arena_live_states: tuple[str, ...] = ("playing",)
     #: 自动进枪战循环的下次执行时刻（秒）
     _shooter_auto_next: float = 0.0
 

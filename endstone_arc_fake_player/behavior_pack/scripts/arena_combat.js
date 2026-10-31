@@ -499,11 +499,19 @@ function hitZone(target, origin, direction) {
         t = Math.max(0, (centerY - origin.y) * dir.y);
     }
     const hitY = origin.y + dir.y * t;
-    const relativeY = hitY - feet.y;
-    const headStart = Math.max(0.35, entityHeight - 0.45);
-    const legEnd = Math.max(0.25, entityHeight * 0.38);
-    if (relativeY >= headStart) return "head";
-    if (relativeY <= legEnd) return "legs";
+    // ⚠ 这里必须按**身高比例**分档，不能用绝对高度。
+    //
+    // 原来的写法：头 = 身高 - 0.45。而实测身高（getHeadLocation）是 1.62
+    // → 爆头线 1.17；可瞄点固定在胸口 +1.2 → 1.2 > 1.17
+    // → **每一枪都判爆头**，伤害 ×1.5。
+    // 2026-10-31 实测：m4 每枪都是 "head 伤害 4.5"（基础 3.0 × 1.5），
+    // 真人 20 血挨 5 枪就倒，而假人 0.2 秒一枪 → "复活即死"。
+    //
+    // 改成比例：头 = 顶部 18%，腿 = 底部 32%，中间是躯干。
+    // 瞄胸口（1.2/1.62 = 0.74）→ body ✓；瞄头（≥0.82）→ head ✓。
+    const rel = (hitY - feet.y) / entityHeight;
+    if (rel >= 0.82) return "head";
+    if (rel <= 0.32) return "legs";
     return "body";
 }
 
@@ -602,10 +610,127 @@ export function isAlive(entity) {
     return Number(hp) > 0;
 }
 
+// ---------------------------------------------------------------------------
+// 交战判定：射程 / 视线 / 无敌
+// ---------------------------------------------------------------------------
+
+/** 假人开火的最大交战距离（格）。超出这个距离**只追，不打**。
+ *
+ *  为什么必须有：之前完全没有距离上限，假人隔着半个图都能打到真人——
+ *  2026-10-31 实测真人"人都没看到就死了"。
+ */
+const SIM_MAX_ENGAGE = 26;
+
+/** 真人开枪打假人的最大距离（格）。 */
+const HUMAN_MAX_ENGAGE = 48;
+
+/** 枪战插件的无敌 nameTag 前缀。
+ *
+ *  语言文件 NAME_TAG_INVINCIBLE = "§6[无敌状态]"，无敌时名字牌会带上它
+ *  （见枪战插件 _team_name_tag）。
+ *
+ *  为什么桥接包要自己判一次：桥接包的 applyDamage 走的是 **JS API**，
+ *  **绕过**了枪战插件的伤害闸门（Python 侧 ActorDamageEvent）——
+ *  所以出生保护/准备阶段的无敌对它无效，真人会在"无敌状态"下被打死。
+ */
+const INVINCIBLE_NAME_TAG = "[无敌状态]";
+
+/** 这个目标现在是不是无敌（出生保护 / 开局准备）。 */
+function isInvincible(entity) {
+    try {
+        const tag = entity?.nameTag;
+        if (typeof tag !== "string" || tag.length === 0) return false;
+        return tag.indexOf(INVINCIBLE_NAME_TAG) >= 0;
+    } catch (_) {
+        return false;
+    }
+}
+
+/** 会挡住视线的方块（只列常见实心方块）。
+ *
+ *  ⚠ 用**白名单**而不是"不是空气就挡"：后者会被地面、花草、台阶、
+ *  自定义 RP 方块误伤 —— AI 于是永远不开枪（比隔墙打更糟）。
+ */
+const SOLID_BLOCKS = new Set([
+    "minecraft:stone", "minecraft:granite", "minecraft:diorite",
+    "minecraft:andesite", "minecraft:cobblestone", "minecraft:mossy_cobblestone",
+    "minecraft:stone_bricks", "minecraft:mossy_stone_bricks",
+    "minecraft:bricks", "minecraft:obsidian", "minecraft:netherrack",
+    "minecraft:end_stone", "minecraft:end_stone_bricks",
+    "minecraft:dirt", "minecraft:coarse_dirt", "minecraft:podzol",
+    "minecraft:rooted_dirt", "minecraft:grass_block", "minecraft:mycelium",
+    "minecraft:sand", "minecraft:red_sand", "minecraft:gravel",
+    "minecraft:clay", "minecraft:soul_sand", "minecraft:soul_soil",
+    "minecraft:magma", "minecraft:bedrock",
+    "minecraft:oak_planks", "minecraft:spruce_planks", "minecraft:birch_planks",
+    "minecraft:jungle_planks", "minecraft:acacia_planks", "minecraft:dark_oak_planks",
+    "minecraft:oak_log", "minecraft:spruce_log", "minecraft:birch_log",
+    "minecraft:jungle_log", "minecraft:acacia_log", "minecraft:dark_oak_log",
+    "minecraft:oak_wood", "minecraft:spruce_wood", "minecraft:birch_wood",
+    "minecraft:jungle_wood", "minecraft:acacia_wood", "minecraft:dark_oak_wood",
+    "minecraft:oak_fence", "minecraft:spruce_fence", "minecraft:birch_fence",
+    "minecraft:jungle_fence", "minecraft:acacia_fence", "minecraft:dark_oak_fence",
+    "minecraft:glass", "minecraft:glass_pane", "minecraft:tinted_glass",
+    "minecraft:iron_block", "minecraft:gold_block", "minecraft:diamond_block",
+    "minecraft:emerald_block", "minecraft:netherite_block", "minecraft:coal_block",
+    "minecraft:iron_bars", "minecraft:concrete", "minecraft:terracotta",
+    "minecraft:quartz_block", "minecraft:sandstone", "minecraft:red_sandstone",
+    "minecraft:prismarine", "minecraft:dark_prismarine", "minecraft:purpur_block",
+    "minecraft:nether_brick", "minecraft:red_nether_brick",
+    "minecraft:cobblestone_wall", "minecraft:mossy_cobblestone_wall",
+    "minecraft:stone_brick_wall", "minecraft:iron_trapdoor",
+]);
+
+/** 视线判定是否可用。
+ *
+ *  这台服没有 Vector3 类 → getBlockFromRay 用不了（需要原生实例），
+ *  所以改成沿射线步进 + getBlock。但 getBlock 收不收普通 {x,y,z}
+ *  没验证过，所以整段包 try/catch：**抛异常就永久关闭**这个判定
+ *  （退回"不挡枪"的老行为），绝不能因为它把整个行为包带崩
+ *  （2026-10-30 实踩过整包加载失败导致假人全灭）。
+ */
+let losCheckUsable = true;
+
+/** 射线到 maxDist 之间有没有实心方块挡着。 */
+function hasLineOfSight(dim, origin, dir, maxDist) {
+    if (!losCheckUsable || !dim) return true;
+    // 有原生 Vector3 时优先用引擎射线（最准）
+    const rayOrigin = nativeVec(origin.x, origin.y, origin.z);
+    if (rayOrigin) {
+        try {
+            const block = dim.getBlockFromRay(
+                rayOrigin, new Vec3(dir.x, dir.y, dir.z),
+                { maxDistance: Math.min(maxDist, MAX_RANGE) });
+            if (block) return false;
+            return true;
+        } catch (_) { /* 落回步进判定 */ }
+    }
+    // 步进判定
+    try {
+        const step = 0.6;
+        for (let d = step; d < maxDist; d += step) {
+            const block = dim.getBlock({
+                x: origin.x + dir.x * d,
+                y: origin.y + dir.y * d,
+                z: origin.z + dir.z * d,
+            });
+            if (!block) continue;
+            const typeId = block.typeId;
+            if (!typeId || typeId === "minecraft:air") continue;
+            if (SOLID_BLOCKS.has(typeId)) return false;
+        }
+        return true;
+    } catch (e) {
+        losCheckUsable = false;
+        console.warn(`${TAG} 视线判定不可用（getBlock 抛异常），已退回"不挡枪": ${e}`);
+        return true;
+    }
+}
+
 /**
  * 假人开一枪。
  *
- * 流程：查枪 → 查弹药 → 算射线 → 视线是否被挡 → 扣血 → 表现 → 扣弹药。
+ * 流程：查枪 → 查弹药 → 射程 → 视线 → 算部位 → 扣血 → 表现 → 扣弹药。
  * 返回 {ok, dmg, dealt, zone, err}。
  */
 export function fireSimShot(sim, target, targetName) {
@@ -615,6 +740,8 @@ export function fireSimShot(sim, target, targetName) {
     if (!isAlive(sim)) return { ok: false, err: "射手已阵亡" };
     // 目标已经倒了同样不用打
     if (!isAlive(target)) return { ok: false, err: "目标已阵亡" };
+    // 目标无敌中（出生保护 / 开局准备）→ 不打
+    if (isInvincible(target)) return { ok: false, err: "目标无敌中" };
 
     const gunId = heldGunId(sim);
     if (!gunId) return { ok: false, err: "手里没枪" };
@@ -630,25 +757,15 @@ export function fireSimShot(sim, target, targetName) {
     const dir = normalized({ x: aim.x - eye.x, y: aim.y - eye.y, z: aim.z - eye.z });
     const range = Math.hypot(aim.x - eye.x, aim.y - eye.y, aim.z - eye.z);
 
+    // 射程上限：超出就不开火（只追）。没有这条，假人隔着半个图都能打到
+    // 真人——2026-10-31 实测真人"人都没看到就死了"。
+    if (range > SIM_MAX_ENGAGE) {
+        return { ok: false, err: `超出射程 ${range.toFixed(0)}` };
+    }
+
     // 视线被方块挡住就不开火（不然就是隔墙打人）
-    //
-    // ⚠️ getBlockFromRay 的前两个参数必须是 **Vector3 实例**，传普通对象会抛
-    // "Native type conversion failed ... expected type: Vector3"。
-    //
-    // 但这台服的 @minecraft/server **没有导出 Vector3 类**（原生类型在，
-    // 类没导出；静态 import 会让整个包加载失败 → 心跳断 → 假人全灭）。
-    // 所以造不出原生实例时**老实跳过这条判定**，退回 3.9.29 的行为
-    // （不挡枪）。宁可隔墙打，也不该让整个行为包起不来。
-    const rayOrigin = nativeVec(eye.x, eye.y, eye.z);
-    if (rayOrigin) {
-        try {
-            const block = sim.dimension.getBlockFromRay(
-                rayOrigin,
-                new Vec3(dir.x, dir.y, dir.z),
-                { maxDistance: Math.min(range, MAX_RANGE) },
-            );
-            if (block) return { ok: false, err: "视线被挡" };
-        } catch (_) { /* 射线查询失败就当没挡 */ }
+    if (!hasLineOfSight(sim.dimension, eye, dir, range)) {
+        return { ok: false, err: "视线被挡" };
     }
 
     const zone = hitZone(target, eye, dir);
@@ -675,7 +792,7 @@ export function fireSimShot(sim, target, targetName) {
 
     logShotThrottled(
         `${sim.name}|${targetName}`,
-        `${TAG} 假人 ${sim.name} 用 ${gunId} 射击 ${targetName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）`,
+        `${TAG} 假人 ${sim.name} 用 ${gunId} 射击 ${targetName}：${zone} 伤害 ${dmg.toFixed(1)}（实际扣血 ${dealt.toFixed(1)}）距离 ${range.toFixed(1)}`,
     );
 
     return { ok: true, dmg, dealt, zone, gunId };
@@ -886,6 +1003,24 @@ export function handleHumanShot(player, gunId) {
         );
         return null;
     }
+
+    // 目标无敌中（刚复活/准备阶段）→ 不扣血
+    if (isInvincible(hitSim)) {
+        logShotThrottled(
+            `inv|${shooterName}`,
+            `${TAG} ${shooterName} 开枪命中假人 ${hitName}，但它无敌中（没扣血）`,
+        );
+        return null;
+    }
+
+    // 射程上限 + 视线遮挡（和假人开枪同一套规矩）
+    const hitDist = Math.hypot(
+        hitSim.location.x - origin.x,
+        hitSim.location.y + 0.9 - origin.y,
+        hitSim.location.z - origin.z,
+    );
+    if (hitDist > HUMAN_MAX_ENGAGE) return null;
+    if (!hasLineOfSight(hitSim.dimension, origin, dir, hitDist)) return null;
 
     const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
     const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;

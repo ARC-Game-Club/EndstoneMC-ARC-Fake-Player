@@ -59,6 +59,7 @@ ALL_TESTS = [
     "test_mob_reflex.py",
     "test_roam.py",
     "test_shooter_autojoin.py",
+    "test_gun_combat_geometry.py",
     "test_chat_persona.py",
     "test_tpa_auto_accept.py",
     "test_humanlike.py",
