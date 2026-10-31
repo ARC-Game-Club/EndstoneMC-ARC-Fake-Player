@@ -53,6 +53,7 @@ ALL_TESTS = [
     "test_interaction_fixes.py",
     "test_plugin_fixes.py",
     "test_pack_upgrade.py",
+    "test_behavior_pack_imports.py",
     "test_crowd.py",
     "test_social.py",
     "test_mob_reflex.py",
