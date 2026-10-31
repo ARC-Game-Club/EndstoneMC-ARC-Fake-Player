@@ -3807,13 +3807,18 @@ class ArcFakePlayerPlugin(Plugin):
         高空落地的游戏模式切换：地面高度未知时从 y=200 生成，先以
         创造模式安全落地（生存模式摔 130 格会死），真身接上时由
         `_apply_pending_gm` 切回配置的模式。
+
+        `respawn` 是**重生点**（服务器配置好的出生点），传给行为包：
+        引擎的 setSpawnPoint 对 SimulatedPlayer 两种写法都不认，
+        行为包只能在自己点完重生之后把假人传送回这个点。
         """
         game_mode = self._bot_game_mode_number()
         if y > 128 and game_mode not in (None, 1):
             game_mode = 1
             self._pending_gm[name] = self._bot_game_mode_number()
         self._bridge.spawn(name, x, y, z, "overworld",
-                           game_mode=game_mode, stealth=stealth)
+                           game_mode=game_mode, stealth=stealth,
+                           respawn=self._spawn_anchor())
         if self._find_sim_player(name) is not None:
             return "joined"
         if not self._bridge.can_spawn_directly:
@@ -5707,19 +5712,73 @@ class ArcFakePlayerPlugin(Plugin):
 
     # ---- 出生点选址 ----------------------------------------------------
 
+    def _arc_core_spawn(self) -> tuple[float, float, float] | None:
+        """弧光核心配置好的出生点（玩家 /spawn 传送到的那个位置）。
+
+        为什么问它而不是读 level.dat：level.dat 里的 `SpawnY=32767` 是
+        "引擎运行时自己找"的哨兵值——BDS 每次解析出来的高度都可能不同
+        （无规则服实测 200 / 312 都出现过），而那一列在山上，假人从那儿
+        掉下来必摔死。弧光核心的 `spawn_locations` 表里存的是**配好的
+        实坐标**（无规则服 -248.45, 168, -111.57；枪战服 0.5, 53, 0.5），
+        Y 是确定的，站在上面就是地面。
+
+        缓存 5 分钟重新问一次——服主可能用 /updatespawnpos 挪过出生点。
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_arc_spawn_cache", None)
+        if cached is not None and now - cached[0] < 300.0:
+            return cached[1]
+        result: tuple[float, float, float] | None = None
+        try:
+            core = self.server.plugin_manager.get_plugin("arc_core")
+            lister = getattr(core, "api_list_spawn_locations", None) if core else None
+            if callable(lister):
+                for item in lister() or []:
+                    dim = str((item or {}).get("dimension") or "").strip().lower()
+                    if dim and dim not in ("minecraft:overworld", "overworld"):
+                        continue
+                    x, y, z = ((item or {}).get(k) for k in ("x", "y", "z"))
+                    if x is None or y is None or z is None:
+                        continue
+                    result = (float(x), float(y), float(z))
+                    break
+        except Exception:
+            result = None
+        self._arc_spawn_cache = (now, result)
+        return result
+
+    def _spawn_anchor(self) -> tuple[float, float, float] | None:
+        """假人的"家"——出生和重生都该在这里。
+
+        优先级：显式配置的 `auto_online.home` > 弧光核心的出生点。
+        拿不到就返回 None（行为包退回"生成点/落地位置"）。
+        """
+        home = self.crowd_config().get("home")
+        if isinstance(home, (list, tuple)) and len(home) >= 3:
+            try:
+                return float(home[0]), float(home[1]), float(home[2])
+            except (TypeError, ValueError):
+                pass
+        return self._arc_core_spawn()
+
     def _crowd_spawn_pos(self) -> tuple[int, int, int, bool] | None:
         """给新角色挑个出生点。返回 (x, y, z, 地面已知)。
 
-        优先级（v3.9.36 起对齐世界出生点——用户定的规矩）：
+        优先级（v3.9.37 起，"对齐世界出生地" + "用服主配好的出生点"合并）：
           1. 配置的 auto_online.home（服主显式写的，最优先）
-          2. **世界出生点** + 地表扫描（和复活点天然一致：重生也会落回
-             这里，出生/复活不会再一个东一个西）；扫不出地面就高空
-             （配合安全落地流程）
-          3. 世界出生点读不到（level.dat 异常）才退回真人身边——
-             区块必然加载，保底能用。
+          2. **弧光核心配置好的出生点**（玩家 /spawn 传送到的那个位置，
+             Y 是配死的实坐标——无规则服 -248.45, 168, -111.57）
+          3. **世界出生点**（level.dat）+ 地表扫描
+          4. 上面都拿不到（level.dat 异常）才退回真人身边——区块必然加载，
+             保底能用。
 
         旧版"真人身边→假人身边"的顺序会让假人满地图散着出生，
-        和复活点（世界出生点）对不上——"出生在 A、死在 B、复活在 C"。
+        和复活点对不上——"出生在 A、死在 B、复活在 C"。
+
+        ⚠️ 为什么第 2 档排在 level.dat 前面：level.dat 的 `SpawnY=32767`
+        是"引擎运行时自己找"的哨兵值，解析出来可能在半空（实测 200/312），
+        而那一列在山上，假人掉下来必摔死。弧光核心那个坐标是**配死的**，
+        站在上面就是地面。
         """
         import random as _random
         # 1) 配置的 home
@@ -5729,7 +5788,13 @@ class ArcFakePlayerPlugin(Plugin):
                 return int(home[0]), int(home[1]), int(home[2]), True
             except (TypeError, ValueError):
                 pass
-        # 2) 世界出生点
+        # 2) 弧光核心配置好的出生点（/spawn 那个位置）
+        #    它的 Y 是配死的实坐标，站在上面就是地面——不像 level.dat 的
+        #    SpawnY=32767（"自动"哨兵）会解析出 200/312 这种半空高度。
+        anchor = self._spawn_anchor()
+        if anchor is not None:
+            return int(anchor[0]), int(anchor[1]), int(anchor[2]), True
+        # 3) 世界出生点（level.dat）+ 地表扫描
         spawn = self._world_spawn_xz()
         if spawn is not None:
             x, z = spawn
@@ -5741,7 +5806,7 @@ class ArcFakePlayerPlugin(Plugin):
             if y is not None:
                 return x, y, z, True
             return x, 200, z, False
-        # 3) 世界出生点读不到 → 真人身边兜底
+        # 4) 世界出生点读不到 → 真人身边兜底（区块必然加载）
         try:
             humans = [p for p in self.server.online_players
                       if str(getattr(p, "xuid", "") or "").strip()]

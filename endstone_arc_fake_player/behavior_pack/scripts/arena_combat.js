@@ -31,7 +31,7 @@
  * 混淆过的第三方包，改它风险大。改数值时**两边都要改**。
  */
 
-import { world, system, EntityDamageCause } from "@minecraft/server";
+import { world, system, EntityDamageCause, Vector3 } from "@minecraft/server";
 
 const TAG = "[ArcFakePlayer]";
 
@@ -97,8 +97,14 @@ const lastHealth = new Map();
 /** 名字 → 落地判定状态：连续两次采样 Y 不变就算站稳了。 */
 const landingState = new Map();
 
+/** 名字集合：这些假人的重生点是**服务器配置**的，落地位置不许覆盖。 */
+const anchoredBots = new Set();
+
 /** 上一次广播 simhit 的时间，避免刷屏。 */
 let lastSimHitLog = 0;
+
+/** 最近结算过的射击：key = "射手@tick"，用来挡掉同一枪的重复广播。 */
+const recentShots = new Set();
 
 /** 射击日志限流：key = "射手|目标"，同一对每 N 毫秒最多记一条。 */
 const shotLogAt = new Map();
@@ -211,12 +217,30 @@ function applySpawnPoint(sim, point) {
  * ⚠️ 重生点必须落在**地面上**，不能直接用"我们把它生成在哪"。
  * 生成点经常在半空（Python 侧扫不到地表 → 退回 y=200），
  * 拿半空当重生点 = 死后原地再摔一次。
+ *
+ * `anchor` 是 Python 侧带来的**服务器配置出生点**（弧光核心 /spawn 那个
+ * 实坐标，Y 配死）。有它就用它——那是服主定的地方，假人死了就回那儿，
+ * 和真人按 /spawn 回出生点是一个道理。没有它才退回"脚下扫地面 +
+ * 落地后再钉一次"那套兜底。
  */
-export function rememberSpawnPoint(name, sim, loc) {
+export function rememberSpawnPoint(name, sim, loc, anchor) {
     const point = { x: Math.floor(loc.x), y: Math.floor(loc.y), z: Math.floor(loc.z) };
     spawnPoints.set(name, point);
     lastPositions.set(name, null);
     landingState.delete(name);
+    if (anchor) {
+        const fixed = {
+            x: Math.floor(anchor.x), y: Math.floor(anchor.y), z: Math.floor(anchor.z),
+        };
+        respawnPoints.set(name, fixed);
+        anchoredBots.add(name);
+        applySpawnPoint(sim, fixed);
+        console.log(
+            `${TAG} 假人 ${name} 出生于 (${point.x}, ${point.y}, ${point.z})；`
+            + `重生点用服务器出生点 (${fixed.x}, ${fixed.y}, ${fixed.z})`,
+        );
+        return;
+    }
     // 假人已经站在这一格上了，所以这一列的区块**一定是加载的**——
     // 这正是 Python 侧那次扫描失败（区块没加载）时缺的那一环。
     const groundY = findGroundY(point.x, point.z, point.y);
@@ -256,6 +280,7 @@ export function forgetBot(name) {
     lastPositions.delete(name);
     lastHealth.delete(name);
     landingState.delete(name);
+    anchoredBots.delete(name);
 }
 
 /**
@@ -264,6 +289,10 @@ export function forgetBot(name) {
  * 为什么还要钉第二遍：生成那一刻的地面扫描也可能失败（区块还没加载完）。
  * 等它**真的站住了**（连续两次采样 Y 不变），脚下那块地一定是实的——
  * 这时候再更新一次，之后它每次重生都会回到这块地上。
+ *
+ * ⚠️ 但如果重生点是**服务器配置的那个**（服主用 /spawn 定的地方），
+ * 就不许被"落地位置"覆盖——那是服主定的规矩，假人死了就回那儿，
+ * 和真人按 /spawn 回出生点是一个道理。
  */
 function pinSpawnPointOnLanding(name, sim, loc) {
     const st = landingState.get(name) || { y: null, still: 0, done: false };
@@ -274,6 +303,7 @@ function pinSpawnPointOnLanding(name, sim, loc) {
     landingState.set(name, st);
     if (st.still < 1) return;      // 需要连续两次几乎不动
     st.done = true;
+    if (anchoredBots.has(name)) return;   // 配置的点说了算，不覆盖
     const x = Math.floor(loc.x);
     const z = Math.floor(loc.z);
     const groundY = findGroundY(x, z, Math.floor(loc.y));
@@ -531,10 +561,17 @@ export function fireSimShot(sim, target, targetName) {
     const range = Math.hypot(aim.x - eye.x, aim.y - eye.y, aim.z - eye.z);
 
     // 视线被方块挡住就不开火（不然就是隔墙打人）
+    //
+    // ⚠️ getBlockFromRay 的前两个参数必须是 **Vector3 实例**，传普通对象会抛
+    // "Native type conversion failed ... expected type: Vector3"。
+    // 原来这里传的是普通对象 → 每次都抛 → 被 catch 吞掉 → "视线被挡"这条判定
+    // 从来没生效过（假人其实能隔墙打人）。这里补上。
     try {
-        const block = sim.dimension.getBlockFromRay(eye, dir, {
-            maxDistance: Math.min(range, MAX_RANGE),
-        });
+        const block = sim.dimension.getBlockFromRay(
+            new Vector3(eye.x, eye.y, eye.z),
+            new Vector3(dir.x, dir.y, dir.z),
+            { maxDistance: Math.min(range, MAX_RANGE) },
+        );
         if (block) return { ok: false, err: "视线被挡" };
     } catch (_) { /* 射线查询失败就当没挡 */ }
 
@@ -545,13 +582,18 @@ export function fireSimShot(sim, target, targetName) {
 
     const dealt = applyDamage(target, dmg, sim);
 
-    // 表现：动画 + 枪声
+    // 表现：后坐力动画 + 枪声 + 枪口火焰
     try {
         sim.playAnimation(`animation.${gunKey}.shoot`);
-    } catch (_) { /* ignore */ }
+    } catch (e) {
+        console.warn(`${TAG} 假人 ${sim.name} 的射击动画播不了: ${e}`);
+    }
     try {
         sim.playSound(`${gunKey}.shoot`, { volume: 1, pitch: 1 });
-    } catch (_) { /* ignore */ }
+    } catch (e) {
+        console.warn(`${TAG} 假人 ${sim.name} 的枪声播不了: ${e}`);
+    }
+    spawnMuzzleFlash(sim, eye, dir);
 
     if (ammo !== undefined) writeAmmo(sim.name, gunKey, ammo - 1);
 
@@ -561,6 +603,44 @@ export function fireSimShot(sim, target, targetName) {
     );
 
     return { ok: true, dmg, dealt, zone, gunId };
+}
+
+/**
+ * 枪口火焰。
+ *
+ * 为什么自己生成粒子，不靠 RP 动画里那份：
+ * RP（失落枪械档案馆弧光重制版 RP）把枪口火焰写在 `animation.<枪>.shoot` 的
+ * `particle_effects` 里，要靠 `playAnimation` 才播得出来；但**模拟玩家**
+ * （SimulatedPlayer）身上 playAnimation 经常不生效——用户反馈"假人开枪没有特效"。
+ * 所以这里用引擎的 spawnParticle 直接补一份。
+ *
+ * 粒子 ID 取自本 RP 里真实存在的定义
+ * （resource_packs/失落枪械档案馆弧光重制版 RP/particles/guns/*.particle.json）：
+ *   nova:muzzleflash  枪口火焰
+ *   nova:flash        亮光
+ *   nova:sparkles     火星
+ *   nova:bullet_smoke 枪口烟
+ */
+function spawnMuzzleFlash(sim, eye, dir) {
+    try {
+        const dim = sim.dimension;
+        const muzzle = new Vector3(
+            eye.x + dir.x * 0.6,
+            eye.y + dir.y * 0.6,
+            eye.z + dir.z * 0.6,
+        );
+        const smoke = new Vector3(
+            eye.x + dir.x * 1.0,
+            eye.y + dir.y * 1.0,
+            eye.z + dir.z * 1.0,
+        );
+        dim.spawnParticle("nova:muzzleflash", muzzle);
+        dim.spawnParticle("nova:flash", muzzle);
+        dim.spawnParticle("nova:sparkles", muzzle);
+        dim.spawnParticle("nova:bullet_smoke", smoke);
+    } catch (e) {
+        console.warn(`${TAG} 枪口火焰生成失败: ${e}`);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +722,18 @@ export function handleShotEvent(data) {
 
     const base = SIM_GUN_DAMAGE[gunId] !== undefined ? SIM_GUN_DAMAGE[gunId] : DEFAULT_DAMAGE;
 
+    // 同一个 tick、同一个射手，只结算一次。
+    //
+    // 为什么需要：真人开枪的广播可能有两个来源——
+    //   ① 枪械包自己主循环里的开火分支；
+    //   ② 我们在枪械包 `system/gunPerformance.js` 里按 itemStartUse 补的广播
+    //      （主循环目前对真人是死的，事件一次都没发过）。
+    // 两边都发的话，同一枪会被算成两枪，假人血量掉得飞快。
+    const shotKey = `${shooterName}@${system.currentTick}`;
+    if (recentShots.has(shotKey)) return null;
+    if (recentShots.size > 256) recentShots.clear();
+    recentShots.add(shotKey);
+
     let hitName = null;
     let hitSim = null;
     let hitRatio = -1;
@@ -657,7 +749,14 @@ export function handleShotEvent(data) {
             hitSim = sim;
         }
     }
-    if (!hitSim) return null;
+    if (!hitSim) {
+        // 打偏了也要留痕：这样能区分"广播根本没来"和"广播来了但没打中"。
+        logShotThrottled(
+            `miss|${shooterName}`,
+            `${TAG} ${shooterName} 开了一枪（${gunId}）但没打中假人`,
+        );
+        return null;
+    }
 
     const zone = hitRatio >= 0.8 ? "head" : hitRatio <= 0.35 ? "legs" : "body";
     const mult = zone === "head" ? HEADSHOT_MULTIPLIER : zone === "legs" ? LEGSHOT_MULTIPLIER : 1;

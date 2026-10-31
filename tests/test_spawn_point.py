@@ -38,6 +38,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from tests.endstone_stub import install
 
@@ -199,6 +200,92 @@ class PendingGameModeTests(unittest.TestCase):
         self.assertEqual(self.dispatched, [])
 
 
+class SpawnAnchorTests(unittest.TestCase):
+    """假人的"家"：服务器配置好的出生点（弧光核心 /spawn 那个位置）。
+
+    为什么不用 level.dat 的世界出生点：那里的 `SpawnY=32767` 是"引擎运行时
+    自己找"的哨兵值，解析出来的高度每次都可能不同（实测 200 / 312），
+    而那一列在山上，假人从那儿掉下来必摔死。弧光核心 `spawn_locations`
+    表里存的是配好的实坐标（无规则服 -248.45, 168, -111.57），Y 是确定的。
+    """
+
+    def setUp(self):
+        self.plugin = ArcFakePlayerPlugin()
+        self.plugin.logger = SimpleNamespace(
+            debug=lambda *a, **k: None, info=lambda *a, **k: None,
+            warning=lambda *a, **k: None)
+        self.plugin.crowd_config = lambda: {"home": None}
+
+    def _with_core(self, spawns):
+        core = SimpleNamespace(api_list_spawn_locations=lambda: spawns)
+        self.plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=lambda name: core))
+        return core
+
+    def test_reads_overworld_spawn_from_core(self):
+        self._with_core([
+            {"dimension": "minecraft:the_end", "x": 1, "y": 2, "z": 3},
+            {"dimension": "minecraft:overworld",
+             "x": -248.45, "y": 168, "z": -111.57},
+        ])
+        got = self.plugin._arc_core_spawn()
+        self.assertEqual(got, (-248.45, 168.0, -111.57))
+
+    def test_no_core_means_no_anchor(self):
+        self.plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=lambda name: None))
+        self.assertIsNone(self.plugin._arc_core_spawn())
+
+    def test_broken_core_api_is_not_fatal(self):
+        core = SimpleNamespace(api_list_spawn_locations=Mock(side_effect=RuntimeError))
+        self.plugin.server = SimpleNamespace(
+            plugin_manager=SimpleNamespace(get_plugin=lambda name: core))
+        self.assertIsNone(self.plugin._arc_core_spawn())
+
+    def test_anchor_prefers_configured_home(self):
+        """显式配置的 home 优先于弧光核心的出生点。"""
+        self._with_core([{"dimension": "minecraft:overworld",
+                          "x": 1, "y": 2, "z": 3}])
+        self.plugin.crowd_config = lambda: {"home": [10, 20, 30]}
+        self.assertEqual(self.plugin._spawn_anchor(), (10.0, 20.0, 30.0))
+
+    def test_anchor_falls_back_to_core(self):
+        self._with_core([{"dimension": "minecraft:overworld",
+                          "x": -248.45, "y": 168, "z": -111.57}])
+        self.assertEqual(self.plugin._spawn_anchor(), (-248.45, 168.0, -111.57))
+
+    def test_spawn_pos_uses_anchor_when_nobody_around(self):
+        """没人在线时，出生点用配置好的出生点（Y 是确定的地面高度）。"""
+        self._with_core([{"dimension": "minecraft:overworld",
+                          "x": -248.45, "y": 168, "z": -111.57}])
+        self.plugin.server.online_players = []
+        self.plugin._actors = {}
+        self.plugin._external = {}
+        self.plugin._world_spawn_xz = lambda: (-243, -105)   # 不该走到这里
+        pos = self.plugin._crowd_spawn_pos()
+        self.assertEqual(pos[:3], (-248, 168, -111))
+
+    def test_spawn_payload_carries_respawn_anchor(self):
+        """重生点要随生成请求一起发给行为包。"""
+        from endstone_arc_fake_player.bridge import FakePlayerBridge
+        sent = []
+
+        class _B(FakePlayerBridge):
+            def __init__(self):
+                pass
+
+            def send_tracked(self, event_id, data, kind=None, callback=None):
+                sent.append((event_id, data))
+                return 1
+
+        b = _B()
+        b.spawn("bot", 1, 2, 3, "overworld", respawn=(-248.45, 168.0, -111.57))
+        self.assertEqual(sent[0][0], "bot:spawn")
+        self.assertEqual(sent[0][1]["rx"], -248.45)
+        self.assertEqual(sent[0][1]["ry"], 168.0)
+        self.assertEqual(sent[0][1]["rz"], -111.57)
+
+
 class BehaviorPackContractTests(unittest.TestCase):
     """行为包侧的契约（源码断言——这套引擎上跑不了 JS，只能钉源码）。"""
 
@@ -275,26 +362,39 @@ class BehaviorPackContractTests(unittest.TestCase):
                       "autoRespawn 里要调用它")
 
     def test_removed_bot_clears_records(self):
-        """假人被移除时，四张表都要清——不然每轮换人都留一条。"""
+        """假人被移除时，五张表都要清——不然每轮换人都留一条。"""
         self.assertIn("export function forgetBot", JS_SRC)
         body = _js_slice(JS_SRC, "export function forgetBot")
         for table in ("spawnPoints", "respawnPoints", "lastPositions",
-                      "lastHealth", "landingState"):
+                      "lastHealth", "landingState", "anchoredBots"):
             self.assertIn(f"{table}.delete(name);", body)
         main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
         self.assertIn("forgetBot(name);", main)
 
+    def test_configured_anchor_wins_over_landing(self):
+        """服务器配置的重生点，不许被"落地位置"覆盖。"""
+        body = _js_slice(JS_SRC, "function pinSpawnPointOnLanding")
+        self.assertIn("anchoredBots.has(name)", body,
+                      "配置的点说了算，落地位置不许覆盖它")
+        self.assertIn("anchoredBots.add(name);",
+                      _js_slice(JS_SRC, "export function rememberSpawnPoint"))
+
+    def test_spawn_message_carries_anchor(self):
+        """Python 侧要把配置好的出生点随生成请求带过来。"""
+        main = (PKG / "behavior_pack" / "scripts" / "main.js").read_text("utf-8")
+        self.assertIn("req.rx", main)
+        self.assertIn("rememberSpawnPoint(name, out.sim, loc, anchor)", main)
+
 
 def main():
-    result = unittest.TextTestRunner(verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(SurfaceScanTests))
-    result2 = unittest.TextTestRunner(verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(PendingGameModeTests))
-    result3 = unittest.TextTestRunner(verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(BehaviorPackContractTests))
-    total = result.testsRun + result2.testsRun + result3.testsRun
-    ok = (result.wasSuccessful() and result2.wasSuccessful()
-          and result3.wasSuccessful())
+    total = 0
+    ok = True
+    for cls in (SurfaceScanTests, PendingGameModeTests, SpawnAnchorTests,
+                BehaviorPackContractTests):
+        result = unittest.TextTestRunner(verbosity=2).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(cls))
+        total += result.testsRun
+        ok = ok and result.wasSuccessful()
     if not ok:
         return 1
     print(f"全部 {total} 项通过")

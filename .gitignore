@@ -10,3 +10,7 @@ venv/
 # IDE
 .idea/
 .vscode/
+
+# set_manifest_version.py 之类的工具留下的备份文件（别进仓库，也别进 wheel）
+*.bak-*
+*.bak

@@ -432,7 +432,6 @@ function doSpawn(req) {
 
     const loc = { x: Math.floor(req.x), y: Math.floor(req.y), z: Math.floor(req.z) };
     const out = ensureSim(loc, name, resolveGameMode(req.gm));
-
     if (!out.sim) {
         // 三条路都不通。不要再默默塞进 pendingSpawns 里等一个永远不来的
         // GameTest —— 那样 Python 侧只会看到"请求发出去了却没人回"。
@@ -447,9 +446,16 @@ function doSpawn(req) {
     tagName(out.sim, name, !!req.st);
     sims.set(name, out.sim);
     initArenaCombat(sims);
-    // 记下出生点并设成引擎的重生点：不然假人死后会被丢回**世界出生点**，
-    // 表现就是"死了以后不知道复活到哪里去了"。
-    rememberSpawnPoint(name, out.sim, loc);
+    // 记下出生点，并算出它该在哪儿重生。
+    //
+    // Python 侧会把它知道的**服务器配置出生点**一起带过来（rx/ry/rz）——
+    // 那是弧光核心 /spawn 用的那个实坐标，Y 是配死的，站在上面就是地面。
+    // 引擎的 setSpawnPoint 对 SimulatedPlayer 两种写法都不认，所以这个点
+    // 由我们自己用：重生之后把假人传送回去（见 teleportAfterRespawn）。
+    const anchor = (req.rx !== undefined && req.ry !== undefined && req.rz !== undefined)
+        ? { x: req.rx, y: req.ry, z: req.rz }
+        : null;
+    rememberSpawnPoint(name, out.sim, loc, anchor);
     reply("bot:spawned", { n: name, ok: true, existed: false, i: req.i });
 }
 

@@ -228,6 +228,7 @@ class FakePlayerBridge:
               dimension: str = "overworld",
               game_mode: int | None = None,
               stealth: bool = False,
+              respawn: tuple[float, float, float] | None = None,
               callback: Callable[[bool, str, dict], None] | None = None) -> int:
         """请求行为包造一个假人。
 
@@ -240,6 +241,11 @@ class FakePlayerBridge:
         ——控制权应该在 JS 侧。传参给引擎一次做对，干净得多。
 
         传 `None` 表示"不干预"，由 JS 侧按世界当前默认模式走。
+
+        `respawn` 是**重生点**（服务器配置好的出生点，x/y/z）。
+        引擎的 setSpawnPoint 对 SimulatedPlayer 两种写法都不认，所以
+        行为包只能在自己点完重生之后把假人传送回这个点——这个坐标得
+        由 Python 侧告诉它。
         """
         payload: dict[str, Any] = {
             "n": name, "x": float(x), "y": float(y), "z": float(z),
@@ -251,6 +257,13 @@ class FakePlayerBridge:
             # 隐身模式（自动在线的"路人群演"）：不挂 [AI] 名牌。
             # 一切"它是 AI"的公开标识都不给，让它看起来就是个玩家。
             payload["st"] = 1
+        if respawn is not None:
+            try:
+                payload["rx"] = float(respawn[0])
+                payload["ry"] = float(respawn[1])
+                payload["rz"] = float(respawn[2])
+            except (TypeError, ValueError, IndexError):
+                pass
         return self.send_tracked(
             "bot:spawn", payload, kind="spawn", callback=callback,
         )
